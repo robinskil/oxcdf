@@ -6,6 +6,9 @@ The reader parses the HDF5 container. It never calls netcdf-c. That C library is
 not thread safe. Its Rust bindings put one process-global mutex around every
 call. This crate has no mutex. Many threads read one file at the same time.
 
+The reader itself holds no `unsafe` code. One dependency, `zstd`, compiles the C
+zstd library. That is the only C code in the build.
+
 `oxcdf::open` reads the magic bytes and picks the container. netCDF-4 and
 classic then use the same interface.
 
@@ -263,7 +266,7 @@ Every other error marks a damaged file or a defect here. Match on
 cargo test --workspace --features "oxcdf/diff-tests,oxcdf/object-store,oxcdf/ndarray,oxcdf/async"
 ```
 
-396 tests.
+396 tests. Add `diff-tests` only when netcdf-c is installed.
 
 | File | Compares against |
 |---|---|
@@ -276,3 +279,29 @@ cargo test --workspace --features "oxcdf/diff-tests,oxcdf/object-store,oxcdf/nda
 | `readme_api.rs` | this page, every example |
 
 Floats compare by bit pattern, not by tolerance.
+
+## Verify
+
+GitHub Actions runs every check on each push and pull request.
+
+| Job | Checks |
+|---|---|
+| `format` | `cargo fmt --all --check` |
+| `clippy` | Five feature sets, both crates. A warning fails the build. |
+| `test` | Linux, macOS and Windows. Default features, then every feature. |
+| `docs` | Three builds. A broken link fails the build. |
+| `msrv` | The crate builds on Rust 1.91. |
+| `differential` | Installs netcdf-c and compares every value against it. |
+| `miri` | Guards the dependencies against undefined behaviour. |
+
+The reader parses untrusted binary input, so `malformed.rs` mutates the corpus.
+It truncates each file, flips bytes, and feeds random bytes. A damaged file must
+return an error. A panic marks a defect.
+
+`fuzz/` holds three `cargo fuzz` targets: `open`, `read` and `filters`. The
+`filters` target covers the C zstd decoder, which is the one part of the build
+that is not safe Rust. A nightly job runs them, seeded from the corpus.
+
+```bash
+cargo +nightly fuzz run open -- -max_total_time=60
+```

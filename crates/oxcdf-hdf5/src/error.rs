@@ -65,7 +65,7 @@ pub enum Error {
     /// The asynchronous engine produces this. It runs a synchronous walk over
     /// the bytes it holds. A walk that needs more bytes stops with this error.
     /// The engine fetches the missing bytes. The engine then runs the walk
-    /// again. See [`crate::replay`].
+    /// again. See the `replay` module, behind the `async` feature.
     ///
     /// A public asynchronous method never returns this. It surfaces only from a
     /// synchronous read on a file that an asynchronous open produced.

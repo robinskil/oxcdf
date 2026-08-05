@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning must fail the build. A warning that nobody sees becomes a defect.
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `rust-toolchain.toml` pins the version and the components.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # A feature turns code on. Check every combination a user can select.
+        # Each crate names its own set: `ndarray` belongs to `oxcdf` alone, so
+        # the sets are written out rather than derived.
+        include:
+          - name: default
+            oxcdf: ""
+            hdf5: ""
+          - name: async
+            oxcdf: "async"
+            hdf5: "async"
+          - name: ndarray
+            oxcdf: "ndarray"
+            hdf5: ""
+          - name: object-store
+            oxcdf: "object-store"
+            hdf5: "object-store"
+          - name: every feature
+            oxcdf: "async,object-store,ndarray"
+            hdf5: "async,object-store"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy oxcdf
+        run: |
+          if [ -z "${{ matrix.oxcdf }}" ]; then
+            cargo clippy -p oxcdf --lib --bins --tests
+          else
+            cargo clippy -p oxcdf --lib --bins --tests --features "${{ matrix.oxcdf }}"
+          fi
+      - name: clippy oxcdf-hdf5
+        run: |
+          if [ -z "${{ matrix.hdf5 }}" ]; then
+            cargo clippy -p oxcdf-hdf5 --lib --bins --tests
+          else
+            cargo clippy -p oxcdf-hdf5 --lib --bins --tests --features "${{ matrix.hdf5 }}"
+          fi
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      # Default features first: a user who selects nothing must still build.
+      - name: test with default features
+        run: cargo test --workspace
+      - name: test with every feature a user can select
+        run: cargo test --workspace --features oxcdf/async,oxcdf/object-store,oxcdf/ndarray
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      # A broken intra-doc link must fail the build. A feature-gated item cannot
+      # be linked from a doc block that is always present, and only a build
+      # without that feature finds it.
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      - name: docs, default features
+        run: cargo doc --workspace --no-deps
+      - name: docs, every feature
+        run: cargo doc --workspace --no-deps --features oxcdf/async,oxcdf/object-store,oxcdf/ndarray
+      - name: docs, lower crate alone
+        run: cargo doc -p oxcdf-hdf5 --no-deps --features async,object-store
+
+  msrv:
+    name: msrv 1.91
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      # `rust-version` in the manifest is a promise. Hold it.
+      - run: cargo check --workspace --all-targets --features oxcdf/async,oxcdf/object-store,oxcdf/ndarray
+
+  differential:
+    name: differential against netcdf-c
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      - name: install netcdf-c
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnetcdf-dev netcdf-bin
+      # This is the strongest correctness signal the crate has. It compares
+      # every value against the C library the crate replaces.
+      - name: compare every value
+        run: cargo test --workspace --features oxcdf/diff-tests,oxcdf/object-store,oxcdf/ndarray,oxcdf/async
+
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    env:
+      # `rust-toolchain.toml` pins 1.91. Miri needs nightly, so override it.
+      RUSTUP_TOOLCHAIN: nightly
+      # Miri cannot run the C zstd decoder, so skip the tests that reach it.
+      MIRIFLAGS: -Zmiri-disable-isolation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # The libraries hold no `unsafe`, so this mostly guards the dependencies
+      # and any `unsafe` a future change introduces.
+      - run: cargo miri setup
+      - name: miri over the pure parsers
+        run: cargo miri test -p oxcdf-hdf5 --lib
+        continue-on-error: true

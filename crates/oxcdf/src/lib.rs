@@ -18,15 +18,8 @@
 //! # Ok::<(), oxcdf::Error>(())
 //! ```
 //!
-//! The asynchronous interface is the same list. Only the reads await.
-//!
-//! ```no_run
-//! # async fn run(source: std::sync::Arc<dyn oxcdf::AsyncByteSource>) -> oxcdf::Result<()> {
-//! let file = oxcdf::open_async(source).await?;
-//! let temp = file.variable("TEMP").unwrap();
-//! let values = temp.get_values::<f64, _>(..).await?;
-//! # Ok(()) }
-//! ```
+//! The asynchronous interface is the same list. Only the reads await. See
+//! `open_async`, behind the `async` feature.
 //!
 //! # Why
 //!
@@ -79,6 +72,22 @@
 // docs.rs builds with `--cfg docsrs` on nightly, so every feature-gated item
 // carries a badge that names the feature. A stable build ignores this.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// The asynchronous example names `AsyncByteSource`, which only exists with the
+// `async` feature. A doc block is always compiled, so gate this one.
+#![cfg_attr(
+    feature = "async",
+    doc = r#"
+# Asynchronous example
+
+```no_run
+# async fn run(source: std::sync::Arc<dyn oxcdf::AsyncByteSource>) -> oxcdf::Result<()> {
+let file = oxcdf::open_async(source).await?;
+let temp = file.variable("TEMP").unwrap();
+let values = temp.get_values::<f64, _>(..).await?;
+# Ok(()) }
+```
+"#
+)]
 #![deny(missing_docs)]
 #![deny(rust_2018_idioms)]
 
@@ -126,7 +135,7 @@ pub use oxcdf_hdf5::{AsyncByteSource, SyncAsAsync};
 /// Open a netCDF file for reading.
 ///
 /// The file may be netCDF-4 or netCDF classic. This is the synchronous entry
-/// point. Use [`open_async`] for an asynchronous one.
+/// point. `open_async` is the asynchronous one, behind the `async` feature.
 ///
 /// ```no_run
 /// let file = oxcdf::open("argo.nc")?;

@@ -1,0 +1,42 @@
+[package]
+name = "oxcdf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.7"
+oxcdf = { path = "../crates/oxcdf" }
+oxcdf-hdf5 = { path = "../crates/oxcdf-hdf5" }
+
+[[bin]]
+name = "open"
+path = "fuzz_targets/open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read"
+path = "fuzz_targets/read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filters"
+path = "fuzz_targets/filters.rs"
+test = false
+doc = false
+bench = false
+
+# A fuzz build is a release build. Keep the debug assertions: an arithmetic
+# overflow in an offset calculation is a real defect, and this is where it
+# shows.
+[profile.release]
+debug = true
+debug-assertions = true
+overflow-checks = true

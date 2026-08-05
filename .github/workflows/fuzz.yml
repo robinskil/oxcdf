@@ -1,0 +1,60 @@
+name: Fuzz
+
+on:
+  # A short run on every pull request catches an obvious regression.
+  pull_request:
+  # A long run every night finds what a short one cannot.
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: How long to run each target
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [open, read, filters]
+    steps:
+      - uses: actions/checkout@v4
+
+      # `cargo fuzz` needs nightly for the sanitiser. `rust-toolchain.toml`
+      # pins 1.91, so override it.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # A fuzzer that starts from nothing spends its first hours rediscovering
+      # the file format. The real files teach it the format in seconds.
+      - name: seed the corpus
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cp test_files/*.nc test_files/*.h5 fuzz/corpus/${{ matrix.target }}/ || true
+
+      - name: fuzz
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          SECONDS_TO_RUN: ${{ github.event.inputs.seconds || (github.event_name == 'schedule' && '900' || '120') }}
+        run: |
+          cargo fuzz run ${{ matrix.target }} \
+            -- -max_total_time=$SECONDS_TO_RUN -rss_limit_mb=4096 -timeout=25
+
+      # A crash is the whole point of the run. Keep it.
+      - name: upload any crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

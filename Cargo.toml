@@ -1,5 +1,8 @@
 [workspace]
 members = ["crates/oxcdf", "crates/oxcdf-hdf5"]
+# `cargo fuzz` builds its own crate against a nightly toolchain and its own
+# profile, so it must stay outside the workspace.
+exclude = ["fuzz"]
 resolver = "2"
 
 # Both crates ship together and share a version. `oxcdf` depends on the exact
