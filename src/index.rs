@@ -52,6 +52,8 @@ pub struct OpenOptions {
     io_cache_bytes: Option<usize>,
     chunk_cache_capacity: Option<u64>,
     readahead: usize,
+    #[cfg(feature = "async")]
+    open_prefetch: usize,
 }
 
 impl Default for OpenOptions {
@@ -64,6 +66,8 @@ impl Default for OpenOptions {
             ),
             chunk_cache_capacity: Some(crate::cache::DEFAULT_CAPACITY),
             readahead: crate::cache::DEFAULT_READAHEAD,
+            #[cfg(feature = "async")]
+            open_prefetch: crate::replay::DEFAULT_PREFETCH_BYTES,
         }
     }
 }
@@ -125,12 +129,41 @@ impl OpenOptions {
         self
     }
 
-    fn build_io_cache(&self) -> Option<crate::cache::IoCache> {
+    /// How many bytes an asynchronous open fetches before its first walk.
+    ///
+    /// netCDF writes its metadata near the front of the file. A window this
+    /// size normally covers a whole open in one request. A window that is too
+    /// small still works. It costs more round trips.
+    #[cfg(feature = "async")]
+    pub fn open_prefetch_bytes(mut self, bytes: usize) -> Self {
+        self.open_prefetch = bytes.max(1);
+        self
+    }
+
+    /// The I/O request size, which is also the byte cache's page size.
+    pub fn request_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// The window an asynchronous open fetches before its first walk.
+    #[cfg(feature = "async")]
+    pub fn prefetch_bytes(&self) -> usize {
+        self.open_prefetch
+    }
+
+    /// The byte-range merging policy in use.
+    pub fn merge_policy(&self) -> crate::io::IoConfig {
+        self.io
+    }
+
+    /// Build the byte cache these options describe.
+    pub fn build_io_cache(&self) -> Option<crate::cache::IoCache> {
         self.io_cache_bytes
             .map(|bytes| crate::cache::IoCache::with_capacity_bytes(bytes, self.page_size))
     }
 
-    fn build_chunk_cache(&self) -> Option<crate::cache::ChunkCache> {
+    /// Build the decoded-chunk cache these options describe.
+    pub fn build_chunk_cache(&self) -> Option<crate::cache::ChunkCache> {
         self.chunk_cache_capacity
             .map(|n| crate::cache::ChunkCache::new(n).with_readahead(self.readahead))
     }
@@ -232,11 +265,11 @@ impl DatasetIndex {
         self.chunks.get().and_then(|c| c.as_deref())
     }
 
-    /// Resolve the chunk index now, so later reads do no metadata I/O.
+    /// Resolve the chunk index now, so later reads do no metadata input.
     ///
-    /// A caller that knows its projection should prepare exactly the variables
-    /// it will read. This is also how the async engine gets a usable index,
-    /// since its read path does not walk B-trees.
+    /// This is an optimisation. A read resolves the index itself. A caller that
+    /// knows its projection prepares exactly the variables it reads, which
+    /// moves that cost off the read path.
     pub fn prepare(&self, ctx: Ctx<'_>) -> Result<()> {
         self.chunks(ctx).map(|_| ())
     }
@@ -367,8 +400,21 @@ impl Hdf5File {
 
     /// Open a file over any byte source with explicit options.
     pub fn from_source_with(source: Arc<dyn ByteSource>, options: OpenOptions) -> Result<Self> {
-        let superblock = Superblock::read(source.as_ref())?;
         let io_cache = options.build_io_cache();
+        Self::from_source_reusing(source, &options, io_cache)
+    }
+
+    /// Open a file over any byte source, reusing a byte cache that already
+    /// holds some of its pages.
+    ///
+    /// The asynchronous open uses this. It fetches the metadata pages itself,
+    /// then hands them straight to the file.
+    pub fn from_source_reusing(
+        source: Arc<dyn ByteSource>,
+        options: &OpenOptions,
+        io_cache: Option<crate::cache::IoCache>,
+    ) -> Result<Self> {
+        let superblock = Superblock::read(source.as_ref())?;
         let root = {
             // Indexing is many small reads over a small region: exactly what the
             // page cache is for. The decoded-chunk cache stays out of it.

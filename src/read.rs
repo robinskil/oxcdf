@@ -41,6 +41,31 @@ impl Hyperslab {
         Ok(slab)
     }
 
+    /// Build a selection from one range for each axis.
+    ///
+    /// `what` names the variable in an error message.
+    pub fn from_ranges(what: &str, shape: &[u64], ranges: &[std::ops::Range<u64>]) -> Result<Self> {
+        if ranges.len() != shape.len() {
+            return Err(Error::bad_request(format!(
+                "variable {what} has rank {} but {} ranges were given",
+                shape.len(),
+                ranges.len()
+            )));
+        }
+        let mut start = Vec::with_capacity(ranges.len());
+        let mut count = Vec::with_capacity(ranges.len());
+        for (axis, r) in ranges.iter().enumerate() {
+            if r.end < r.start {
+                return Err(Error::bad_request(format!(
+                    "range on axis {axis} of variable {what} is reversed"
+                )));
+            }
+            start.push(r.start);
+            count.push(r.end - r.start);
+        }
+        Ok(Self { start, count })
+    }
+
     /// Total number of elements selected.
     pub fn element_count(&self) -> u64 {
         self.count.iter().product()
@@ -776,8 +801,10 @@ fn read_chunked(
 /// heavy decoding should still hand step 3 to `spawn_blocking`; this function
 /// does the awaiting before any of that work begins.
 ///
-/// Indexing is not needed here: `dataset.chunks` was resolved when the file was
-/// opened, and the index is engine-agnostic.
+/// This function fetches data, not metadata. The dataset's chunk index must be
+/// resolved before the call. Most callers should use
+/// [`crate::async_file::AsyncVariable::read`] instead, which resolves the index
+/// itself.
 #[cfg(feature = "async")]
 pub async fn read_hyperslab_async(
     source: &dyn crate::async_source::AsyncByteSource,
@@ -868,13 +895,14 @@ pub async fn read_hyperslab_async_with(
         }
 
         Layout::Chunked { chunk_dims, .. } => {
-            // The async engine does not walk B-trees: resolving a chunk index
-            // is a chain of dependent reads, which belongs in `prepare`. Say so
-            // plainly rather than silently reading nothing.
+            // This function fetches data, not metadata. A chunk index is
+            // metadata, so the caller resolves it first.
+            // `crate::async_file::AsyncVariable` does that. Say so plainly
+            // rather than silently reading nothing.
             let chunks = dataset.resolved_chunks().ok_or_else(|| {
                 Error::bad_request(format!(
-                    "dataset {} has no resolved chunk index; call `prepare` before \
-                     reading it asynchronously",
+                    "dataset {} has no resolved chunk index; read it through \
+                     `AsyncFile`, which resolves the index itself",
                     dataset.path
                 ))
             })?;

@@ -45,6 +45,16 @@ pub enum Error {
     NotFound(String),
     /// The caller passed an invalid request, such as an out-of-range hyperslab.
     BadRequest(String),
+    /// The byte source does not hold the requested bytes yet.
+    ///
+    /// The asynchronous engine produces this. It runs a synchronous walk over
+    /// the bytes it holds. A walk that needs more bytes stops with this error.
+    /// The engine fetches the missing bytes. The engine then runs the walk
+    /// again. See [`crate::replay`].
+    ///
+    /// A public asynchronous method never returns this. It surfaces only from a
+    /// synchronous read on a file that an asynchronous open produced.
+    Incomplete,
 }
 
 impl Error {
@@ -103,6 +113,11 @@ impl fmt::Display for Error {
             ),
             Error::NotFound(m) => write!(f, "not found: {m}"),
             Error::BadRequest(m) => write!(f, "bad request: {m}"),
+            Error::Incomplete => write!(
+                f,
+                "the bytes are not in memory: an asynchronous open produced this file, \
+                 so use the asynchronous read methods"
+            ),
         }
     }
 }

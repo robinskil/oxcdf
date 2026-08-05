@@ -82,6 +82,9 @@ pub fn read_dense_attributes(
         |cur| Attribute::parse_at(cur, sizes),
     ) {
         Ok(indexed) => Ok((indexed, true)),
+        // The asynchronous engine replays this walk until every byte is in
+        // memory. Report a short read. Do not mistake it for a bad index.
+        Err(crate::error::Error::Incomplete) => Err(crate::error::Error::Incomplete),
         // Keep whatever the walk found rather than losing it to an index this
         // reader cannot follow.
         Err(_) => Ok((attributes, false)),

@@ -41,24 +41,39 @@
 //! The decode step stays synchronous. Decompression uses the processor. An
 //! async decode would block the runtime.
 //!
+//! The crate holds one parser, not two. The asynchronous open runs the
+//! synchronous walk over pages held in memory. It fetches the pages the walk
+//! asks for. It then runs the walk again. See [`replay`].
+//!
 //! # Layers
 //!
 //! * [`netcdf`] applies the netCDF conventions. Use it for variables,
 //!   dimensions and attributes.
+//! * [`async_file`] is the same layer, asynchronous.
 //! * [`index`] holds the HDF5 view. Use it for datasets and raw storage.
 //! * [`classic`] reads the netCDF classic formats. Those files are not HDF5.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use oxcdf::netcdf::NetcdfFile;
-//!
-//! let file = NetcdfFile::open("argo.nc")?;
+//! let file = oxcdf::open("argo.nc")?;
 //! let temp = file.variable("TEMP").unwrap();
 //!
 //! println!("{:?} {:?}", temp.shape, temp.dimensions);
 //! let values = temp.read()?.to_f64()?;
 //! # Ok::<(), oxcdf::Error>(())
+//! ```
+//!
+//! The asynchronous form matches it.
+//!
+//! ```no_run
+//! # async fn run(source: std::sync::Arc<dyn oxcdf::AsyncByteSource>) -> oxcdf::Result<()> {
+//! let file = oxcdf::open_async(source).await?;
+//! let temp = file.variable("TEMP").unwrap();
+//!
+//! println!("{:?} {:?}", temp.shape, temp.dimensions);
+//! let values = temp.read().await?.to_f64()?;
+//! # Ok(()) }
 //! ```
 //!
 //! # Writes
@@ -83,6 +98,8 @@
 #![deny(rust_2018_idioms)]
 
 #[cfg(feature = "async")]
+pub mod async_file;
+#[cfg(feature = "async")]
 pub mod async_source;
 pub mod cache;
 pub mod checksum;
@@ -97,10 +114,72 @@ pub mod io;
 pub mod object_store_source;
 pub mod netcdf;
 pub mod read;
+#[cfg(feature = "async")]
+pub mod replay;
 pub mod source;
 
 pub use error::{Error, Result};
 pub use source::{ByteSource, FileSource, MemorySource};
+
+// The types most callers need, at the crate root.
+pub use index::OpenOptions;
+pub use netcdf::{AttributeValue, DType, NcAttribute, NcDimension, NcVariable, NetcdfFile, Values, Variable};
+pub use read::Hyperslab;
+
+#[cfg(feature = "async")]
+pub use async_file::{AsyncFile, AsyncVariable};
+#[cfg(feature = "async")]
+pub use async_source::{AsyncByteSource, SyncAsAsync};
+
+/// Open a netCDF file for reading.
+///
+/// The file may be netCDF-4 or netCDF classic. This is the synchronous entry
+/// point. Use [`open_async`] for an asynchronous one.
+///
+/// ```no_run
+/// let file = oxcdf::open("argo.nc")?;
+/// let temp = file.variable("TEMP").unwrap();
+/// let values = temp.read()?.to_f64()?;
+/// # Ok::<(), oxcdf::Error>(())
+/// ```
+pub fn open(path: impl AsRef<std::path::Path>) -> Result<NetcdfFile> {
+    NetcdfFile::open(path)
+}
+
+/// Open a netCDF file for reading, with explicit options.
+///
+/// Use [`OpenOptions::remote`] for object storage.
+pub fn open_with(path: impl AsRef<std::path::Path>, options: OpenOptions) -> Result<NetcdfFile> {
+    NetcdfFile::open_with(path, options)
+}
+
+/// Open a netCDF-4 file over an asynchronous byte source.
+///
+/// The open reads the metadata. The returned file answers every metadata
+/// question without further input. A read of values awaits.
+///
+/// ```no_run
+/// # async fn run(source: std::sync::Arc<dyn oxcdf::AsyncByteSource>) -> oxcdf::Result<()> {
+/// let file = oxcdf::open_async(source).await?;
+/// let temp = file.variable("TEMP").unwrap();
+/// let values = temp.read().await?.to_f64()?;
+/// # Ok(()) }
+/// ```
+#[cfg(feature = "async")]
+pub async fn open_async(source: std::sync::Arc<dyn AsyncByteSource>) -> Result<AsyncFile> {
+    AsyncFile::open(source).await
+}
+
+/// Open a netCDF-4 file over an asynchronous byte source, with explicit options.
+///
+/// Use [`OpenOptions::remote`] for object storage.
+#[cfg(feature = "async")]
+pub async fn open_async_with(
+    source: std::sync::Arc<dyn AsyncByteSource>,
+    options: OpenOptions,
+) -> Result<AsyncFile> {
+    AsyncFile::open_with(source, options).await
+}
 
 /// The 8-byte signature at the front of every HDF5 file.
 pub const HDF5_SIGNATURE: [u8; 8] = [0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a];

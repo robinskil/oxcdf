@@ -243,6 +243,15 @@ impl NetcdfFile {
         &self.hdf5
     }
 
+    /// Replace the underlying HDF5 file, keeping the netCDF view.
+    ///
+    /// Use this to attach caches after an open. The netCDF view describes
+    /// names, shapes and axes. None of those depend on how bytes arrive.
+    pub fn map_hdf5(mut self, f: impl FnOnce(Hdf5File) -> Hdf5File) -> Self {
+        self.hdf5 = f(self.hdf5);
+        self
+    }
+
     /// A variable's metadata by absolute path, without binding it to the file.
     ///
     /// Prefer [`NetcdfFile::variable`], which returns a readable handle.
@@ -776,7 +785,8 @@ pub enum DType {
 }
 
 impl DType {
-    fn of(datatype: &crate::hdf5::message::Datatype) -> Self {
+    /// The summary type of an HDF5 datatype.
+    pub fn of(datatype: &crate::hdf5::message::Datatype) -> Self {
         let size = datatype.size;
         match &datatype.class {
             DatatypeClass::FixedPoint { signed: true, .. } => DType::Int(size as u8),
@@ -1099,61 +1109,15 @@ impl<'a> Variable<'a> {
     /// # Ok(()) }
     /// ```
     pub fn read_slice(&self, ranges: &[std::ops::Range<u64>]) -> Result<Values> {
-        if ranges.len() != self.info.shape.len() {
-            return Err(Error::bad_request(format!(
-                "variable {} has rank {} but {} ranges were given",
-                self.info.path,
-                self.info.shape.len(),
-                ranges.len()
-            )));
-        }
-        let mut start = Vec::with_capacity(ranges.len());
-        let mut count = Vec::with_capacity(ranges.len());
-        for (axis, r) in ranges.iter().enumerate() {
-            if r.end < r.start {
-                return Err(Error::bad_request(format!(
-                    "range on axis {axis} of variable {} is reversed",
-                    self.info.path
-                )));
-            }
-            start.push(r.start);
-            count.push(r.end - r.start);
-        }
-        self.read_selection(&Hyperslab { start, count })
+        let slab = Hyperslab::from_ranges(&self.info.path, &self.info.shape, ranges)?;
+        self.read_selection(&slab)
     }
 
     /// Read an explicit selection.
     pub fn read_selection(&self, slab: &Hyperslab) -> Result<Values> {
         let ctx = self.file.hdf5().ctx();
         let raw = read_hyperslab(ctx, self.dataset, slab)?;
-
-        // Variable-length strings must be followed into the global heap while
-        // the file is still to hand.
-        let mut vlen_strings = None;
-        let mut vlen_sequences = None;
-        let mut vlen_base = None;
-
-        if let DatatypeClass::VariableLength { kind, base, .. } = &self.dataset.datatype.class {
-            match kind {
-                crate::hdf5::message::VlenKind::String => {
-                    vlen_strings =
-                        Some(crate::read::resolve_vlen_strings(ctx, self.dataset, &raw)?);
-                }
-                crate::hdf5::message::VlenKind::Sequence => {
-                    vlen_sequences =
-                        Some(crate::read::resolve_vlen_sequences(ctx, self.dataset, &raw)?);
-                    vlen_base = Some((**base).clone());
-                }
-            }
-        }
-
-        Ok(Values {
-            raw,
-            datatype: self.dataset.datatype.clone(),
-            vlen_strings,
-            vlen_sequences,
-            vlen_base,
-        })
+        values_from_raw(ctx, self.dataset, raw)
     }
 
     /// The shape of one storage chunk, when the variable is chunked.
@@ -1190,52 +1154,107 @@ impl<'a> Variable<'a> {
         self.try_chunks().unwrap_or_default()
     }
 
-    /// Resolve the chunk index now, so later reads do no metadata I/O.
+    /// Resolve the chunk index now, so later reads do no metadata input.
+    ///
+    /// This is an optimisation. A read resolves the index itself.
     pub fn prepare(&self) -> Result<()> {
         self.dataset.prepare(self.file.hdf5().ctx())
     }
 
     /// Every stored chunk, reporting a chunk index this reader cannot walk.
     pub fn try_chunks(&self) -> Result<Vec<Chunk>> {
-        let shape = &self.info.shape;
-        let resolved = self.dataset.chunks(self.file.hdf5().ctx())?;
-
-        let (Some(chunk_dims), Some(records)) = (self.chunk_shape(), resolved) else {
-            return Ok(vec![Chunk {
-                offset: vec![0; shape.len()],
-                shape: shape.clone(),
-                stored_size: self.element_count() * self.dataset.element_size() as u64,
-            }]);
-        };
-
-        Ok(records
-            .iter()
-            .filter_map(|record| {
-                // Clip the stored chunk to the variable's bounds. Edge chunks
-                // are stored full size and hang past the end.
-                let mut clipped = Vec::with_capacity(shape.len());
-                for axis in 0..shape.len() {
-                    let origin = *record.offset.get(axis)?;
-                    let full = *chunk_dims.get(axis)?;
-                    let dim = *shape.get(axis)?;
-                    if origin >= dim {
-                        return None;
-                    }
-                    clipped.push(full.min(dim - origin));
-                }
-                Some(Chunk {
-                    offset: record.offset.clone(),
-                    shape: clipped,
-                    stored_size: record.size as u64,
-                })
-            })
-            .collect())
+        self.dataset.chunks(self.file.hdf5().ctx())?;
+        chunks_of(self.dataset)
     }
 
     /// Read one chunk. The result covers exactly the chunk's clipped region.
     pub fn read_chunk(&self, chunk: &Chunk) -> Result<Values> {
         self.read_selection(&chunk.selection())
     }
+}
+
+/// Turn raw bytes into values, following any heap pointer they hold.
+///
+/// A variable-length string or sequence stores a pointer into the global heap.
+/// The value is only complete once the reader follows it, so that read happens
+/// here, while the file is still to hand. Both engines use this.
+pub(crate) fn values_from_raw(
+    ctx: crate::hdf5::context::Ctx<'_>,
+    dataset: &DatasetIndex,
+    raw: RawData,
+) -> Result<Values> {
+    let mut vlen_strings = None;
+    let mut vlen_sequences = None;
+    let mut vlen_base = None;
+
+    if let DatatypeClass::VariableLength { kind, base, .. } = &dataset.datatype.class {
+        match kind {
+            crate::hdf5::message::VlenKind::String => {
+                vlen_strings = Some(crate::read::resolve_vlen_strings(ctx, dataset, &raw)?);
+            }
+            crate::hdf5::message::VlenKind::Sequence => {
+                vlen_sequences = Some(crate::read::resolve_vlen_sequences(ctx, dataset, &raw)?);
+                vlen_base = Some((**base).clone());
+            }
+        }
+    }
+
+    Ok(Values {
+        raw,
+        datatype: dataset.datatype.clone(),
+        vlen_strings,
+        vlen_sequences,
+        vlen_base,
+    })
+}
+
+/// Every stored chunk of a dataset, clipped to its bounds.
+///
+/// The chunk index must be resolved already. A dataset that is not chunked
+/// reports one chunk covering everything, so a caller uses one loop either way.
+/// Both engines use this.
+pub(crate) fn chunks_of(dataset: &DatasetIndex) -> Result<Vec<Chunk>> {
+    let shape = &dataset.shape;
+    let chunk_dims = match &dataset.layout {
+        Layout::Chunked { chunk_dims, .. } => Some(
+            chunk_dims
+                .iter()
+                .map(|&d| d as u64)
+                .collect::<Vec<u64>>(),
+        ),
+        _ => None,
+    };
+
+    let (Some(chunk_dims), Some(records)) = (chunk_dims, dataset.resolved_chunks()) else {
+        return Ok(vec![Chunk {
+            offset: vec![0; shape.len()],
+            shape: shape.clone(),
+            stored_size: dataset.element_count() * dataset.element_size() as u64,
+        }]);
+    };
+
+    Ok(records
+        .iter()
+        .filter_map(|record| {
+            // Clip the stored chunk to the variable's bounds. An edge chunk is
+            // stored full size and hangs past the end.
+            let mut clipped = Vec::with_capacity(shape.len());
+            for axis in 0..shape.len() {
+                let origin = *record.offset.get(axis)?;
+                let full = *chunk_dims.get(axis)?;
+                let dim = *shape.get(axis)?;
+                if origin >= dim {
+                    return None;
+                }
+                clipped.push(full.min(dim - origin));
+            }
+            Some(Chunk {
+                offset: record.offset.clone(),
+                shape: clipped,
+                stored_size: record.size as u64,
+            })
+        })
+        .collect())
 }
 
 impl NetcdfFile {

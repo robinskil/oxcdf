@@ -311,6 +311,31 @@ impl IoCache {
         self.pages.invalidate_all();
     }
 
+    /// One page by index, if the cache holds it.
+    ///
+    /// The index counts pages of [`IoCache::page_size`] from the start of the
+    /// file. The asynchronous engine uses this to share pages between walks.
+    pub fn page(&self, index: u64) -> Option<Bytes> {
+        self.pages.get(&index)
+    }
+
+    /// Store one page by index.
+    ///
+    /// The bytes must be the file's bytes at `index * page_size`. A page other
+    /// than the last one must be exactly [`IoCache::page_size`] long.
+    pub fn put_page(&self, index: u64, bytes: Bytes) {
+        self.pages.insert(index, bytes);
+    }
+
+    /// Apply the cache's pending inserts and evictions now.
+    ///
+    /// A write becomes visible to a reader a moment after the insert. This
+    /// method removes that delay. Tests need it. Normal code does not: a page
+    /// that a reader misses costs one fetch, not a wrong answer.
+    pub fn run_pending(&self) {
+        self.pages.run_pending_tasks();
+    }
+
     /// Read `len` bytes at `offset`, serving whatever is already cached.
     ///
     /// Missing pages are fetched in runs, so cached pages in the middle of a
