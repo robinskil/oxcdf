@@ -9,7 +9,7 @@ same time.
 
 ```toml
 [dependencies]
-oxcdf = "0.1"
+oxcdf = { version = "0.1", features = ["async", "object-store"] }
 ```
 
 | Feature | Purpose |
@@ -19,71 +19,168 @@ oxcdf = "0.1"
 | `ndarray` | Return `ArrayD` instead of `Vec` |
 | `diff-tests` | Compare against netcdf-c in tests |
 
-## Read a file
+## The interface
+
+The two engines expose the same interface. An open awaits. A read of values
+awaits. Every other call answers at once, because the open reads all the
+metadata.
+
+| | Synchronous | Asynchronous |
+|---|---|---|
+| Open a local file | `oxcdf::open(path)?` | `oxcdf::open_async(source).await?` |
+| Open from a store | | `AsyncFile::open_store(store, path).await?` |
+| Dimensions | `file.dimensions()` | `file.dimensions()` |
+| Global attributes | `file.attributes()` | `file.attributes()` |
+| Every variable | `file.variables()` | `file.variables()` |
+| One variable | `file.variable("TEMP")` | `file.variable("TEMP")` |
+| A subgroup | `file.group("/forecast")` | `file.group("/forecast")` |
+| Variable attributes | `var.attribute("units")` | `var.attribute("units")` |
+| Read all | `var.read()?` | `var.read().await?` |
+| Read a slice | `var.read_slice(&[0..8])?` | `var.read_slice(&[0..8]).await?` |
+| Read an array | `var.read_array_f64()?` | `var.read_array_f64().await?` |
+| List the chunks | `var.chunks()` | `var.chunks().await?` |
+| Read one chunk | `var.read_chunk(&c)?` | `var.read_chunk(&c).await?` |
+
+## Read a local file
 
 ```rust
 let file = oxcdf::open("argo.nc")?;
 
-// Metadata.
+// Dimensions.
 for d in file.dimensions() {
-    println!("{} = {}", d.name, d.len);
-}
-for v in file.variables() {
-    println!("{} {:?} {:?}", v.name, v.shape, v.dimensions);
+    let mark = if d.is_unlimited { " (unlimited)" } else { "" };
+    println!("{} = {}{}", d.name, d.len, mark);
 }
 
-// Values. A leading slash is optional.
+// Global attributes.
+for a in file.attributes() {
+    println!("{} = {:?}", a.name, a.value);
+}
+
+// Variables.
+for v in file.variables() {
+    println!("{} {:?} {:?} {:?}", v.name, v.dtype(), v.shape, v.dimensions);
+}
+
+// One variable. A leading slash is optional.
 let temp = file.variable("TEMP").unwrap();
+
+// Its attributes.
+println!("{:?}", temp.attribute("units").unwrap().value.as_text());
+println!("{:?}", temp.attribute("_FillValue").unwrap().value.as_f64());
+
+// Its values.
 let all = temp.read()?.to_f64()?;
 let part = temp.read_slice(&[0..8, 10..30])?.to_f64()?;
 
-// Attributes.
-println!("{:?}", temp.attribute("units").unwrap().value.as_text());
+// A variable in a subgroup.
+let nested = file.variable("/forecast/TEMP").unwrap();
 ```
 
-`Values` also gives `to_i64`, `to_strings` and `to_sequences_f64`.
+`Values` also gives `to_i64`, `to_strings`, `to_sequences_f64` and `as_bytes`.
 
-## Read a file asynchronously
+## Read into an ndarray
 
-Turn on the `async` feature. The API matches the synchronous one. An open
-awaits. A read of values awaits. Everything else answers at once.
+Turn on the `ndarray` feature. The result is an `ArrayD`. Its shape is the
+variable's shape. Its axes follow the variable's dimensions, in order.
 
 ```rust
-let file = oxcdf::open_async(source).await?;
-
-for d in file.dimensions() {
-    println!("{} = {}", d.name, d.len);
-}
-
 let temp = file.variable("TEMP").unwrap();
-println!("{:?}", temp.attribute("units").unwrap().value.as_text());
 
-let all = temp.read().await?.to_f64()?;
-let part = temp.read_slice(&[0..8, 10..30]).await?.to_f64()?;
+// The whole variable.
+let a = temp.read_array_f64()?;      // ArrayD<f64>, shape [8, 6]
+assert_eq!(a.shape(), &[8, 6]);
+println!("{}", a[[0, 0]]);           // Row-major.
+
+// One row.
+let row = a.index_axis(ndarray::Axis(0), 0);
+
+// A slice. Read first, then convert.
+let b = temp.read_slice(&[5..15, 2..5])?.to_array_f64()?;
+assert_eq!(b.shape(), &[10, 3]);
+
+// An integer variable.
+let counts = file.variable("N_LEVELS").unwrap().read_array_i64()?;
+
+// Strings.
+let names = file.variable("PLATFORM_NUMBER").unwrap().read()?.to_array_strings()?;
 ```
 
-`source` is any `Arc<dyn AsyncByteSource>`. Use `SyncAsAsync(FileSource::open(
-path)?)` for a local file.
+The asynchronous form is the same, with an await.
+
+```rust
+let a = temp.read_array_f64().await?;
+let b = temp.read_slice(&[5..15, 2..5]).await?.to_array_f64()?;
+```
+
+`read_array_f64` widens any integer or float variable to `f64`. `read_array_i64`
+takes integers only: it refuses a float rather than round it.
+`to_array_strings` needs a string variable, fixed length or variable length.
 
 ## Read from object storage
 
-Turn on the `object-store` and `async` features. The reader reads byte ranges.
-It needs no local copy.
+Turn on the `async` and `object-store` features. The reader reads byte ranges.
+It needs no local copy. The interface does not change.
 
 ```rust
-use object_store::{aws::AmazonS3Builder, path::Path};
+use std::sync::Arc;
+use object_store::{aws::AmazonS3Builder, path::Path, ObjectStore};
+use oxcdf::AsyncFile;
 
-let store = Arc::new(AmazonS3Builder::from_env().with_bucket_name("argo").build()?);
-let file = oxcdf::AsyncFile::open_store(store, Path::from("13857_prof.nc")).await?;
+let store: Arc<dyn ObjectStore> =
+    Arc::new(AmazonS3Builder::from_env().with_bucket_name("argo").build()?);
 
+let file = AsyncFile::open_store(store, Path::from("dac/aoml/13857_prof.nc")).await?;
+
+// Dimensions.
+for d in file.dimensions() {
+    let mark = if d.is_unlimited { " (unlimited)" } else { "" };
+    println!("{} = {}{}", d.name, d.len, mark);
+}
+
+// Global attributes.
+for a in file.attributes() {
+    println!("{} = {:?}", a.name, a.value);
+}
+
+// Variables.
+for v in file.variables() {
+    println!("{} {:?} {:?} {:?}", v.name, v.dtype(), v.shape, v.dimensions);
+}
+
+// One variable.
 let temp = file.variable("TEMP").unwrap();
-let values = temp.read().await?.to_f64()?;
+
+// Its attributes. The open read them, so this needs no request.
+println!("{:?}", temp.attribute("units").unwrap().value.as_text());
+
+// Its values.
+let all = temp.read().await?.to_f64()?;
+let part = temp.read_slice(&[0..8, 10..30]).await?.to_f64()?;
 ```
 
 `open_store` uses `OpenOptions::remote()`: a 256 KiB request size and a 128 MiB
 byte cache. Pass your own with `open_store_with`.
 
 Every file in the test corpus opens in **one request**.
+
+## Read a local file asynchronously
+
+Wrap a local file to get the same interface without a store.
+
+```rust
+use std::sync::Arc;
+use oxcdf::{FileSource, SyncAsAsync};
+
+let source = Arc::new(SyncAsAsync(FileSource::open("argo.nc")?));
+let file = oxcdf::open_async(source).await?;
+
+let temp = file.variable("TEMP").unwrap();
+let values = temp.read().await?.to_f64()?;
+```
+
+`open_async` takes any `Arc<dyn AsyncByteSource>`. Implement that trait for any
+other backend.
 
 ## Read one chunk at a time
 
@@ -98,6 +195,15 @@ let blocks: Vec<_> = temp
     .par_iter()
     .map(|c| temp.read_chunk(c))
     .collect();
+```
+
+The asynchronous form reads them together.
+
+```rust
+let chunks = temp.chunks().await?;
+let blocks = futures::future::try_join_all(
+    chunks.iter().map(|c| temp.read_chunk(c))
+).await?;
 ```
 
 Chunks are clipped to the variable. They cover it exactly once.
@@ -188,7 +294,8 @@ The crate does not write files. Keep netcdf-c for writes.
 cargo test --features "diff-tests,object-store,ndarray,async"
 ```
 
-317 tests. `differential.rs` compares every value against netcdf-c.
+325 tests. `differential.rs` compares every value against netcdf-c.
 `netcdf_layer.rs` compares variables, dimensions and axes against `ncdump`.
 `async_open.rs` compares the two engines, file by file and value by value.
-Floats compare by bit pattern, not by tolerance.
+`readme_api.rs` runs every example on this page, so the page cannot drift from
+the API. Floats compare by bit pattern, not by tolerance.
