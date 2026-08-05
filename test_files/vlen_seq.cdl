@@ -1,0 +1,14 @@
+netcdf vlen_seq {
+types:
+    float(*) row_t ;
+    int(*) idx_t ;
+dimensions:
+    n = 4 ;
+variables:
+    row_t rows(n) ;
+        rows:long_name = "ragged rows" ;
+    idx_t indices(n) ;
+data:
+    rows = {1.5, 2.5}, {}, {3.5, 4.5, 5.5}, {-0.25} ;
+    indices = {1}, {2, 3}, {}, {4, 5, 6, 7} ;
+}

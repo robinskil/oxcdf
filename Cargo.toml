@@ -1,0 +1,53 @@
+[package]
+name = "oxcdf"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "A pure-Rust, parallel-safe reader for netCDF-4 and netCDF classic files"
+repository = "https://github.com/robinskil/oxcdf"
+readme = "README.md"
+keywords = ["netcdf", "hdf5", "scientific", "reader", "parallel"]
+categories = ["science", "parser-implementations", "filesystem"]
+license = "Apache-2.0"
+
+[features]
+default = []
+# Return reads as `ndarray::ArrayD` instead of flat vectors.
+ndarray = ["dep:ndarray"]
+# Read from S3, GCS, Azure or HTTP by byte range. No local copy is needed.
+object-store = ["dep:object_store", "dep:tokio"]
+# The asynchronous engine. It shares every pure part with the synchronous one.
+async = ["dep:async-trait", "dep:tokio"]
+# Compare this reader against netcdf-c, value by value. Off by default: the
+# crate exists to avoid that library.
+diff-tests = ["dep:netcdf"]
+
+[dependencies]
+thiserror = "2.0.12"
+# Pure-Rust inflate. Never turn on the C zlib backends.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+zstd = "0.13.2"
+lz4_flex = "0.11"
+# A concurrent cache. A hit takes no lock.
+moka = { version = "0.12.10", features = ["sync"] }
+# Byte buffers that clone and slice without a copy.
+bytes = "1.10.0"
+
+ndarray = { version = "0.17.1", optional = true }
+object_store = { version = "0.13.1", optional = true }
+tokio = { version = "1.47.1", features = ["rt", "sync"], optional = true }
+async-trait = { version = "0.1.88", optional = true }
+
+[dependencies.netcdf]
+git = "https://github.com/robinskil/netcdf.git"
+version = "0.11.1"
+features = ["ndarray"]
+optional = true
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["full"] }
+zstd = "0.13.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

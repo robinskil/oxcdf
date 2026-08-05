@@ -1,0 +1,33 @@
+netcdf classic {
+dimensions:
+    time = UNLIMITED ;
+    level = 3 ;
+    name_strlen = 8 ;
+variables:
+    double time(time) ;
+        time:units = "days since 1970-01-01" ;
+    float pressure(time, level) ;
+        pressure:units = "dbar" ;
+        pressure:_FillValue = -999.f ;
+    int count(level) ;
+    short flag(time, level) ;
+    char label(level, name_strlen) ;
+        label:long_name = "level label" ;
+// global attributes:
+    :title = "classic format fixture" ;
+    :version = 3 ;
+data:
+    time = 0., 1., 2., 3. ;
+    pressure =
+        0.5, 1.5, 2.5,
+        3.5, 4.5, 5.5,
+        6.5, 7.5, 8.5,
+        9.5, 10.5, 11.5 ;
+    count = 10, 20, 30 ;
+    flag =
+        1, 2, 3,
+        4, 5, 6,
+        7, 8, 9,
+        10, 11, 12 ;
+    label = "surface", "middle", "bottom" ;
+}
