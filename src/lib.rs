@@ -106,6 +106,7 @@ pub mod checksum;
 pub mod classic;
 pub mod cursor;
 pub mod error;
+pub mod extent;
 pub mod filters;
 pub mod hdf5;
 pub mod index;
@@ -122,8 +123,12 @@ pub use error::{Error, Result};
 pub use source::{ByteSource, FileSource, MemorySource};
 
 // The types most callers need, at the crate root.
+pub use extent::{Extent, Extents};
 pub use index::OpenOptions;
-pub use netcdf::{AttributeValue, DType, NcAttribute, NcDimension, NcVariable, NetcdfFile, Values, Variable};
+pub use netcdf::{
+    AttributeValue, DType, Element, NcAttribute, NcDimension, NcVariable, NetcdfFile, Values,
+    Variable,
+};
 pub use read::Hyperslab;
 
 #[cfg(feature = "async")]

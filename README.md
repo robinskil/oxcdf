@@ -35,15 +35,20 @@ metadata.
 | One variable | `file.variable("TEMP")` | `file.variable("TEMP")` |
 | A subgroup | `file.group("/forecast")` | `file.group("/forecast")` |
 | Variable attributes | `var.attribute("units")` | `var.attribute("units")` |
-| Read all | `var.read()?` | `var.read().await?` |
-| Read a slice | `var.read_slice(&[0..8])?` | `var.read_slice(&[0..8]).await?` |
-| Read an array | `var.read_array_f64()?` | `var.read_array_f64().await?` |
+| Read values | `var.get_values::<f32,_>(..)?` | `var.get_values::<f32,_>(..).await?` |
+| Read one value | `var.get_value::<f32,_>([0,3])?` | `var.get_value::<f32,_>([0,3]).await?` |
+| Read an array | `var.get_array::<f32,_>(..)?` | `var.get_array::<f32,_>(..).await?` |
 | List the chunks | `var.chunks()` | `var.chunks().await?` |
 | Read one chunk | `var.read_chunk(&c)?` | `var.read_chunk(&c).await?` |
+
+`get_values`, `get_value` and the selection forms match the `netcdf` crate. A
+program that uses that crate reads the same values here.
 
 ## Read a local file
 
 ```rust
+use oxcdf::{Extent, Extents};
+
 let file = oxcdf::open("argo.nc")?;
 
 // Dimensions.
@@ -69,38 +74,101 @@ let temp = file.variable("TEMP").unwrap();
 println!("{:?}", temp.attribute("units").unwrap().value.as_text());
 println!("{:?}", temp.attribute("_FillValue").unwrap().value.as_f64());
 
-// Its values.
-let all = temp.read()?.to_f64()?;
-let part = temp.read_slice(&[0..8, 10..30])?.to_f64()?;
+// Its values. Ask for the stored type to copy them without a conversion.
+let all = temp.get_values::<f32, _>(Extents::All)?;
+let part = temp.get_values::<f32, _>([0..8, 10..30])?;
+let one = temp.get_value::<f32, _>([0, 3])?;
 
 // A variable in a subgroup.
 let nested = file.variable("/forecast/TEMP").unwrap();
 ```
 
-`Values` also gives `to_i64`, `to_strings`, `to_sequences_f64` and `as_bytes`.
+## Select the elements
 
-## Read into an ndarray
+`get_values` takes the same selection forms as the `netcdf` crate.
 
-Turn on the `ndarray` feature. The result is an `ArrayD`. Its shape is the
-variable's shape. Its axes follow the variable's dimensions, in order.
+```rust
+var.get_values::<f32, _>(Extents::All)?;     // the whole variable
+var.get_values::<f32, _>(..)?;               // the same
+var.get_values::<f32, _>([0..8, 10..30])?;   // one range for each axis
+var.get_values::<f32, _>([0, 3])?;           // one element
+var.get_values::<f32, _>([2.., 5..])?;       // to the end of each axis
+var.get_values::<f32, _>([..8, ..30])?;      // from the start of each axis
+
+// A Rust array holds one type, so mix an index and a range through `Extent`.
+var.get_values::<f32, _>([Extent::Index(3), (0..6).into()])?;
+
+// A start and a count for each axis.
+var.get_values::<f32, _>(([0usize, 10].as_slice(), [8usize, 20].as_slice()))?;
+```
+
+A stride is the one form this reader does not read yet. It returns
+`Error::Unsupported` rather than read the wrong elements.
+
+## Types
+
+A read converts between any two numeric types, which is what the `netcdf` crate
+does. A read of a string as a number returns `Error::TypeMismatch`, which names
+the stored type.
 
 ```rust
 let temp = file.variable("TEMP").unwrap();
+println!("{:?}", temp.dtype());               // Float(4)
+
+let exact = temp.get_values::<f32, _>(..)?;   // copied, no conversion
+let wide = temp.get_values::<f64, _>(..)?;    // converted
+```
+
+Ask for the type `dtype()` reports and the read copies the values. Any other
+numeric type converts, and a conversion can lose information: `f64` to `f32`
+loses precision, `i64` to `f64` loses integers above 2^53, and a float to an
+integer truncates toward zero.
+
+| `dtype()` | Rust type | netCDF |
+|---|---|---|
+| `Int(1)` `Int(2)` `Int(4)` `Int(8)` | `i8` `i16` `i32` `i64` | `byte` `short` `int` `int64` |
+| `Uint(1)` `Uint(2)` `Uint(4)` `Uint(8)` | `u8` `u16` `u32` `u64` | `ubyte` `ushort` `uint` `uint64` |
+| `Float(4)` `Float(8)` | `f32` `f64` | `float` `double` |
+
+## Other reads
+
+`read()` and `read_slice()` return a `Values`, which holds the type and the
+shape. Use it to look before you decode, and for strings and sequences.
+
+```rust
+let values = temp.read()?;
+println!("{:?} {:?}", values.dtype(), values.shape());
+
+let numbers: Vec<f32> = values.get()?;
+let text = file.variable("PLATFORM_NUMBER").unwrap().read()?.to_strings()?;
+let seqs = file.variable("profiles").unwrap().read()?.to_sequences::<f32>()?;
+```
+
+`Values` also gives `as_bytes` for the raw native-order bytes.
+
+## Read into an ndarray
+
+Turn on the `ndarray` feature. `get_array` takes the same selections and the
+same types as `get_values`. The result is an `ArrayD` whose shape is the
+selection's shape. Its axes follow the variable's dimensions, in order.
+
+```rust
+let temp = file.variable("TEMP").unwrap();     // stored f32
 
 // The whole variable.
-let a = temp.read_array_f64()?;      // ArrayD<f64>, shape [8, 6]
+let a = temp.get_array::<f32, _>(..)?;         // ArrayD<f32>, shape [8, 6]
 assert_eq!(a.shape(), &[8, 6]);
-println!("{}", a[[0, 0]]);           // Row-major.
+println!("{}", a[[0, 0]]);                     // Row-major.
 
 // One row.
 let row = a.index_axis(ndarray::Axis(0), 0);
 
-// A slice. Read first, then convert.
-let b = temp.read_slice(&[5..15, 2..5])?.to_array_f64()?;
+// A block.
+let b = temp.get_array::<f32, _>([5..15, 2..5])?;
 assert_eq!(b.shape(), &[10, 3]);
 
 // An integer variable.
-let counts = file.variable("N_LEVELS").unwrap().read_array_i64()?;
+let counts = file.variable("N_LEVELS").unwrap().get_array::<i32, _>(..)?;
 
 // Strings.
 let names = file.variable("PLATFORM_NUMBER").unwrap().read()?.to_array_strings()?;
@@ -109,12 +177,10 @@ let names = file.variable("PLATFORM_NUMBER").unwrap().read()?.to_array_strings()
 The asynchronous form is the same, with an await.
 
 ```rust
-let a = temp.read_array_f64().await?;
-let b = temp.read_slice(&[5..15, 2..5]).await?.to_array_f64()?;
+let a = temp.get_array::<f32, _>(..).await?;
+let b = temp.get_array::<f32, _>([5..15, 2..5]).await?;
 ```
 
-`read_array_f64` widens any integer or float variable to `f64`. `read_array_i64`
-takes integers only: it refuses a float rather than round it.
 `to_array_strings` needs a string variable, fixed length or variable length.
 
 ## Read from object storage
@@ -155,8 +221,8 @@ let temp = file.variable("TEMP").unwrap();
 println!("{:?}", temp.attribute("units").unwrap().value.as_text());
 
 // Its values.
-let all = temp.read().await?.to_f64()?;
-let part = temp.read_slice(&[0..8, 10..30]).await?.to_f64()?;
+let all = temp.get_values::<f32, _>(Extents::All).await?;
+let part = temp.get_values::<f32, _>([0..8, 10..30]).await?;
 ```
 
 `open_store` uses `OpenOptions::remote()`: a 256 KiB request size and a 128 MiB
@@ -176,7 +242,7 @@ let source = Arc::new(SyncAsAsync(FileSource::open("argo.nc")?));
 let file = oxcdf::open_async(source).await?;
 
 let temp = file.variable("TEMP").unwrap();
-let values = temp.read().await?.to_f64()?;
+let values = temp.get_values::<f32, _>(..).await?;
 ```
 
 `open_async` takes any `Arc<dyn AsyncByteSource>`. Implement that trait for any
@@ -284,7 +350,7 @@ strings and variable sequences; big-endian values; fill values; asynchronous
 open and read.
 
 Missing: szip; blosc with snappy; extensible arrays that need secondary blocks;
-CDF-5 (written, unverified); batched reads across variables.
+CDF-5 (written, unverified); strided selections; batched reads across variables.
 
 The crate does not write files. Keep netcdf-c for writes.
 
@@ -294,7 +360,9 @@ The crate does not write files. Keep netcdf-c for writes.
 cargo test --features "diff-tests,object-store,ndarray,async"
 ```
 
-325 tests. `differential.rs` compares every value against netcdf-c.
+357 tests. `differential.rs` compares every value against netcdf-c.
+`typed_reads.rs` reads every corpus variable as its stored type through both
+this crate and the `netcdf` crate, and compares element by element.
 `netcdf_layer.rs` compares variables, dimensions and axes against `ncdump`.
 `async_open.rs` compares the two engines, file by file and value by value.
 `readme_api.rs` runs every example on this page, so the page cannot drift from

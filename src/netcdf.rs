@@ -29,6 +29,7 @@ use crate::error::{Error, Result};
 use crate::hdf5::heap::{GlobalHeap, VlenDescriptor};
 use crate::hdf5::message::{Attribute, DatatypeClass, Layout, StringPad};
 use crate::index::{DatasetIndex, GroupIndex, Hdf5File};
+use crate::extent::Extents;
 use crate::read::{read_hyperslab, Hyperslab, RawData};
 
 /// Prefix of the `NAME` attribute on a dimension that has no coordinate
@@ -815,7 +816,119 @@ impl DType {
     pub fn is_float(&self) -> bool {
         matches!(self, DType::Float(_))
     }
+
+    /// The Rust type that matches this stored type.
+    ///
+    /// Pass this name to [`Values::get`]. A type this reader does not model
+    /// reports its own description instead.
+    pub fn name(&self) -> String {
+        match self {
+            DType::Int(1) => "i8".into(),
+            DType::Int(2) => "i16".into(),
+            DType::Int(4) => "i32".into(),
+            DType::Int(8) => "i64".into(),
+            DType::Uint(1) => "u8".into(),
+            DType::Uint(2) => "u16".into(),
+            DType::Uint(4) => "u32".into(),
+            DType::Uint(8) => "u64".into(),
+            DType::Float(4) => "f32".into(),
+            DType::Float(8) => "f64".into(),
+            DType::Int(n) => format!("a {n}-byte signed integer"),
+            DType::Uint(n) => format!("a {n}-byte unsigned integer"),
+            DType::Float(n) => format!("a {n}-byte float"),
+            DType::String(n) => format!("a {n}-byte string"),
+            DType::VarString => "a variable-length string".into(),
+            DType::VarSequence(base) => format!("a sequence of {}", base.name()),
+            DType::Other => "a type this reader does not model".into(),
+        }
+    }
 }
+
+/// A Rust type a variable can be read as.
+///
+/// | Rust | netCDF | HDF5 |
+/// |---|---|---|
+/// | `i8` `i16` `i32` `i64` | `byte` `short` `int` `int64` | signed fixed point |
+/// | `u8` `u16` `u32` `u64` | `ubyte` `ushort` `uint` `uint64` | unsigned fixed point |
+/// | `f32` `f64` | `float` `double` | floating point |
+///
+/// # Conversion
+///
+/// A read converts between any two numeric types, which is what the `netcdf`
+/// crate does. A read of a string or a compound as a number fails with
+/// [`Error::TypeMismatch`].
+///
+/// A conversion can lose information. `f64` to `f32` loses precision. `i64` to
+/// `f64` loses integers above 2^53. A float to an integer truncates toward
+/// zero, and saturates at the limits of the target.
+///
+/// Call [`Values::dtype`] or [`Variable::dtype`] to learn the stored type, then
+/// ask for that type. The read then copies the values and changes nothing.
+///
+/// This trait is sealed. Only the ten types above implement it.
+pub trait Element: Copy + Sized + sealed::Sealed {
+    /// The stored type that needs no conversion.
+    const DTYPE: DType;
+    /// The name used in an error message.
+    const NAME: &'static str;
+    /// Decode one element from native-order bytes of exactly this type.
+    ///
+    /// The read path normalises byte order, so the bytes are always native by
+    /// the time they arrive here.
+    fn from_ne_bytes(bytes: &[u8]) -> Self;
+    /// Convert from a stored signed integer.
+    fn from_i64(value: i64) -> Self;
+    /// Convert from a stored unsigned integer.
+    fn from_u64(value: u64) -> Self;
+    /// Convert from a stored float.
+    fn from_f64(value: f64) -> Self;
+}
+
+mod sealed {
+    /// Stops a type outside this crate from claiming a stored type mapping.
+    pub trait Sealed {}
+}
+
+macro_rules! element {
+    ($rust:ty, $dtype:expr, $name:literal) => {
+        impl sealed::Sealed for $rust {}
+        impl Element for $rust {
+            const DTYPE: DType = $dtype;
+            const NAME: &'static str = $name;
+            fn from_ne_bytes(bytes: &[u8]) -> Self {
+                // The caller checked the width against `size_of`, so this
+                // cannot fail.
+                <$rust>::from_ne_bytes(bytes.try_into().expect("width checked"))
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+            #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            fn from_i64(value: i64) -> Self {
+                value as $rust
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+            #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            fn from_u64(value: u64) -> Self {
+                value as $rust
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[allow(clippy::cast_precision_loss)]
+            fn from_f64(value: f64) -> Self {
+                value as $rust
+            }
+        }
+    };
+}
+
+element!(i8, DType::Int(1), "i8");
+element!(i16, DType::Int(2), "i16");
+element!(i32, DType::Int(4), "i32");
+element!(i64, DType::Int(8), "i64");
+element!(u8, DType::Uint(1), "u8");
+element!(u16, DType::Uint(2), "u16");
+element!(u32, DType::Uint(4), "u32");
+element!(u64, DType::Uint(8), "u64");
+element!(f32, DType::Float(4), "f32");
+element!(f64, DType::Float(8), "f64");
 
 /// One stored chunk of a variable.
 ///
@@ -902,14 +1015,32 @@ impl Values {
         &self.raw
     }
 
-    /// Values as `f64`, widening from whatever numeric type was stored.
-    pub fn to_f64(&self) -> Result<Vec<f64>> {
-        self.raw.to_f64_of(&self.datatype)
+    /// Values as `T`.
+    ///
+    /// A `T` equal to [`Values::dtype`] copies the values. Any other numeric
+    /// type converts, which is what the `netcdf` crate does. See
+    /// [`Element`] for what a conversion can lose.
+    ///
+    /// ```no_run
+    /// # fn run(var: oxcdf::Variable<'_>) -> oxcdf::Result<()> {
+    /// let values = var.read()?;
+    /// println!("{:?}", values.dtype());       // Float(4)
+    /// let exact: Vec<f32> = values.get()?;    // no conversion
+    /// let wide: Vec<f64> = values.get()?;     // converted
+    /// # Ok(()) }
+    /// ```
+    pub fn get<T: Element>(&self) -> Result<Vec<T>> {
+        self.raw.get_of(&self.datatype, "")
     }
 
-    /// Values as `i64`, for integer variables.
+    /// Values as `f64`. Shorthand for [`Values::get`].
+    pub fn to_f64(&self) -> Result<Vec<f64>> {
+        self.get()
+    }
+
+    /// Values as `i64`. Shorthand for [`Values::get`].
     pub fn to_i64(&self) -> Result<Vec<i64>> {
-        self.raw.to_i64_of(&self.datatype)
+        self.get()
     }
 
     /// Values as strings.
@@ -924,18 +1055,24 @@ impl Values {
         self.raw.to_strings_of(&self.datatype)
     }
 
-    /// The values as an `ndarray` of `f64`, shaped as they were read.
+    /// The values as an `ndarray` of `T`, shaped as they were read.
     ///
     /// Row-major, so the array's axes match the variable's dimensions in order.
     #[cfg(feature = "ndarray")]
-    pub fn to_array_f64(&self) -> Result<ndarray::ArrayD<f64>> {
-        shape_into_array(self.shape(), self.to_f64()?)
+    pub fn to_array<T: Element>(&self) -> Result<ndarray::ArrayD<T>> {
+        shape_into_array(self.shape(), self.get::<T>()?)
     }
 
-    /// The values as an `ndarray` of `i64`.
+    /// The values as an `ndarray` of `f64`. Shorthand for [`Values::to_array`].
+    #[cfg(feature = "ndarray")]
+    pub fn to_array_f64(&self) -> Result<ndarray::ArrayD<f64>> {
+        self.to_array()
+    }
+
+    /// The values as an `ndarray` of `i64`. Shorthand for [`Values::to_array`].
     #[cfg(feature = "ndarray")]
     pub fn to_array_i64(&self) -> Result<ndarray::ArrayD<i64>> {
-        shape_into_array(self.shape(), self.to_i64()?)
+        self.to_array()
     }
 
     /// The values as an `ndarray` of strings.
@@ -961,11 +1098,11 @@ impl Values {
         self.vlen_strings.is_some() || self.vlen_sequences.is_some()
     }
 
-    /// Variable-length sequences widened to `f64`, one vector per element.
+    /// Variable-length sequences as `T`, one vector for each element.
     ///
     /// An empty sequence comes back as an empty vector, which is a real value
     /// rather than a missing one.
-    pub fn to_sequences_f64(&self) -> Result<Vec<Vec<f64>>> {
+    pub fn to_sequences<T: Element>(&self) -> Result<Vec<Vec<T>>> {
         let (sequences, base) = self.sequences()?;
         sequences
             .iter()
@@ -975,25 +1112,19 @@ impl Values {
                     element_size: base.size as usize,
                     shape: vec![(bytes.len() / (base.size as usize).max(1)) as u64],
                 }
-                .to_f64_of(base)
+                .get_of(base, "")
             })
             .collect()
     }
 
-    /// Variable-length sequences as `i64`, for integer element types.
+    /// Sequences as `f64`. Shorthand for [`Values::to_sequences`].
+    pub fn to_sequences_f64(&self) -> Result<Vec<Vec<f64>>> {
+        self.to_sequences()
+    }
+
+    /// Sequences as `i64`. Shorthand for [`Values::to_sequences`].
     pub fn to_sequences_i64(&self) -> Result<Vec<Vec<i64>>> {
-        let (sequences, base) = self.sequences()?;
-        sequences
-            .iter()
-            .map(|bytes| {
-                RawData {
-                    bytes: bytes.clone(),
-                    element_size: base.size as usize,
-                    shape: vec![(bytes.len() / (base.size as usize).max(1)) as u64],
-                }
-                .to_i64_of(base)
-            })
-            .collect()
+        self.to_sequences()
     }
 
     /// The raw bytes of each sequence, in native order.
@@ -1093,6 +1224,58 @@ impl<'a> Variable<'a> {
         self.read()?.to_array_i64()
     }
 
+    /// Read values as `T`, over any selection.
+    ///
+    /// This matches `netcdf::Variable::get_values`. `extents` accepts the same
+    /// forms: [`Extents::All`], `..`, ranges, indices, or a start and count
+    /// pair. See [`crate::extent`].
+    ///
+    /// ```no_run
+    /// # use oxcdf::Extents;
+    /// # fn run(var: oxcdf::Variable<'_>) -> oxcdf::Result<()> {
+    /// let all = var.get_values::<f32, _>(Extents::All)?;
+    /// let block = var.get_values::<f32, _>([0..8, 10..30])?;
+    /// let row = var.get_values::<f32, _>([3, 0])?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// A `T` equal to [`Variable::dtype`] copies the values. Any other numeric
+    /// type converts. See [`Element`].
+    pub fn get_values<T: Element, E>(&self, extents: E) -> Result<Vec<T>>
+    where
+        E: TryInto<Extents>,
+        E::Error: Into<Error>,
+    {
+        let extents: Extents = extents.try_into().map_err(Into::into)?;
+        let slab = extents.to_hyperslab(&self.info.path, &self.info.shape)?;
+        self.read_selection(&slab)?.get()
+    }
+
+    /// Read one value as `T`.
+    ///
+    /// This matches `netcdf::Variable::get_value`. The selection must name one
+    /// element.
+    pub fn get_value<T: Element, E>(&self, extents: E) -> Result<T>
+    where
+        E: TryInto<Extents>,
+        E::Error: Into<Error>,
+    {
+        let values = self.get_values::<T, E>(extents)?;
+        one_value(&self.info.path, values)
+    }
+
+    /// Read a whole variable into an `ndarray` of `T`.
+    #[cfg(feature = "ndarray")]
+    pub fn get_array<T: Element, E>(&self, extents: E) -> Result<ndarray::ArrayD<T>>
+    where
+        E: TryInto<Extents>,
+        E::Error: Into<Error>,
+    {
+        let extents: Extents = extents.try_into().map_err(Into::into)?;
+        let slab = extents.to_hyperslab(&self.info.path, &self.info.shape)?;
+        self.read_selection(&slab)?.to_array()
+    }
+
     /// Read the whole variable.
     pub fn read(&self) -> Result<Values> {
         self.read_selection(&Hyperslab::all(&self.info.shape))
@@ -1170,6 +1353,16 @@ impl<'a> Variable<'a> {
     /// Read one chunk. The result covers exactly the chunk's clipped region.
     pub fn read_chunk(&self, chunk: &Chunk) -> Result<Values> {
         self.read_selection(&chunk.selection())
+    }
+}
+
+/// Take the one value a selection named, or say how many it named instead.
+pub(crate) fn one_value<T>(what: &str, mut values: Vec<T>) -> Result<T> {
+    match values.len() {
+        1 => Ok(values.pop().expect("length checked")),
+        n => Err(Error::bad_request(format!(
+            "the selection on variable {what} names {n} elements, but one was asked for"
+        ))),
     }
 }
 

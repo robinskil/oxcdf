@@ -43,6 +43,21 @@ pub enum Error {
     },
     /// The caller asked for something the file does not contain.
     NotFound(String),
+    /// The caller asked for a Rust type that the variable does not store.
+    ///
+    /// The reader never converts one numeric type to another. It returns the
+    /// stored type or it fails. A conversion would hide a precision loss, and
+    /// only the caller knows whether that loss is acceptable.
+    ///
+    /// Read [`Error::TypeMismatch::stored`] and ask for that type instead.
+    TypeMismatch {
+        /// The type the variable stores.
+        stored: String,
+        /// The Rust type the caller asked for.
+        asked: &'static str,
+        /// Which variable, when the reader knows.
+        what: String,
+    },
     /// The caller passed an invalid request, such as an out-of-range hyperslab.
     BadRequest(String),
     /// The byte source does not hold the requested bytes yet.
@@ -112,6 +127,20 @@ impl fmt::Display for Error {
                 "{what} checksum mismatch: file stores {stored:#010x}, computed {computed:#010x}"
             ),
             Error::NotFound(m) => write!(f, "not found: {m}"),
+            Error::TypeMismatch {
+                stored,
+                asked,
+                what,
+            } => write!(
+                f,
+                "type mismatch{}: the variable stores {stored}, but {asked} was asked for; \
+                 this reader does not convert between numeric types",
+                if what.is_empty() {
+                    String::new()
+                } else {
+                    format!(" for {what}")
+                }
+            ),
             Error::BadRequest(m) => write!(f, "bad request: {m}"),
             Error::Incomplete => write!(
                 f,
@@ -134,5 +163,16 @@ impl std::error::Error for Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Io(e)
+    }
+}
+
+impl From<std::convert::Infallible> for Error {
+    /// A selection that converts without failing never reaches this.
+    ///
+    /// A read takes `E: TryInto<Extents>`. A type with a plain `From` gets
+    /// `TryFrom` for free, and its error type is [`std::convert::Infallible`].
+    /// This makes such a type usable.
+    fn from(e: std::convert::Infallible) -> Self {
+        match e {}
     }
 }

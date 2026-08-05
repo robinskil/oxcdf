@@ -199,7 +199,7 @@ mod tests {
             let d = file.dataset("/chunked_i32").unwrap();
             read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape))
                 .unwrap()
-                .to_i64(d)
+                .get::<i64>(d)
                 .unwrap()
         })
         .await

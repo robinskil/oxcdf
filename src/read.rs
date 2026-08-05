@@ -127,65 +127,68 @@ impl RawData {
         self.bytes.is_empty()
     }
 
-    /// Reinterpret as `f64`, widening from whatever numeric type was stored.
-    pub fn to_f64(&self, dataset: &DatasetIndex) -> Result<Vec<f64>> {
-        self.to_f64_of(&dataset.datatype)
+    /// Decode as `T`.
+    pub fn get<T: crate::netcdf::Element>(&self, dataset: &DatasetIndex) -> Result<Vec<T>> {
+        self.get_of(&dataset.datatype, &dataset.path)
     }
 
-    /// Reinterpret as `f64`, given the datatype directly.
-    pub fn to_f64_of(&self, datatype: &crate::hdf5::message::Datatype) -> Result<Vec<f64>> {
-        let n = self.len();
+    /// Decode as `f64`. Shorthand for [`RawData::get`].
+    pub fn to_f64(&self, dataset: &DatasetIndex) -> Result<Vec<f64>> {
+        self.get(dataset)
+    }
+
+    /// Decode as `i64`. Shorthand for [`RawData::get`].
+    pub fn to_i64(&self, dataset: &DatasetIndex) -> Result<Vec<i64>> {
+        self.get(dataset)
+    }
+
+    /// Decode as `T`, given the datatype directly.
+    ///
+    /// A stored type equal to `T` copies the values. Any other numeric type
+    /// converts, which is what the `netcdf` crate does. A stored string or
+    /// compound returns [`Error::TypeMismatch`], naming the stored type.
+    ///
+    /// A conversion can lose information. See [`crate::netcdf::Element`].
+    pub fn get_of<T: crate::netcdf::Element>(
+        &self,
+        datatype: &crate::hdf5::message::Datatype,
+        what: &str,
+    ) -> Result<Vec<T>> {
         let size = self.element_size;
-        let mut out = Vec::with_capacity(n);
+        let count = self.len();
+        let element = |i: usize| &self.bytes[i * size..(i + 1) * size];
+
+        // The stored type is the asked-for type: copy, do not convert.
+        if crate::netcdf::DType::of(datatype) == T::DTYPE && size == std::mem::size_of::<T>() {
+            return Ok((0..count).map(|i| T::from_ne_bytes(element(i))).collect());
+        }
 
         match &datatype.class {
-            DatatypeClass::FloatingPoint { .. } => {
-                for i in 0..n {
-                    let b = &self.bytes[i * size..(i + 1) * size];
-                    out.push(match size {
+            DatatypeClass::FixedPoint { signed: true, .. } => (0..count)
+                .map(|i| Ok(T::from_i64(read_integer(element(i), true)?)))
+                .collect(),
+            DatatypeClass::FixedPoint { signed: false, .. } => (0..count)
+                .map(|i| Ok(T::from_u64(read_unsigned(element(i))?)))
+                .collect(),
+            DatatypeClass::FloatingPoint { .. } => (0..count)
+                .map(|i| {
+                    let b = element(i);
+                    let v = match size {
                         4 => f32::from_ne_bytes(b.try_into().unwrap()) as f64,
                         8 => f64::from_ne_bytes(b.try_into().unwrap()),
                         other => {
-                            return Err(Error::unsupported(format!(
-                                "{other}-byte floating point"
-                            )))
+                            return Err(Error::unsupported(format!("{other}-byte floating point")))
                         }
-                    });
-                }
-            }
-            DatatypeClass::FixedPoint { signed, .. } => {
-                for i in 0..n {
-                    let b = &self.bytes[i * size..(i + 1) * size];
-                    out.push(read_integer(b, *signed)? as f64);
-                }
-            }
-            other => {
-                return Err(Error::unsupported(format!(
-                    "converting {other:?} to f64"
-                )))
-            }
+                    };
+                    Ok(T::from_f64(v))
+                })
+                .collect(),
+            _ => Err(Error::TypeMismatch {
+                stored: crate::netcdf::DType::of(datatype).name(),
+                asked: T::NAME,
+                what: what.to_string(),
+            }),
         }
-
-        Ok(out)
-    }
-
-    /// Reinterpret as `i64`, for integer datatypes.
-    pub fn to_i64(&self, dataset: &DatasetIndex) -> Result<Vec<i64>> {
-        self.to_i64_of(&dataset.datatype)
-    }
-
-    /// Reinterpret as `i64`, given the datatype directly.
-    pub fn to_i64_of(&self, datatype: &crate::hdf5::message::Datatype) -> Result<Vec<i64>> {
-        let DatatypeClass::FixedPoint { signed, .. } = &datatype.class else {
-            return Err(Error::unsupported(format!(
-                "converting {:?} to i64",
-                datatype.class
-            )));
-        };
-        let size = self.element_size;
-        (0..self.len())
-            .map(|i| read_integer(&self.bytes[i * size..(i + 1) * size], *signed))
-            .collect()
     }
 
     /// Decode fixed-length string elements.
@@ -306,6 +309,20 @@ fn prefetch_chunks(
 }
 
 /// Read a little-endian-normalised integer of 1 to 8 bytes.
+/// Read a native-order unsigned integer of 1 to 8 bytes.
+fn read_unsigned(bytes: &[u8]) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    let n = bytes.len();
+    if n == 0 || n > 8 {
+        return Err(Error::unsupported(format!("{n}-byte integer")));
+    }
+    #[cfg(target_endian = "little")]
+    buf[..n].copy_from_slice(bytes);
+    #[cfg(target_endian = "big")]
+    buf[8 - n..].copy_from_slice(bytes);
+    Ok(u64::from_ne_bytes(buf))
+}
+
 fn read_integer(bytes: &[u8], signed: bool) -> Result<i64> {
     let mut buf = [0u8; 8];
     let n = bytes.len();

@@ -261,6 +261,55 @@ impl<'a> AsyncVariable<'a> {
         self.dataset.is_readable()
     }
 
+    /// Read values as `T`, over any selection.
+    ///
+    /// The asynchronous twin of [`crate::netcdf::Variable::get_values`]. It
+    /// takes the same selection forms and applies the same type rules.
+    ///
+    /// ```no_run
+    /// # use oxcdf::Extents;
+    /// # async fn run(var: oxcdf::AsyncVariable<'_>) -> oxcdf::Result<()> {
+    /// let all = var.get_values::<f32, _>(Extents::All).await?;
+    /// let block = var.get_values::<f32, _>([0..8, 10..30]).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn get_values<T: crate::netcdf::Element, E>(&self, extents: E) -> Result<Vec<T>>
+    where
+        E: TryInto<crate::extent::Extents>,
+        E::Error: Into<crate::Error>,
+    {
+        let extents: crate::extent::Extents = extents.try_into().map_err(Into::into)?;
+        let slab = extents.to_hyperslab(&self.info.path, &self.info.shape)?;
+        self.read_selection(&slab).await?.get()
+    }
+
+    /// Read one value as `T`.
+    ///
+    /// The asynchronous twin of [`crate::netcdf::Variable::get_value`].
+    pub async fn get_value<T: crate::netcdf::Element, E>(&self, extents: E) -> Result<T>
+    where
+        E: TryInto<crate::extent::Extents>,
+        E::Error: Into<crate::Error>,
+    {
+        let values = self.get_values::<T, E>(extents).await?;
+        crate::netcdf::one_value(&self.info.path, values)
+    }
+
+    /// Read values as an `ndarray` of `T`, over any selection.
+    #[cfg(feature = "ndarray")]
+    pub async fn get_array<T: crate::netcdf::Element, E>(
+        &self,
+        extents: E,
+    ) -> Result<ndarray::ArrayD<T>>
+    where
+        E: TryInto<crate::extent::Extents>,
+        E::Error: Into<crate::Error>,
+    {
+        let extents: crate::extent::Extents = extents.try_into().map_err(Into::into)?;
+        let slab = extents.to_hyperslab(&self.info.path, &self.info.shape)?;
+        self.read_selection(&slab).await?.to_array()
+    }
+
     /// Read the whole variable.
     pub async fn read(&self) -> Result<Values> {
         self.read_selection(&Hyperslab::all(&self.info.shape)).await

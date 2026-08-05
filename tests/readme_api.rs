@@ -39,11 +39,79 @@ fn the_synchronous_example_works() -> oxcdf::Result<()> {
     println!("{:?}", temp.attribute("units").map(|a| a.value.as_text()));
     println!("{:?}", temp.attribute("_FillValue").map(|a| a.value.as_f64()));
 
-    let _all = temp.read()?;
-    let _part = temp.read_slice(&[0..1, 0..4, 0..4])?;
+    let _all = temp.get_values::<f32, _>(oxcdf::Extents::All)?;
+    let _part = temp.get_values::<f32, _>([0..1, 0..4, 0..4])?;
+    let _one = temp.get_value::<f32, _>([0, 3, 3])?;
 
     // A path into a subgroup resolves the same way. This file has no subgroup.
     assert!(file.variable("/forecast/TEMP").is_none());
+    Ok(())
+}
+
+// ─── "Select the elements" ─────────────────────────────────────────────────
+
+#[test]
+fn every_selection_form_in_the_readme_works() -> oxcdf::Result<()> {
+    use oxcdf::{Extent, Extents};
+
+    let Some(path) = corpus("legacy_v1_objheader.h5") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+    let var = file.variable("/contig_f64").unwrap(); // shape [40, 6]
+
+    var.get_values::<f64, _>(Extents::All)?;
+    var.get_values::<f64, _>(..)?;
+    var.get_values::<f64, _>([0..8, 2..5])?;
+    var.get_values::<f64, _>([0, 3])?;
+    var.get_values::<f64, _>([2.., 5..])?;
+    var.get_values::<f64, _>([..8, ..5])?;
+    var.get_values::<f64, _>([Extent::Index(3), (0..6).into()])?;
+    var.get_values::<f64, _>(([0usize, 2].as_slice(), [8usize, 3].as_slice()))?;
+    Ok(())
+}
+
+// ─── "Types" ───────────────────────────────────────────────────────────────
+
+#[test]
+fn the_types_example_works() -> oxcdf::Result<()> {
+    let Some(path) = corpus("legacy_v1_objheader.h5") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+    let temp = file.variable("/contig_f32be").unwrap();
+
+    assert_eq!(temp.dtype(), oxcdf::DType::Float(4));
+    let exact = temp.get_values::<f32, _>(..)?;
+    let wide = temp.get_values::<f64, _>(..)?;
+    assert_eq!(exact.len(), wide.len());
+
+    // A string read as a number names the stored type.
+    let err = file
+        .variable("/fixed_strings")
+        .unwrap()
+        .get_values::<f64, _>(..)
+        .unwrap_err();
+    assert!(matches!(err, oxcdf::Error::TypeMismatch { .. }), "got {err:?}");
+    Ok(())
+}
+
+// ─── "Other reads" ─────────────────────────────────────────────────────────
+
+#[test]
+fn the_values_example_works() -> oxcdf::Result<()> {
+    let Some(path) = corpus("legacy_v1_objheader.h5") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+    let temp = file.variable("/contig_f32be").unwrap();
+
+    let values = temp.read()?;
+    println!("{:?} {:?}", values.dtype(), values.shape());
+    let _numbers: Vec<f32> = values.get()?;
+    let _bytes = values.as_bytes();
+
+    let _text = file.variable("/fixed_strings").unwrap().read()?.to_strings()?;
     Ok(())
 }
 
@@ -58,17 +126,20 @@ fn the_ndarray_example_works() -> oxcdf::Result<()> {
     let file = oxcdf::open(&path)?;
     let temp = file.variable("/contig_f64").expect("a 2-D variable");
 
-    let a = temp.read_array_f64()?;
+    let a = temp.get_array::<f64, _>(..)?;
     assert_eq!(a.shape(), &[40, 6]);
     println!("{}", a[[0, 0]]);
 
     let row = a.index_axis(ndarray::Axis(0), 0);
     assert_eq!(row.len(), 6);
 
-    let b = temp.read_slice(&[5..15, 2..5])?.to_array_f64()?;
+    let b = temp.get_array::<f64, _>([5..15, 2..5])?;
     assert_eq!(b.shape(), &[10, 3]);
 
-    let counts = file.variable("/chunked_i32").unwrap().read_array_i64()?;
+    let counts = file
+        .variable("/chunked_i32")
+        .unwrap()
+        .get_array::<i32, _>(..)?;
     assert_eq!(counts.shape(), &[40, 6]);
 
     let names = file
@@ -77,9 +148,28 @@ fn the_ndarray_example_works() -> oxcdf::Result<()> {
         .read()?
         .to_array_strings()?;
     assert_eq!(names.shape(), &[5]);
+    Ok(())
+}
 
-    // `read_array_i64` refuses a float rather than round it. The README says so.
-    assert!(temp.read_array_i64().is_err());
+// ─── "The interface" table ─────────────────────────────────────────────────
+
+#[test]
+fn the_get_values_example_works() -> oxcdf::Result<()> {
+    let Some(path) = corpus("legacy_v1_objheader.h5") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+    let temp = file.variable("/contig_f64").unwrap();
+
+    let all = temp.get_values::<f64, _>(oxcdf::Extents::All)?;
+    assert_eq!(all.len(), 240);
+    assert_eq!(temp.get_values::<f64, _>(..)?.len(), 240);
+
+    let block = temp.get_values::<f64, _>([0..8, 2..5])?;
+    assert_eq!(block.len(), 24);
+
+    let one = temp.get_value::<f64, _>([0, 0])?;
+    assert_eq!(one, all[0]);
     Ok(())
 }
 
@@ -112,7 +202,7 @@ async fn the_local_async_example_works() -> oxcdf::Result<()> {
     let file = oxcdf::open_async(source).await?;
 
     let temp = file.variable("/contig_f64").unwrap();
-    let _values = temp.read().await?.to_f64()?;
+    let _values = temp.get_values::<f64, _>(..).await?;
     Ok(())
 }
 
@@ -153,9 +243,9 @@ async fn the_async_ndarray_example_works() -> oxcdf::Result<()> {
     let file = oxcdf::open_async(Arc::new(SyncAsAsync(FileSource::open(&path)?))).await?;
     let temp = file.variable("/contig_f64").unwrap();
 
-    let a = temp.read_array_f64().await?;
+    let a = temp.get_array::<f64, _>(..).await?;
     assert_eq!(a.shape(), &[40, 6]);
-    let b = temp.read_slice(&[5..15, 2..5]).await?.to_array_f64()?;
+    let b = temp.get_array::<f64, _>([5..15, 2..5]).await?;
     assert_eq!(b.shape(), &[10, 3]);
     Ok(())
 }
@@ -189,8 +279,8 @@ async fn the_object_store_example_compiles(
     let temp = file.variable("TEMP").unwrap();
     println!("{:?}", temp.attribute("units").unwrap().value.as_text());
 
-    let _all = temp.read().await?.to_f64()?;
-    let _part = temp.read_slice(&[0..8, 10..30]).await?.to_f64()?;
+    let _all = temp.get_values::<f32, _>(oxcdf::Extents::All).await?;
+    let _part = temp.get_values::<f32, _>([0..8, 10..30]).await?;
     Ok(())
 }
 
