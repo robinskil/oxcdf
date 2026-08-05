@@ -4,9 +4,13 @@
 //! corpus. A test that needs a network only has to compile, so it lives in a
 //! function that nothing calls.
 
+#[cfg(feature = "async")]
 use std::sync::Arc;
 
-use oxcdf::{AsyncFile, FileSource, SyncAsAsync};
+#[cfg(feature = "async")]
+use oxcdf::{FileSource, SyncAsAsync};
+#[cfg(all(feature = "async", feature = "object-store"))]
+use oxcdf::AsyncFile;
 
 fn corpus(name: &str) -> Option<String> {
     let path = format!("{}/test_files/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -96,6 +100,46 @@ fn the_types_example_works() -> oxcdf::Result<()> {
     Ok(())
 }
 
+// ─── "Strings" ─────────────────────────────────────────────────────────────
+
+#[test]
+fn the_string_variable_example_works() -> oxcdf::Result<()> {
+    let Some(path) = corpus("vlen_strings.nc") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+    let names = file.variable("station_name").unwrap();
+    assert_eq!(names.dtype(), oxcdf::DType::String);
+
+    let all = names.get_strings(..)?;
+    let one = names.get_string([0])?;
+    assert_eq!(one, all[0]);
+    Ok(())
+}
+
+#[test]
+fn the_char_variable_example_works() -> oxcdf::Result<()> {
+    let Some(path) = corpus("wod_ctd_1964.nc") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+    let v = file.variable("country").unwrap();
+    assert_eq!(v.dtype(), oxcdf::DType::Char);
+    assert_eq!(v.shape, vec![47, 40]);
+
+    let width = *v.shape.last().unwrap() as usize;
+    let joined: Vec<String> = v
+        .get_strings(..)?
+        .chunks(width)
+        .map(|row| row.concat().trim_end_matches('\0').to_string())
+        .collect();
+    assert_eq!(joined[0], "GREAT BRITAIN");
+
+    // The raw bytes are the other route the page names.
+    assert_eq!(v.read()?.as_bytes().len(), 47 * 40);
+    Ok(())
+}
+
 // ─── "Other reads" ─────────────────────────────────────────────────────────
 
 #[test]
@@ -112,6 +156,33 @@ fn the_values_example_works() -> oxcdf::Result<()> {
     let _bytes = values.as_bytes();
 
     let _text = file.variable("/fixed_strings").unwrap().read()?.to_strings()?;
+    Ok(())
+}
+
+#[test]
+fn the_dtype_table_matches_the_corpus() -> oxcdf::Result<()> {
+    use oxcdf::DType;
+
+    let Some(path) = corpus("wod_ctd_1964.nc") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+
+    // Every variable's type must be one the table names, and `size` must agree.
+    for v in file.variables() {
+        match v.dtype() {
+            DType::Int(n) | DType::Uint(n) | DType::Float(n) => {
+                assert_eq!(v.dtype().size(), Some(n as usize), "{}", v.path);
+                assert!(v.dtype().is_integer() || v.dtype().is_float());
+            }
+            DType::Char => {
+                assert_eq!(v.dtype().size(), Some(1), "{}", v.path);
+                assert!(v.dtype().is_text());
+            }
+            DType::String => assert_eq!(v.dtype().size(), None, "{}", v.path),
+            other => panic!("{} has an unexpected type {other:?}", v.path),
+        }
+    }
     Ok(())
 }
 

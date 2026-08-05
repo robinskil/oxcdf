@@ -295,6 +295,33 @@ impl<'a> AsyncVariable<'a> {
         crate::netcdf::one_value(&self.info.path, values)
     }
 
+    /// Read strings, over any selection.
+    ///
+    /// The asynchronous twin of [`crate::netcdf::Variable::get_strings`]. A
+    /// `string` variable resolves through the global heap, which this reads for
+    /// itself.
+    pub async fn get_strings<E>(&self, extents: E) -> Result<Vec<String>>
+    where
+        E: TryInto<crate::extent::Extents>,
+        E::Error: Into<crate::Error>,
+    {
+        let extents: crate::extent::Extents = extents.try_into().map_err(Into::into)?;
+        let slab = extents.to_hyperslab(&self.info.path, &self.info.shape)?;
+        self.read_selection(&slab).await?.to_strings()
+    }
+
+    /// Read one string.
+    ///
+    /// The asynchronous twin of [`crate::netcdf::Variable::get_string`].
+    pub async fn get_string<E>(&self, extents: E) -> Result<String>
+    where
+        E: TryInto<crate::extent::Extents>,
+        E::Error: Into<crate::Error>,
+    {
+        let strings = self.get_strings(extents).await?;
+        crate::netcdf::one_value(&self.info.path, strings)
+    }
+
     /// Read values as an `ndarray` of `T`, over any selection.
     #[cfg(feature = "ndarray")]
     pub async fn get_array<T: crate::netcdf::Element, E>(

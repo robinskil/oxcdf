@@ -24,7 +24,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
+// Only the object-store source raises errors of its own. Everything else here
+// forwards what the inner source returns.
+#[cfg(any(feature = "object-store", test))]
+use crate::error::Error;
 
 /// A source of bytes addressed by absolute file offset, fetched asynchronously.
 ///

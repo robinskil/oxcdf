@@ -36,7 +36,9 @@ fn navigates_variables_and_reports_their_types() {
     assert_eq!(file.variable("/chunked_i32").unwrap().dtype(), DType::Int(4));
     assert_eq!(
         file.variable("/fixed_strings").unwrap().dtype(),
-        DType::String(8)
+        // A fixed string wider than one byte is not a netCDF type. netcdf-c
+        // never writes one; this fixture comes from plain HDF5.
+        DType::FixedString(8)
     );
     assert!(file.variable("/nope").is_none());
 }

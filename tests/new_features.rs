@@ -17,7 +17,7 @@ fn reads_variable_length_strings() {
     let file = NetcdfFile::open(VLEN).unwrap();
     let v = file.variable("/station_name").expect("station_name");
 
-    assert_eq!(v.dtype(), DType::VarString);
+    assert_eq!(v.dtype(), DType::String);
     assert_eq!(v.shape, vec![4]);
 
     let values = v.read().unwrap();
@@ -383,7 +383,7 @@ fn reads_ragged_float_sequences() {
     let file = NetcdfFile::open(VLEN_SEQ).unwrap();
     let v = file.variable("/rows").expect("rows");
 
-    assert_eq!(v.dtype(), DType::VarSequence(Box::new(DType::Float(4))));
+    assert_eq!(v.dtype(), DType::Vlen(Box::new(DType::Float(4))));
     assert_eq!(v.shape, vec![4]);
 
     let values = v.read().unwrap();
@@ -405,7 +405,7 @@ fn reads_ragged_integer_sequences() {
     let file = NetcdfFile::open(VLEN_SEQ).unwrap();
     let v = file.variable("/indices").unwrap();
 
-    assert_eq!(v.dtype(), DType::VarSequence(Box::new(DType::Int(4))));
+    assert_eq!(v.dtype(), DType::Vlen(Box::new(DType::Int(4))));
     assert_eq!(
         v.read().unwrap().to_sequences_i64().unwrap(),
         vec![vec![1], vec![2, 3], vec![], vec![4, 5, 6, 7]]

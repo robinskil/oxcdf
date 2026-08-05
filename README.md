@@ -37,6 +37,8 @@ metadata.
 | Variable attributes | `var.attribute("units")` | `var.attribute("units")` |
 | Read values | `var.get_values::<f32,_>(..)?` | `var.get_values::<f32,_>(..).await?` |
 | Read one value | `var.get_value::<f32,_>([0,3])?` | `var.get_value::<f32,_>([0,3]).await?` |
+| Read strings | `var.get_strings(..)?` | `var.get_strings(..).await?` |
+| Read one string | `var.get_string([0])?` | `var.get_string([0]).await?` |
 | Read an array | `var.get_array::<f32,_>(..)?` | `var.get_array::<f32,_>(..).await?` |
 | List the chunks | `var.chunks()` | `var.chunks().await?` |
 | Read one chunk | `var.read_chunk(&c)?` | `var.read_chunk(&c).await?` |
@@ -124,11 +126,55 @@ numeric type converts, and a conversion can lose information: `f64` to `f32`
 loses precision, `i64` to `f64` loses integers above 2^53, and a float to an
 integer truncates toward zero.
 
-| `dtype()` | Rust type | netCDF |
+`dtype()` returns a `DType`, which mirrors the `netcdf` crate's
+`NcVariableType`.
+
+| `dtype()` | netCDF | Read it with |
 |---|---|---|
-| `Int(1)` `Int(2)` `Int(4)` `Int(8)` | `i8` `i16` `i32` `i64` | `byte` `short` `int` `int64` |
-| `Uint(1)` `Uint(2)` `Uint(4)` `Uint(8)` | `u8` `u16` `u32` `u64` | `ubyte` `ushort` `uint` `uint64` |
-| `Float(4)` `Float(8)` | `f32` `f64` | `float` `double` |
+| `Int(1)` `Int(2)` `Int(4)` `Int(8)` | `byte` `short` `int` `int64` | `get_values::<i8>` … `::<i64>` |
+| `Uint(1)` `Uint(2)` `Uint(4)` `Uint(8)` | `ubyte` `ushort` `uint` `uint64` | `get_values::<u8>` … `::<u64>` |
+| `Float(4)` `Float(8)` | `float` `double` | `get_values::<f32>` `::<f64>` |
+| `Char` | `char` | `get_strings` or `as_bytes` |
+| `String` | `string` | `get_strings` |
+| `Vlen(..)` | ragged array | `to_sequences::<T>` |
+| `FixedString(n)` | not netCDF | `get_strings` |
+
+## Strings
+
+netCDF stores text two ways, and this reader keeps them apart.
+
+A `string` variable holds one variable-length string in each element. The value
+lives in the global heap, which the reader follows for you.
+
+```rust
+let names = file.variable("station_name").unwrap();
+assert_eq!(names.dtype(), DType::String);
+
+let all = names.get_strings(..)?;      // one string for each element
+let one = names.get_string([0])?;
+```
+
+A `char` variable holds one **byte** in each element. Its last dimension is the
+string length, so `char country(casts, strnlensmall)` holds one string for each
+cast. The reader reports the elements as the file stores them. Join the last
+axis yourself.
+
+```rust
+let v = file.variable("country").unwrap();
+assert_eq!(v.dtype(), DType::Char);
+assert_eq!(v.shape, vec![47, 40]);     // 40 is the string length
+
+let width = *v.shape.last().unwrap() as usize;
+let joined: Vec<String> = v
+    .get_strings(..)?
+    .chunks(width)
+    .map(|row| row.concat().trim_end_matches('\0').to_string())
+    .collect();
+assert_eq!(joined[0], "GREAT BRITAIN");
+```
+
+`read()?.as_bytes()` gives the same data as raw bytes, which is often the
+simpler route for a caller that builds its own string array.
 
 ## Other reads
 
@@ -140,7 +186,7 @@ let values = temp.read()?;
 println!("{:?} {:?}", values.dtype(), values.shape());
 
 let numbers: Vec<f32> = values.get()?;
-let text = file.variable("PLATFORM_NUMBER").unwrap().read()?.to_strings()?;
+let text = file.variable("station_name").unwrap().read()?.to_strings()?;
 let seqs = file.variable("profiles").unwrap().read()?.to_sequences::<f32>()?;
 ```
 
@@ -360,7 +406,7 @@ The crate does not write files. Keep netcdf-c for writes.
 cargo test --features "diff-tests,object-store,ndarray,async"
 ```
 
-357 tests. `differential.rs` compares every value against netcdf-c.
+371 tests. `differential.rs` compares every value against netcdf-c.
 `typed_reads.rs` reads every corpus variable as its stored type through both
 this crate and the `netcdf` crate, and compares element by element.
 `netcdf_layer.rs` compares variables, dimensions and axes against `ncdump`.

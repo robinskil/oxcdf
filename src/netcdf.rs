@@ -761,53 +761,69 @@ mod tests {
 // caller actually uses: navigate to a variable, look at its metadata, then read
 // all of it, a slice of it, or one stored chunk at a time.
 
-/// A simple view of a variable's element type.
+/// A variable's netCDF type.
 ///
-/// The full HDF5 datatype is still available through
-/// [`Variable::datatype`]; this is the summary most callers want.
+/// This mirrors `netcdf::types::NcVariableType`. The full HDF5 datatype is
+/// still available through [`Variable::datatype`].
 ///
-/// Not `Copy`: a variable-length sequence carries its element type.
+/// Not `Copy`: a ragged array carries its element type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DType {
-    /// Signed integer of the given width in bytes.
+    /// Signed integer of the given width in bytes. netCDF `byte`, `short`,
+    /// `int` and `int64`.
     Int(u8),
-    /// Unsigned integer of the given width in bytes.
+    /// Unsigned integer of the given width in bytes. netCDF `ubyte`, `ushort`,
+    /// `uint` and `uint64`.
     Uint(u8),
-    /// IEEE float of the given width in bytes.
+    /// IEEE float of the given width in bytes. netCDF `float` and `double`.
     Float(u8),
-    /// Fixed-length string of the given width in bytes.
-    String(u32),
-    /// Variable-length string, stored through the global heap.
-    VarString,
-    /// Variable-length sequence of a base type, stored through the global heap.
-    VarSequence(Box<DType>),
+    /// netCDF `char`. One byte for each element.
+    ///
+    /// A `char` variable holds text across its last dimension, so
+    /// `char name(casts, strnlen)` holds one string for each cast. The last
+    /// dimension is the string length. This reader reports the elements as the
+    /// file stores them and leaves that join to the caller.
+    Char,
+    /// netCDF `string`. One variable-length string for each element, held in
+    /// the global heap.
+    String,
+    /// A fixed-length string wider than one byte.
+    ///
+    /// netcdf-c never writes this. Another HDF5 writer may. One string sits in
+    /// each element, and the dataspace already excludes the width.
+    FixedString(u32),
+    /// A ragged array of a base type, held in the global heap.
+    Vlen(Box<DType>),
     /// Something this summary does not model.
     Other,
 }
 
 impl DType {
-    /// The summary type of an HDF5 datatype.
+    /// The netCDF type of an HDF5 datatype.
     pub fn of(datatype: &crate::hdf5::message::Datatype) -> Self {
         let size = datatype.size;
         match &datatype.class {
             DatatypeClass::FixedPoint { signed: true, .. } => DType::Int(size as u8),
             DatatypeClass::FixedPoint { signed: false, .. } => DType::Uint(size as u8),
             DatatypeClass::FloatingPoint { .. } => DType::Float(size as u8),
-            DatatypeClass::String { .. } => DType::String(size),
+            // netcdf-c writes `char` as a one-byte HDF5 string and puts the
+            // length in the dataspace. Any wider fixed string is not netCDF.
+            DatatypeClass::String { .. } if size == 1 => DType::Char,
+            DatatypeClass::String { .. } => DType::FixedString(size),
             DatatypeClass::VariableLength {
                 kind: crate::hdf5::message::VlenKind::String,
                 ..
-            } => DType::VarString,
+            } => DType::String,
             DatatypeClass::VariableLength {
                 kind: crate::hdf5::message::VlenKind::Sequence,
                 base,
                 ..
-            } => DType::VarSequence(Box::new(DType::of(base))),
+            } => DType::Vlen(Box::new(DType::of(base))),
             _ => DType::Other,
         }
     }
 
-    /// Whether this is an integer type.
+    /// Whether this is an integer type. `char` is not one.
     pub fn is_integer(&self) -> bool {
         matches!(self, DType::Int(_) | DType::Uint(_))
     }
@@ -817,10 +833,27 @@ impl DType {
         matches!(self, DType::Float(_))
     }
 
-    /// The Rust type that matches this stored type.
+    /// Whether this type holds text.
+    pub fn is_text(&self) -> bool {
+        matches!(self, DType::Char | DType::String | DType::FixedString(_))
+    }
+
+    /// Size of one element in bytes, where the type has a fixed one.
     ///
-    /// Pass this name to [`Values::get`]. A type this reader does not model
-    /// reports its own description instead.
+    /// A [`DType::String`] has no fixed size: the value lives in a heap.
+    pub fn size(&self) -> Option<usize> {
+        match self {
+            DType::Int(n) | DType::Uint(n) | DType::Float(n) => Some(*n as usize),
+            DType::Char => Some(1),
+            DType::FixedString(n) => Some(*n as usize),
+            DType::String | DType::Vlen(_) | DType::Other => None,
+        }
+    }
+
+    /// The netCDF name of this type.
+    ///
+    /// A numeric type also names the Rust type that reads it without a
+    /// conversion. Pass that to [`Values::get`].
     pub fn name(&self) -> String {
         match self {
             DType::Int(1) => "i8".into(),
@@ -836,9 +869,10 @@ impl DType {
             DType::Int(n) => format!("a {n}-byte signed integer"),
             DType::Uint(n) => format!("a {n}-byte unsigned integer"),
             DType::Float(n) => format!("a {n}-byte float"),
-            DType::String(n) => format!("a {n}-byte string"),
-            DType::VarString => "a variable-length string".into(),
-            DType::VarSequence(base) => format!("a sequence of {}", base.name()),
+            DType::Char => "char".into(),
+            DType::String => "string".into(),
+            DType::FixedString(n) => format!("a {n}-byte fixed string"),
+            DType::Vlen(base) => format!("a ragged array of {}", base.name()),
             DType::Other => "a type this reader does not model".into(),
         }
     }
@@ -1262,6 +1296,48 @@ impl<'a> Variable<'a> {
     {
         let values = self.get_values::<T, E>(extents)?;
         one_value(&self.info.path, values)
+    }
+
+    /// Read strings, over any selection.
+    ///
+    /// This matches `netcdf::Variable::get_strings`. It takes the same
+    /// selection forms as [`Variable::get_values`].
+    ///
+    /// A `string` variable holds one string in each element, so the result has
+    /// one string for each element the selection names.
+    ///
+    /// A `char` variable holds one **byte** in each element. Its last dimension
+    /// is the string length, so this returns one string for each character.
+    /// Join them yourself, or read the bytes with [`Values::as_bytes`]. The
+    /// reader reports the elements as the file stores them.
+    ///
+    /// ```no_run
+    /// # fn run(var: oxcdf::Variable<'_>) -> oxcdf::Result<()> {
+    /// let names = var.get_strings(..)?;
+    /// let some = var.get_strings([0..4])?;
+    /// # Ok(()) }
+    /// ```
+    pub fn get_strings<E>(&self, extents: E) -> Result<Vec<String>>
+    where
+        E: TryInto<Extents>,
+        E::Error: Into<Error>,
+    {
+        let extents: Extents = extents.try_into().map_err(Into::into)?;
+        let slab = extents.to_hyperslab(&self.info.path, &self.info.shape)?;
+        self.read_selection(&slab)?.to_strings()
+    }
+
+    /// Read one string.
+    ///
+    /// This matches `netcdf::Variable::get_string`. The selection must name one
+    /// element.
+    pub fn get_string<E>(&self, extents: E) -> Result<String>
+    where
+        E: TryInto<Extents>,
+        E::Error: Into<Error>,
+    {
+        let strings = self.get_strings(extents)?;
+        one_value(&self.info.path, strings)
     }
 
     /// Read a whole variable into an `ndarray` of `T`.

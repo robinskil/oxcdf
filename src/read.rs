@@ -204,6 +204,11 @@ impl RawData {
                 datatype.class
             )));
         };
+
+        // One string for each element. A netCDF `char` variable stores one byte
+        // for each element, so it decodes to one string for each character. The
+        // last dimension is its string length. This reader reports the elements
+        // as stored and leaves that join to the caller.
         let size = self.element_size;
         let mut out = Vec::with_capacity(self.len());
 
@@ -1072,8 +1077,10 @@ async fn fetch_bytes(
 
 /// Copy one decoded chunk's intersection with the selection into `out`.
 ///
-/// Shared by both engines: the copy is pure arithmetic over already-fetched
-/// bytes, so it does not care how they arrived.
+/// The copy is pure arithmetic over already-fetched bytes, so it does not care
+/// how they arrived. Only the asynchronous engine calls it: the synchronous one
+/// decodes and copies in one pass, because it holds the bytes already.
+#[cfg(feature = "async")]
 #[allow(clippy::too_many_arguments)]
 fn copy_chunk(
     out: &mut [u8],
