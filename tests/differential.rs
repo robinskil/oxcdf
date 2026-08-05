@@ -105,7 +105,7 @@ fn compare_integers(
     let got = mine
         .read()
         .unwrap_or_else(|e| panic!("{label}: native read failed: {e}"))
-        .to_i64()
+        .get::<i64>()
         .unwrap_or_else(|e| panic!("{label}: native decode failed: {e}"));
 
     assert_eq!(
@@ -136,7 +136,7 @@ fn compare_floats(
     let got = mine
         .read()
         .unwrap_or_else(|e| panic!("{label}: native read failed: {e}"))
-        .to_f64()
+        .get::<f64>()
         .unwrap_or_else(|e| panic!("{label}: native decode failed: {e}"));
 
     assert_eq!(
@@ -271,15 +271,12 @@ fn hyperslab_reads_match_netcdf_c() {
                     .unwrap_or_else(|e| panic!("{label}: netcdf-c slab read failed: {e}")),
             };
 
-            let mine_ranges: Vec<std::ops::Range<u64>> = ranges
-                .iter()
-                .map(|r| r.start as u64..r.end as u64)
-                .collect();
+            // The same selection value drives both crates, which is the point:
+            // the two `get_values` calls above and below differ only in which
+            // crate they call.
             let got = mine
-                .read_slice(&mine_ranges)
-                .unwrap_or_else(|e| panic!("{label}: native slab read failed: {e}"))
-                .to_f64()
-                .unwrap();
+                .get_values::<f64, _>(ranges.as_slice())
+                .unwrap_or_else(|e| panic!("{label}: native slab read failed: {e}"));
 
             assert_eq!(
                 got.len(),
@@ -338,7 +335,7 @@ fn chunkwise_reads_reassemble_to_what_netcdf_c_returns() {
                 let block = mine
                     .read_chunk(&chunk)
                     .unwrap_or_else(|e| panic!("{label}: chunk read failed: {e}"))
-                    .to_f64()
+                    .get::<f64>()
                     .unwrap();
                 for row in 0..chunk.shape[0] as usize {
                     for col in 0..chunk.shape[1] as usize {

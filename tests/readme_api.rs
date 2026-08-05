@@ -36,7 +36,7 @@ fn the_synchronous_example_works() -> oxcdf::Result<()> {
     }
 
     for v in file.variables() {
-        println!("{} {:?} {:?} {:?}", v.name, v.dtype(), v.shape, v.dimensions);
+        println!("{} {:?} {:?} {:?}", v.name, v.vartype(), v.shape, v.dimensions);
     }
 
     let temp = file.variable("analysed_sst").expect("a variable");
@@ -85,7 +85,7 @@ fn the_types_example_works() -> oxcdf::Result<()> {
     let file = oxcdf::open(&path)?;
     let temp = file.variable("/contig_f32be").unwrap();
 
-    assert_eq!(temp.dtype(), oxcdf::DType::Float(4));
+    assert_eq!(temp.vartype(), oxcdf::DType::Float(4));
     let exact = temp.get_values::<f32, _>(..)?;
     let wide = temp.get_values::<f64, _>(..)?;
     assert_eq!(exact.len(), wide.len());
@@ -109,7 +109,7 @@ fn the_string_variable_example_works() -> oxcdf::Result<()> {
     };
     let file = oxcdf::open(&path)?;
     let names = file.variable("station_name").unwrap();
-    assert_eq!(names.dtype(), oxcdf::DType::String);
+    assert_eq!(names.vartype(), oxcdf::DType::String);
 
     let all = names.get_strings(..)?;
     let one = names.get_string([0])?;
@@ -124,7 +124,7 @@ fn the_char_variable_example_works() -> oxcdf::Result<()> {
     };
     let file = oxcdf::open(&path)?;
     let v = file.variable("country").unwrap();
-    assert_eq!(v.dtype(), oxcdf::DType::Char);
+    assert_eq!(v.vartype(), oxcdf::DType::Char);
     assert_eq!(v.shape, vec![47, 40]);
 
     let width = *v.shape.last().unwrap() as usize;
@@ -170,16 +170,16 @@ fn the_dtype_table_matches_the_corpus() -> oxcdf::Result<()> {
 
     // Every variable's type must be one the table names, and `size` must agree.
     for v in file.variables() {
-        match v.dtype() {
+        match v.vartype() {
             DType::Int(n) | DType::Uint(n) | DType::Float(n) => {
-                assert_eq!(v.dtype().size(), Some(n as usize), "{}", v.path);
-                assert!(v.dtype().is_integer() || v.dtype().is_float());
+                assert_eq!(v.vartype().size(), Some(n as usize), "{}", v.path);
+                assert!(v.vartype().is_integer() || v.vartype().is_float());
             }
             DType::Char => {
-                assert_eq!(v.dtype().size(), Some(1), "{}", v.path);
-                assert!(v.dtype().is_text());
+                assert_eq!(v.vartype().size(), Some(1), "{}", v.path);
+                assert!(v.vartype().is_text());
             }
-            DType::String => assert_eq!(v.dtype().size(), None, "{}", v.path),
+            DType::String => assert_eq!(v.vartype().size(), None, "{}", v.path),
             other => panic!("{} has an unexpected type {other:?}", v.path),
         }
     }
@@ -197,20 +197,20 @@ fn the_ndarray_example_works() -> oxcdf::Result<()> {
     let file = oxcdf::open(&path)?;
     let temp = file.variable("/contig_f64").expect("a 2-D variable");
 
-    let a = temp.get_array::<f64, _>(..)?;
+    let a = temp.get::<f64, _>(..)?;
     assert_eq!(a.shape(), &[40, 6]);
     println!("{}", a[[0, 0]]);
 
     let row = a.index_axis(ndarray::Axis(0), 0);
     assert_eq!(row.len(), 6);
 
-    let b = temp.get_array::<f64, _>([5..15, 2..5])?;
+    let b = temp.get::<f64, _>([5..15, 2..5])?;
     assert_eq!(b.shape(), &[10, 3]);
 
     let counts = file
         .variable("/chunked_i32")
         .unwrap()
-        .get_array::<i32, _>(..)?;
+        .get::<i32, _>(..)?;
     assert_eq!(counts.shape(), &[40, 6]);
 
     let names = file
@@ -293,13 +293,13 @@ async fn the_async_interface_matches_the_table() -> oxcdf::Result<()> {
 
     let temp = file.variable("/chunked_i32").unwrap();
     let _ = temp.attribute("units");
-    let _ = temp.dtype();
+    let _ = temp.vartype();
     let _ = temp.shape.clone();
     let _ = temp.dimensions.clone();
 
     // Only the values await.
     let _ = temp.read().await?;
-    let _ = temp.read_slice(&[0..2, 0..2]).await?;
+    let _ = temp.get_values::<f64, _>([0..2, 0..2]).await?;
     let chunks = temp.chunks().await?;
     let _ = temp.read_chunk(&chunks[0]).await?;
     Ok(())
@@ -314,9 +314,9 @@ async fn the_async_ndarray_example_works() -> oxcdf::Result<()> {
     let file = oxcdf::open_async(Arc::new(SyncAsAsync(FileSource::open(&path)?))).await?;
     let temp = file.variable("/contig_f64").unwrap();
 
-    let a = temp.get_array::<f64, _>(..).await?;
+    let a = temp.get::<f64, _>(..).await?;
     assert_eq!(a.shape(), &[40, 6]);
-    let b = temp.get_array::<f64, _>([5..15, 2..5]).await?;
+    let b = temp.get::<f64, _>([5..15, 2..5]).await?;
     assert_eq!(b.shape(), &[10, 3]);
     Ok(())
 }
@@ -344,7 +344,7 @@ async fn the_object_store_example_compiles(
     }
 
     for v in file.variables() {
-        println!("{} {:?} {:?} {:?}", v.name, v.dtype(), v.shape, v.dimensions);
+        println!("{} {:?} {:?} {:?}", v.name, v.vartype(), v.shape, v.dimensions);
     }
 
     let temp = file.variable("TEMP").unwrap();
@@ -371,5 +371,27 @@ async fn the_open_store_options_compile(
             .io_cache_bytes(128 << 20),
     )
     .await?;
+    Ok(())
+}
+
+#[test]
+fn the_ragged_array_example_works() -> oxcdf::Result<()> {
+    let Some(path) = corpus("vlen_seq.nc") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+    let seqs = file.variable("rows").unwrap().read()?.to_sequences::<f32>()?;
+    assert!(!seqs.is_empty());
+    Ok(())
+}
+
+#[test]
+fn the_char_raw_bytes_example_works() -> oxcdf::Result<()> {
+    let Some(path) = corpus("wod_ctd_1964.nc") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+    let bytes = file.variable("country").unwrap().get_raw_values(..)?;
+    assert_eq!(bytes.len(), 47 * 40);
     Ok(())
 }

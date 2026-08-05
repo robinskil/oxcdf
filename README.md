@@ -39,7 +39,7 @@ metadata.
 | Read one value | `var.get_value::<f32,_>([0,3])?` | `var.get_value::<f32,_>([0,3]).await?` |
 | Read strings | `var.get_strings(..)?` | `var.get_strings(..).await?` |
 | Read one string | `var.get_string([0])?` | `var.get_string([0]).await?` |
-| Read an array | `var.get_array::<f32,_>(..)?` | `var.get_array::<f32,_>(..).await?` |
+| Read an array | `var.get::<f32,_>(..)?` | `var.get::<f32,_>(..).await?` |
 | List the chunks | `var.chunks()` | `var.chunks().await?` |
 | Read one chunk | `var.read_chunk(&c)?` | `var.read_chunk(&c).await?` |
 
@@ -66,7 +66,7 @@ for a in file.attributes() {
 
 // Variables.
 for v in file.variables() {
-    println!("{} {:?} {:?} {:?}", v.name, v.dtype(), v.shape, v.dimensions);
+    println!("{} {:?} {:?} {:?}", v.name, v.vartype(), v.shape, v.dimensions);
 }
 
 // One variable. A leading slash is optional.
@@ -115,21 +115,21 @@ the stored type.
 
 ```rust
 let temp = file.variable("TEMP").unwrap();
-println!("{:?}", temp.dtype());               // Float(4)
+println!("{:?}", temp.vartype());               // Float(4)
 
 let exact = temp.get_values::<f32, _>(..)?;   // copied, no conversion
 let wide = temp.get_values::<f64, _>(..)?;    // converted
 ```
 
-Ask for the type `dtype()` reports and the read copies the values. Any other
+Ask for the type `vartype()` reports and the read copies the values. Any other
 numeric type converts, and a conversion can lose information: `f64` to `f32`
 loses precision, `i64` to `f64` loses integers above 2^53, and a float to an
 integer truncates toward zero.
 
-`dtype()` returns a `DType`, which mirrors the `netcdf` crate's
+`vartype()` returns a `DType`, which mirrors the `netcdf` crate's
 `NcVariableType`.
 
-| `dtype()` | netCDF | Read it with |
+| `vartype()` | netCDF | Read it with |
 |---|---|---|
 | `Int(1)` `Int(2)` `Int(4)` `Int(8)` | `byte` `short` `int` `int64` | `get_values::<i8>` … `::<i64>` |
 | `Uint(1)` `Uint(2)` `Uint(4)` `Uint(8)` | `ubyte` `ushort` `uint` `uint64` | `get_values::<u8>` … `::<u64>` |
@@ -148,7 +148,7 @@ lives in the global heap, which the reader follows for you.
 
 ```rust
 let names = file.variable("station_name").unwrap();
-assert_eq!(names.dtype(), DType::String);
+assert_eq!(names.vartype(), DType::String);
 
 let all = names.get_strings(..)?;      // one string for each element
 let one = names.get_string([0])?;
@@ -161,7 +161,7 @@ axis yourself.
 
 ```rust
 let v = file.variable("country").unwrap();
-assert_eq!(v.dtype(), DType::Char);
+assert_eq!(v.vartype(), DType::Char);
 assert_eq!(v.shape, vec![47, 40]);     // 40 is the string length
 
 let width = *v.shape.last().unwrap() as usize;
@@ -173,28 +173,30 @@ let joined: Vec<String> = v
 assert_eq!(joined[0], "GREAT BRITAIN");
 ```
 
-`read()?.as_bytes()` gives the same data as raw bytes, which is often the
+`get_raw_values(..)` gives the same data as raw bytes, which is often the
 simpler route for a caller that builds its own string array.
 
-## Other reads
+## Beyond the netCDF interface
 
-`read()` and `read_slice()` return a `Values`, which holds the type and the
-shape. Use it to look before you decode, and for strings and sequences.
+Everything above matches the `netcdf` crate. Two reads have no netCDF name, so
+they go through `read()`, which returns a `Values`.
 
 ```rust
+// A ragged array.
+let seqs = file.variable("profiles").unwrap().read()?.to_sequences::<f32>()?;
+
+// The type and the shape, before deciding how to decode.
 let values = temp.read()?;
 println!("{:?} {:?}", values.dtype(), values.shape());
-
 let numbers: Vec<f32> = values.get()?;
-let text = file.variable("station_name").unwrap().read()?.to_strings()?;
-let seqs = file.variable("profiles").unwrap().read()?.to_sequences::<f32>()?;
 ```
 
-`Values` also gives `as_bytes` for the raw native-order bytes.
+Chunks are the other addition. Each chunk is a separate byte range with its own
+filters, so they are the natural unit of parallel work.
 
 ## Read into an ndarray
 
-Turn on the `ndarray` feature. `get_array` takes the same selections and the
+Turn on the `ndarray` feature. `get` takes the same selections and the
 same types as `get_values`. The result is an `ArrayD` whose shape is the
 selection's shape. Its axes follow the variable's dimensions, in order.
 
@@ -202,7 +204,7 @@ selection's shape. Its axes follow the variable's dimensions, in order.
 let temp = file.variable("TEMP").unwrap();     // stored f32
 
 // The whole variable.
-let a = temp.get_array::<f32, _>(..)?;         // ArrayD<f32>, shape [8, 6]
+let a = temp.get::<f32, _>(..)?;         // ArrayD<f32>, shape [8, 6]
 assert_eq!(a.shape(), &[8, 6]);
 println!("{}", a[[0, 0]]);                     // Row-major.
 
@@ -210,11 +212,11 @@ println!("{}", a[[0, 0]]);                     // Row-major.
 let row = a.index_axis(ndarray::Axis(0), 0);
 
 // A block.
-let b = temp.get_array::<f32, _>([5..15, 2..5])?;
+let b = temp.get::<f32, _>([5..15, 2..5])?;
 assert_eq!(b.shape(), &[10, 3]);
 
 // An integer variable.
-let counts = file.variable("N_LEVELS").unwrap().get_array::<i32, _>(..)?;
+let counts = file.variable("N_LEVELS").unwrap().get::<i32, _>(..)?;
 
 // Strings.
 let names = file.variable("PLATFORM_NUMBER").unwrap().read()?.to_array_strings()?;
@@ -223,8 +225,8 @@ let names = file.variable("PLATFORM_NUMBER").unwrap().read()?.to_array_strings()
 The asynchronous form is the same, with an await.
 
 ```rust
-let a = temp.get_array::<f32, _>(..).await?;
-let b = temp.get_array::<f32, _>([5..15, 2..5]).await?;
+let a = temp.get::<f32, _>(..).await?;
+let b = temp.get::<f32, _>([5..15, 2..5]).await?;
 ```
 
 `to_array_strings` needs a string variable, fixed length or variable length.
@@ -257,7 +259,7 @@ for a in file.attributes() {
 
 // Variables.
 for v in file.variables() {
-    println!("{} {:?} {:?} {:?}", v.name, v.dtype(), v.shape, v.dimensions);
+    println!("{} {:?} {:?} {:?}", v.name, v.vartype(), v.shape, v.dimensions);
 }
 
 // One variable.
@@ -406,7 +408,7 @@ The crate does not write files. Keep netcdf-c for writes.
 cargo test --features "diff-tests,object-store,ndarray,async"
 ```
 
-371 tests. `differential.rs` compares every value against netcdf-c.
+372 tests. `differential.rs` compares every value against netcdf-c.
 `typed_reads.rs` reads every corpus variable as its stored type through both
 this crate and the `netcdf` crate, and compares element by element.
 `netcdf_layer.rs` compares variables, dimensions and axes against `ncdump`.

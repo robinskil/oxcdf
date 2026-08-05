@@ -118,7 +118,7 @@ async fn a_cold_async_read_is_correct() {
     .await
     .unwrap();
 
-    let values = got.to_i64(d).unwrap();
+    let values = got.get::<i64>(d).unwrap();
     assert_eq!(values.len(), 240);
     for (i, v) in values.iter().enumerate() {
         assert_eq!(*v, i as i64 * 3 - 100, "element {i}");
@@ -232,5 +232,5 @@ async fn a_contiguous_variable_needs_no_preparation() {
     )
     .await
     .unwrap();
-    assert_eq!(got.to_f64(d).unwrap().len(), 240);
+    assert_eq!(got.get::<f64>(d).unwrap().len(), 240);
 }

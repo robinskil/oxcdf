@@ -253,10 +253,13 @@ impl NetcdfFile {
         self
     }
 
-    /// A variable's metadata by absolute path, without binding it to the file.
-    ///
-    /// Prefer [`NetcdfFile::variable`], which returns a readable handle.
-    pub fn variable_info(&self, path: &str) -> Option<&NcVariable> {
+    /// The HDF5 dataset behind a variable, for the storage this layer does not
+    /// model.
+    pub fn dataset(&self, variable: &NcVariable) -> Option<&DatasetIndex> {
+        self.hdf5.dataset(&variable.path)
+    }
+
+    pub(crate) fn variable_info(&self, path: &str) -> Option<&NcVariable> {
         let trimmed = path.trim_start_matches('/');
         let mut parts: Vec<&str> = trimmed.split('/').collect();
         let leaf = parts.pop()?;
@@ -265,24 +268,6 @@ impl NetcdfFile {
             group = group.groups.iter().find(|g| g.name == part)?;
         }
         group.variable(leaf)
-    }
-
-    /// The HDF5 dataset backing a variable.
-    pub fn dataset(&self, variable: &NcVariable) -> Option<&DatasetIndex> {
-        self.hdf5.dataset(&variable.path)
-    }
-
-    /// Read a hyperslab of a variable.
-    pub fn read(&self, variable: &NcVariable, slab: &Hyperslab) -> Result<RawData> {
-        let dataset = self
-            .dataset(variable)
-            .ok_or_else(|| Error::not_found(format!("dataset for variable {}", variable.path)))?;
-        read_hyperslab(self.hdf5.ctx(), dataset, slab)
-    }
-
-    /// Read a whole variable.
-    pub fn read_all(&self, variable: &NcVariable) -> Result<RawData> {
-        self.read(variable, &Hyperslab::all(&variable.shape))
     }
 }
 
@@ -705,7 +690,7 @@ mod tests {
         );
         let file = NetcdfFile::open(path).unwrap();
         let v = file.variable("/chunked_i32").unwrap();
-        let values = v.read().unwrap().to_i64().unwrap();
+        let values = v.read().unwrap().get::<i64>().unwrap();
 
         assert_eq!(values.len(), 240);
         assert_eq!(values[0], -100);
@@ -1049,6 +1034,11 @@ impl Values {
         &self.raw
     }
 
+    /// Take the underlying [`RawData`], without a copy.
+    pub fn into_raw(self) -> RawData {
+        self.raw
+    }
+
     /// Values as `T`.
     ///
     /// A `T` equal to [`Values::dtype`] copies the values. Any other numeric
@@ -1067,15 +1057,6 @@ impl Values {
         self.raw.get_of(&self.datatype, "")
     }
 
-    /// Values as `f64`. Shorthand for [`Values::get`].
-    pub fn to_f64(&self) -> Result<Vec<f64>> {
-        self.get()
-    }
-
-    /// Values as `i64`. Shorthand for [`Values::get`].
-    pub fn to_i64(&self) -> Result<Vec<i64>> {
-        self.get()
-    }
 
     /// Values as strings.
     ///
@@ -1097,17 +1078,6 @@ impl Values {
         shape_into_array(self.shape(), self.get::<T>()?)
     }
 
-    /// The values as an `ndarray` of `f64`. Shorthand for [`Values::to_array`].
-    #[cfg(feature = "ndarray")]
-    pub fn to_array_f64(&self) -> Result<ndarray::ArrayD<f64>> {
-        self.to_array()
-    }
-
-    /// The values as an `ndarray` of `i64`. Shorthand for [`Values::to_array`].
-    #[cfg(feature = "ndarray")]
-    pub fn to_array_i64(&self) -> Result<ndarray::ArrayD<i64>> {
-        self.to_array()
-    }
 
     /// The values as an `ndarray` of strings.
     ///
@@ -1151,15 +1121,6 @@ impl Values {
             .collect()
     }
 
-    /// Sequences as `f64`. Shorthand for [`Values::to_sequences`].
-    pub fn to_sequences_f64(&self) -> Result<Vec<Vec<f64>>> {
-        self.to_sequences()
-    }
-
-    /// Sequences as `i64`. Shorthand for [`Values::to_sequences`].
-    pub fn to_sequences_i64(&self) -> Result<Vec<Vec<i64>>> {
-        self.to_sequences()
-    }
 
     /// The raw bytes of each sequence, in native order.
     pub fn sequence_bytes(&self) -> Result<&[Vec<u8>]> {
@@ -1229,14 +1190,19 @@ impl<'a> Variable<'a> {
         &self.dataset.datatype
     }
 
-    /// A summary of the element type.
-    pub fn dtype(&self) -> DType {
+    /// The variable's netCDF type. This matches `netcdf::Variable::vartype`.
+    pub fn vartype(&self) -> DType {
         DType::of(&self.dataset.datatype)
     }
 
-    /// Total number of elements.
-    pub fn element_count(&self) -> u64 {
+    /// Total number of elements. This matches `netcdf::Variable::len`.
+    pub fn len(&self) -> u64 {
         self.info.shape.iter().product()
+    }
+
+    /// Whether the variable holds no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Whether this reader can decode the variable's values.
@@ -1244,18 +1210,6 @@ impl<'a> Variable<'a> {
     /// Check this before reading if netcdf-c is kept as a fallback.
     pub fn is_readable(&self) -> bool {
         self.dataset.is_readable()
-    }
-
-    /// Read the whole variable straight into an `ndarray` of `f64`.
-    #[cfg(feature = "ndarray")]
-    pub fn read_array_f64(&self) -> Result<ndarray::ArrayD<f64>> {
-        self.read()?.to_array_f64()
-    }
-
-    /// Read the whole variable straight into an `ndarray` of `i64`.
-    #[cfg(feature = "ndarray")]
-    pub fn read_array_i64(&self) -> Result<ndarray::ArrayD<i64>> {
-        self.read()?.to_array_i64()
     }
 
     /// Read values as `T`, over any selection.
@@ -1340,9 +1294,12 @@ impl<'a> Variable<'a> {
         one_value(&self.info.path, strings)
     }
 
-    /// Read a whole variable into an `ndarray` of `T`.
+    /// Read values as an `ndarray` of `T`, over any selection.
+    ///
+    /// This matches `netcdf::Variable::get`. The array's shape is the
+    /// selection's shape, and its axes follow the variable's dimensions.
     #[cfg(feature = "ndarray")]
-    pub fn get_array<T: Element, E>(&self, extents: E) -> Result<ndarray::ArrayD<T>>
+    pub fn get<T: Element, E>(&self, extents: E) -> Result<ndarray::ArrayD<T>>
     where
         E: TryInto<Extents>,
         E::Error: Into<Error>,
@@ -1352,27 +1309,32 @@ impl<'a> Variable<'a> {
         self.read_selection(&slab)?.to_array()
     }
 
-    /// Read the whole variable.
+    /// Read the raw bytes of a selection, in native order and row-major.
+    ///
+    /// This matches `netcdf::Variable::get_raw_values`. Use it for a `char`
+    /// variable, or to build your own typed array without a copy through
+    /// [`Vec`].
+    pub fn get_raw_values<E>(&self, extents: E) -> Result<Vec<u8>>
+    where
+        E: TryInto<Extents>,
+        E::Error: Into<Error>,
+    {
+        let extents: Extents = extents.try_into().map_err(Into::into)?;
+        let slab = extents.to_hyperslab(&self.info.path, &self.info.shape)?;
+        Ok(self.read_selection(&slab)?.into_raw().bytes)
+    }
+
+    /// Read the whole variable as [`Values`].
+    ///
+    /// [`Values`] carries the type and the shape, so use this to look before
+    /// deciding how to decode. It also reaches the reads that have no netCDF
+    /// name: ragged arrays through [`Values::to_sequences`], and one storage
+    /// chunk at a time.
     pub fn read(&self) -> Result<Values> {
         self.read_selection(&Hyperslab::all(&self.info.shape))
     }
 
-    /// Read a slice, given one range per axis.
-    ///
-    /// ```no_run
-    /// # use oxcdf::netcdf::NetcdfFile;
-    /// # fn main() -> oxcdf::Result<()> {
-    /// # let file = NetcdfFile::open("f.nc")?;
-    /// let temp = file.variable("/TEMP").unwrap();
-    /// let block = temp.read_slice(&[0..8, 10..30])?;
-    /// # Ok(()) }
-    /// ```
-    pub fn read_slice(&self, ranges: &[std::ops::Range<u64>]) -> Result<Values> {
-        let slab = Hyperslab::from_ranges(&self.info.path, &self.info.shape, ranges)?;
-        self.read_selection(&slab)
-    }
-
-    /// Read an explicit selection.
+    /// Read an explicit selection as [`Values`].
     pub fn read_selection(&self, slab: &Hyperslab) -> Result<Values> {
         let ctx = self.file.hdf5().ctx();
         let raw = read_hyperslab(ctx, self.dataset, slab)?;
@@ -1566,6 +1528,21 @@ impl NetcdfFile {
     /// The dimensions defined in the root group.
     pub fn dimensions(&self) -> &[NcDimension] {
         &self.root.dimensions
+    }
+
+    /// One dimension of the root group by name.
+    pub fn dimension(&self, name: &str) -> Option<&NcDimension> {
+        self.root.dimension(name)
+    }
+
+    /// The length of one dimension of the root group.
+    pub fn dimension_len(&self, name: &str) -> Option<u64> {
+        self.dimension(name).map(|d| d.len)
+    }
+
+    /// The groups directly inside the root group.
+    pub fn groups(&self) -> &[NcGroup] {
+        &self.root.groups
     }
 
     /// A group by absolute path, such as `/` or `/processing`.

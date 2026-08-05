@@ -60,7 +60,7 @@
 //! let temp = file.variable("TEMP").unwrap();
 //!
 //! println!("{:?} {:?}", temp.shape, temp.dimensions);
-//! let values = temp.read()?.to_f64()?;
+//! let values = temp.read()?.get::<f64>()?;
 //! # Ok::<(), oxcdf::Error>(())
 //! ```
 //!
@@ -72,7 +72,7 @@
 //! let temp = file.variable("TEMP").unwrap();
 //!
 //! println!("{:?} {:?}", temp.shape, temp.dimensions);
-//! let values = temp.read().await?.to_f64()?;
+//! let values = temp.read().await?.get::<f64>()?;
 //! # Ok(()) }
 //! ```
 //!
@@ -144,7 +144,7 @@ pub use async_source::{AsyncByteSource, SyncAsAsync};
 /// ```no_run
 /// let file = oxcdf::open("argo.nc")?;
 /// let temp = file.variable("TEMP").unwrap();
-/// let values = temp.read()?.to_f64()?;
+/// let values = temp.read()?.get::<f64>()?;
 /// # Ok::<(), oxcdf::Error>(())
 /// ```
 pub fn open(path: impl AsRef<std::path::Path>) -> Result<NetcdfFile> {
@@ -167,7 +167,7 @@ pub fn open_with(path: impl AsRef<std::path::Path>, options: OpenOptions) -> Res
 /// # async fn run(source: std::sync::Arc<dyn oxcdf::AsyncByteSource>) -> oxcdf::Result<()> {
 /// let file = oxcdf::open_async(source).await?;
 /// let temp = file.variable("TEMP").unwrap();
-/// let values = temp.read().await?.to_f64()?;
+/// let values = temp.read().await?.get::<f64>()?;
 /// # Ok(()) }
 /// ```
 #[cfg(feature = "async")]

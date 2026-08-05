@@ -21,7 +21,7 @@ fn native_pass(file: &NetcdfFile) -> usize {
             continue;
         }
         if let Ok(values) = v.read() {
-            if let Ok(f) = values.to_f64() {
+            if let Ok(f) = values.get::<f64>() {
                 n += f.len();
             }
         }

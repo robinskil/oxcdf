@@ -33,7 +33,7 @@ fn values_are_identical_across_request_sizes() {
         let d = f.dataset("/chunked_i32").unwrap();
         read_hyperslab(f.ctx(), d, &Hyperslab::all(&d.shape))
             .unwrap()
-            .to_i64(d)
+            .get::<i64>(d)
             .unwrap()
     };
 
@@ -43,7 +43,7 @@ fn values_are_identical_across_request_sizes() {
         let d = f.dataset("/chunked_i32").unwrap();
         let got = read_hyperslab(f.ctx(), d, &Hyperslab::all(&d.shape))
             .unwrap()
-            .to_i64(d)
+            .get::<i64>(d)
             .unwrap();
         assert_eq!(got, want, "request size {size} changed the values");
     }
@@ -64,7 +64,7 @@ fn caches_can_be_turned_off_entirely() {
     assert_eq!(
         read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape))
             .unwrap()
-            .to_f64(d)
+            .get::<f64>(d)
             .unwrap()
             .len(),
         240

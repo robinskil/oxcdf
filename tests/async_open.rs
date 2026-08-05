@@ -157,7 +157,7 @@ async fn the_two_opens_report_the_same_variable_attributes() {
                 .map(|a| (&a.name, format!("{:?}", a.value)))
                 .collect();
             assert_eq!(got_attrs, want_attrs, "attributes of {} in {path}", want.path);
-            assert_eq!(got.dtype(), want.dtype(), "type of {}", want.path);
+            assert_eq!(got.vartype(), want.vartype(), "type of {}", want.path);
         }
     }
 }
@@ -171,7 +171,7 @@ async fn the_two_engines_read_the_same_bytes() {
         let file = AsyncFile::open(Counting::open(&path)).await.unwrap();
 
         for want in sync.variables() {
-            if !want.is_readable() || want.element_count() == 0 {
+            if !want.is_readable() || want.is_empty() {
                 continue;
             }
             let got = file.variable(&want.path).unwrap();
@@ -218,11 +218,14 @@ async fn a_slice_matches_the_synchronous_engine() {
         if !want.is_readable() || want.shape.len() != 1 || want.shape[0] < 8 {
             continue;
         }
-        let ranges = vec![std::ops::Range { start: 2u64, end: 7 }];
+        let ranges = vec![std::ops::Range {
+            start: 2usize,
+            end: 7,
+        }];
         let got = file.variable(&want.path).unwrap();
         assert_eq!(
-            got.read_slice(&ranges).await.unwrap().as_bytes(),
-            want.read_slice(&ranges).unwrap().as_bytes(),
+            got.get_raw_values(ranges.clone()).await.unwrap(),
+            want.get_raw_values(ranges).unwrap(),
             "slice of {}",
             want.path
         );
@@ -236,7 +239,7 @@ async fn chunks_match_the_synchronous_engine() {
         let file = AsyncFile::open(Counting::open(&path)).await.unwrap();
 
         for want in sync.variables() {
-            if !want.is_readable() || want.element_count() == 0 {
+            if !want.is_readable() || want.is_empty() {
                 continue;
             }
             let got = file.variable(&want.path).unwrap();
@@ -319,7 +322,7 @@ async fn a_second_read_of_one_variable_makes_no_metadata_request() {
     let name = file
         .variables()
         .iter()
-        .find(|v| v.is_readable() && v.element_count() > 0)
+        .find(|v| v.is_readable() && !v.is_empty())
         .map(|v| v.path.clone())
         .expect("a readable variable");
 

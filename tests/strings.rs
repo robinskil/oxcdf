@@ -29,7 +29,7 @@ fn a_string_variable_returns_one_string_for_each_element() {
     let file = oxcdf::open(&path).unwrap();
     let v = file.variable("station_name").unwrap();
 
-    assert_eq!(v.dtype(), DType::String);
+    assert_eq!(v.vartype(), DType::String);
     assert_eq!(v.shape, vec![4]);
 
     let names = v.get_strings(..).unwrap();
@@ -106,7 +106,7 @@ fn a_char_variable_reports_one_element_for_each_character() {
 
     // The last dimension is the string length. The reader reports the elements
     // as stored; joining that axis is the caller's job.
-    assert_eq!(v.dtype(), DType::Char, "netCDF calls this `char`, not a string");
+    assert_eq!(v.vartype(), DType::Char, "netCDF calls this `char`, not a string");
     assert_eq!(v.shape, vec![47, 40]);
     assert_eq!(v.dimensions, vec!["casts", "strnlensmall"]);
 
@@ -172,7 +172,7 @@ async fn the_async_engine_reads_the_same_strings() {
         .unwrap();
 
         for want in sync.variables() {
-            if !want.dtype().is_text() {
+            if !want.vartype().is_text() {
                 continue;
             }
             let got = file.variable(&want.path).unwrap();
@@ -225,7 +225,7 @@ fn netcdf_string_parity() {
     let theirs = netcdf::open(&path).unwrap();
 
     for v in ours.variables() {
-        if v.dtype() != DType::String {
+        if v.vartype() != DType::String {
             continue;
         }
         let Some(other) = theirs.variable(&v.name) else {

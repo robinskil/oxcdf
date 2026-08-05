@@ -47,7 +47,7 @@ fn every_version_four_index_resolves_to_the_same_values() {
 
         let raw = read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape))
             .unwrap_or_else(|e| panic!("{name}: read failed: {e}"));
-        let got = raw.to_i64(d).unwrap();
+        let got = raw.get::<i64>(d).unwrap();
 
         assert_eq!(got.len(), want.len(), "{name}: wrong element count");
         for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
@@ -94,7 +94,7 @@ fn a_hyperslab_across_chunk_boundaries_is_right_for_every_index() {
         let slab = Hyperslab::new(vec![5, 2], vec![10, 3], &d.shape).unwrap();
         let got = read_hyperslab(file.ctx(), d, &slab)
             .unwrap_or_else(|e| panic!("{name}: {e}"))
-            .to_i64(d)
+            .get::<i64>(d)
             .unwrap();
 
         for row in 0..10usize {

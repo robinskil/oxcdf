@@ -14,8 +14,9 @@
 //! let temp = file.variable("TEMP").unwrap();
 //! println!("{:?}", temp.attribute("units").map(|a| &a.value));
 //!
-//! let all = temp.read().await?.to_f64()?;
-//! let part = temp.read_slice(&[0..8, 10..30]).await?.to_f64()?;
+//! let all = temp.get_values::<f32, _>(..).await?;
+//! let part = temp.get_values::<f32, _>([0..8, 10..30]).await?;
+//! let one = temp.get_value::<f32, _>([0, 3]).await?;
 //! # Ok(()) }
 //! ```
 //!
@@ -117,6 +118,21 @@ impl AsyncFile {
     /// The dimensions of the root group.
     pub fn dimensions(&self) -> &[NcDimension] {
         &self.netcdf.root().dimensions
+    }
+
+    /// One dimension of the root group by name.
+    pub fn dimension(&self, name: &str) -> Option<&NcDimension> {
+        self.netcdf.dimension(name)
+    }
+
+    /// The length of one dimension of the root group.
+    pub fn dimension_len(&self, name: &str) -> Option<u64> {
+        self.netcdf.dimension_len(name)
+    }
+
+    /// The groups directly inside the root group.
+    pub fn groups(&self) -> &[NcGroup] {
+        self.netcdf.groups()
     }
 
     /// The global attributes.
@@ -227,8 +243,8 @@ impl<'a> AsyncVariable<'a> {
         self.info.attributes.iter().find(|a| a.name == name)
     }
 
-    /// The value type.
-    pub fn dtype(&self) -> crate::netcdf::DType {
+    /// The variable's netCDF type. This matches `netcdf::Variable::vartype`.
+    pub fn vartype(&self) -> crate::netcdf::DType {
         crate::netcdf::DType::of(&self.dataset.datatype)
     }
 
@@ -237,9 +253,14 @@ impl<'a> AsyncVariable<'a> {
         &self.dataset.datatype
     }
 
-    /// Number of elements in the whole variable.
-    pub fn element_count(&self) -> u64 {
+    /// Total number of elements. This matches `netcdf::Variable::len`.
+    pub fn len(&self) -> u64 {
         self.info.shape.iter().product()
+    }
+
+    /// Whether the variable holds no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// The shape of one storage chunk, when the variable is chunked.
@@ -323,11 +344,10 @@ impl<'a> AsyncVariable<'a> {
     }
 
     /// Read values as an `ndarray` of `T`, over any selection.
+    ///
+    /// The asynchronous twin of [`crate::netcdf::Variable::get`].
     #[cfg(feature = "ndarray")]
-    pub async fn get_array<T: crate::netcdf::Element, E>(
-        &self,
-        extents: E,
-    ) -> Result<ndarray::ArrayD<T>>
+    pub async fn get<T: crate::netcdf::Element, E>(&self, extents: E) -> Result<ndarray::ArrayD<T>>
     where
         E: TryInto<crate::extent::Extents>,
         E::Error: Into<crate::Error>,
@@ -337,18 +357,27 @@ impl<'a> AsyncVariable<'a> {
         self.read_selection(&slab).await?.to_array()
     }
 
-    /// Read the whole variable.
+    /// Read the raw bytes of a selection, in native order and row-major.
+    ///
+    /// The asynchronous twin of [`crate::netcdf::Variable::get_raw_values`].
+    pub async fn get_raw_values<E>(&self, extents: E) -> Result<Vec<u8>>
+    where
+        E: TryInto<crate::extent::Extents>,
+        E::Error: Into<crate::Error>,
+    {
+        let extents: crate::extent::Extents = extents.try_into().map_err(Into::into)?;
+        let slab = extents.to_hyperslab(&self.info.path, &self.info.shape)?;
+        Ok(self.read_selection(&slab).await?.into_raw().bytes)
+    }
+
+    /// Read the whole variable as [`Values`].
+    ///
+    /// See [`crate::netcdf::Variable::read`].
     pub async fn read(&self) -> Result<Values> {
         self.read_selection(&Hyperslab::all(&self.info.shape)).await
     }
 
-    /// Read a slice, given one range for each axis.
-    pub async fn read_slice(&self, ranges: &[std::ops::Range<u64>]) -> Result<Values> {
-        self.read_selection(&Hyperslab::from_ranges(&self.info.path, &self.info.shape, ranges)?)
-            .await
-    }
-
-    /// Read an explicit selection.
+    /// Read an explicit selection as [`Values`].
     pub async fn read_selection(&self, slab: &Hyperslab) -> Result<Values> {
         let hdf5 = self.file.netcdf.hdf5();
         self.resolve_index().await?;
@@ -384,18 +413,6 @@ impl<'a> AsyncVariable<'a> {
         self.read_selection(&chunk.selection()).await
     }
 
-    /// Read the whole variable into an `ndarray` of `f64`.
-    #[cfg(feature = "ndarray")]
-    pub async fn read_array_f64(&self) -> Result<ndarray::ArrayD<f64>> {
-        self.read().await?.to_array_f64()
-    }
-
-    /// Read the whole variable into an `ndarray` of `i64`.
-    #[cfg(feature = "ndarray")]
-    pub async fn read_array_i64(&self) -> Result<ndarray::ArrayD<i64>> {
-        self.read().await?.to_array_i64()
-    }
-
     /// Resolve the chunk index, if it is not resolved already.
     ///
     /// The walk is pure. Two tasks that race it both do the work. The duplicate
@@ -422,7 +439,7 @@ impl AsyncFile {
     /// use object_store::path::Path;
     ///
     /// let file = oxcdf::AsyncFile::open_store(store, Path::from("13857_prof.nc")).await?;
-    /// let values = file.variable("TEMP").unwrap().read().await?.to_f64()?;
+    /// let values = file.variable("TEMP").unwrap().read().await?.get::<f64>()?;
     /// # Ok(()) }
     /// ```
     pub async fn open_store(

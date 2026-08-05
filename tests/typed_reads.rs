@@ -24,7 +24,7 @@ fn a_read_of_the_stored_type_copies_the_values() {
     let file = oxcdf::open(&path).unwrap();
 
     let f64_var = file.variable("/contig_f64").unwrap();
-    assert_eq!(f64_var.dtype(), DType::Float(8));
+    assert_eq!(f64_var.vartype(), DType::Float(8));
     let exact = f64_var.get_values::<f64, _>(..).unwrap();
 
     // The same bytes, reinterpreted. No conversion can have happened.
@@ -41,7 +41,7 @@ fn an_f32_variable_reads_as_f32_without_a_round_trip_through_f64() {
     let Some(path) = corpus(LEGACY) else { return };
     let file = oxcdf::open(&path).unwrap();
     let v = file.variable("/contig_f32be").unwrap();
-    assert_eq!(v.dtype(), DType::Float(4));
+    assert_eq!(v.vartype(), DType::Float(4));
 
     let exact = v.get_values::<f32, _>(..).unwrap();
     let raw = v.read().unwrap();
@@ -56,7 +56,7 @@ fn an_i32_variable_reads_as_i32() {
     let Some(path) = corpus(LEGACY) else { return };
     let file = oxcdf::open(&path).unwrap();
     let v = file.variable("/chunked_i32").unwrap();
-    assert_eq!(v.dtype(), DType::Int(4));
+    assert_eq!(v.vartype(), DType::Int(4));
 
     let exact = v.get_values::<i32, _>(..).unwrap();
     let wide = v.get_values::<i64, _>(..).unwrap();
@@ -206,9 +206,9 @@ fn get_array_keeps_the_selection_shape() {
     let file = oxcdf::open(&path).unwrap();
     let v = file.variable("/contig_f64").unwrap();
 
-    let a = v.get_array::<f64, _>(..).unwrap();
+    let a = v.get::<f64, _>(..).unwrap();
     assert_eq!(a.shape(), &[40, 6]);
-    let b = v.get_array::<f32, _>([2..5, 1..4]).unwrap();
+    let b = v.get::<f32, _>([2..5, 1..4]).unwrap();
     assert_eq!(b.shape(), &[3, 3]);
 }
 
@@ -227,9 +227,9 @@ async fn the_async_engine_applies_the_same_type_rules() {
 
     for want in sync.variables() {
         let got = file.variable(&want.path).unwrap();
-        assert_eq!(got.dtype(), want.dtype(), "{}", want.path);
+        assert_eq!(got.vartype(), want.vartype(), "{}", want.path);
 
-        match want.dtype() {
+        match want.vartype() {
             DType::Float(_) | DType::Int(_) | DType::Uint(_) => {
                 assert_eq!(
                     got.get_values::<f64, _>(..).await.unwrap(),
@@ -267,7 +267,7 @@ fn netcdf_parity() {
         let theirs = netcdf::open(&path).unwrap();
 
         for v in ours.variables() {
-            if !v.is_readable() || v.element_count() == 0 {
+            if !v.is_readable() || v.is_empty() {
                 continue;
             }
             let Some(other) = theirs.variable(&v.name) else {
@@ -288,7 +288,7 @@ fn netcdf_parity() {
             }
 
             // As the stored type, then widened. Both must agree with netcdf.
-            match v.dtype() {
+            match v.vartype() {
                 DType::Int(1) => compare!(i8),
                 DType::Int(2) => compare!(i16),
                 DType::Int(4) => compare!(i32),
@@ -316,7 +316,7 @@ fn netcdf_selection_parity() {
     let theirs = netcdf::open(&path).unwrap();
 
     for v in ours.variables() {
-        if !v.is_readable() || v.dtype() != DType::Float(4) || v.shape.len() < 2 {
+        if !v.is_readable() || v.vartype() != DType::Float(4) || v.shape.len() < 2 {
             continue;
         }
         let Some(other) = theirs.variable(&v.name) else {

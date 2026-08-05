@@ -29,7 +29,7 @@ fn reads_a_whole_contiguous_f64_dataset() {
     let file = open();
     let d = file.dataset("/contig_f64").unwrap();
     let raw = read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape)).unwrap();
-    let values = raw.to_f64(d).unwrap();
+    let values = raw.get::<f64>(d).unwrap();
 
     assert_eq!(values.len(), NX * NY);
     for (i, v) in values.iter().enumerate() {
@@ -44,7 +44,7 @@ fn reads_a_whole_chunked_and_compressed_dataset() {
     assert!(!d.pipeline.is_empty(), "this dataset is shuffled and deflated");
 
     let raw = read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape)).unwrap();
-    let values = raw.to_i64(d).unwrap();
+    let values = raw.get::<i64>(d).unwrap();
 
     assert_eq!(values.len(), NX * NY);
     for (i, v) in values.iter().enumerate() {
@@ -61,7 +61,7 @@ fn reads_a_hyperslab_that_straddles_chunk_boundaries() {
 
     let slab = Hyperslab::new(vec![5, 2], vec![10, 3], &d.shape).unwrap();
     let raw = read_hyperslab(file.ctx(), d, &slab).unwrap();
-    let values = raw.to_i64(d).unwrap();
+    let values = raw.get::<i64>(d).unwrap();
 
     assert_eq!(values.len(), 30);
     for row in 0..10usize {
@@ -84,7 +84,7 @@ fn reads_a_hyperslab_of_a_contiguous_dataset() {
     let slab = Hyperslab::new(vec![37, 1], vec![3, 4], &d.shape).unwrap();
     let values = read_hyperslab(file.ctx(), d, &slab)
         .unwrap()
-        .to_f64(d)
+        .get::<f64>(d)
         .unwrap();
 
     assert_eq!(values.len(), 12);
@@ -109,7 +109,7 @@ fn reads_big_endian_floats_in_the_right_byte_order() {
 
     let values = read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape))
         .unwrap()
-        .to_f64(d)
+        .get::<f64>(d)
         .unwrap();
 
     assert_eq!(values.len(), NX);
@@ -136,7 +136,7 @@ fn reads_a_dataset_inside_a_subgroup() {
     let d = file.dataset("/subgroup/nested_i16").unwrap();
     let values = read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape))
         .unwrap()
-        .to_i64(d)
+        .get::<i64>(d)
         .unwrap();
     assert_eq!(values, (0..NY as i64).map(|i| 1000 + i).collect::<Vec<_>>());
 }
@@ -170,7 +170,7 @@ fn many_threads_read_the_same_file_concurrently() {
         let d = file.dataset("/chunked_i32").unwrap();
         read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape))
             .unwrap()
-            .to_i64(d)
+            .get::<i64>(d)
             .unwrap()
     };
 
@@ -187,7 +187,7 @@ fn many_threads_read_the_same_file_concurrently() {
             let slab = Hyperslab::new(vec![start, 0], vec![5, NY as u64], &d.shape).unwrap();
             let part = read_hyperslab(file.ctx(), d, &slab)
                 .unwrap()
-                .to_i64(d)
+                .get::<i64>(d)
                 .unwrap();
             for (i, v) in part.iter().enumerate() {
                 let global = start as usize * NY + i;
@@ -196,7 +196,7 @@ fn many_threads_read_the_same_file_concurrently() {
 
             let whole = read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape))
                 .unwrap()
-                .to_i64(d)
+                .get::<i64>(d)
                 .unwrap();
             assert_eq!(whole, expected, "thread {thread} full read");
         }));

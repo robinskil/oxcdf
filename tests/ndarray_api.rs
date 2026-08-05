@@ -19,7 +19,7 @@ fn argo() -> Option<NetcdfFile> {
 #[test]
 fn a_two_dimensional_variable_keeps_its_shape() {
     let file = NetcdfFile::open(FIXTURE).unwrap();
-    let a = file.variable("/contig_f64").unwrap().read_array_f64().unwrap();
+    let a = file.variable("/contig_f64").unwrap().get::<f64, _>(..).unwrap();
 
     assert_eq!(a.shape(), &[40, 6]);
     assert_eq!(a.ndim(), 2);
@@ -35,8 +35,8 @@ fn indexing_matches_the_flat_read() {
     let file = NetcdfFile::open(FIXTURE).unwrap();
     let v = file.variable("/chunked_i32").unwrap();
 
-    let flat = v.read().unwrap().to_i64().unwrap();
-    let arr = v.read_array_i64().unwrap();
+    let flat = v.read().unwrap().get::<i64>().unwrap();
+    let arr = v.get::<i64, _>(..).unwrap();
 
     for row in 0..40 {
         for col in 0..6 {
@@ -50,7 +50,7 @@ fn a_slice_yields_an_array_of_the_slice_shape() {
     let file = NetcdfFile::open(FIXTURE).unwrap();
     let v = file.variable("/chunked_i32").unwrap();
 
-    let a = v.read_slice(&[5..15, 2..5]).unwrap().to_array_i64().unwrap();
+    let a = v.get::<i64, _>([5..15, 2..5]).unwrap();
     assert_eq!(a.shape(), &[10, 3]);
     assert_eq!(a[[0, 0]], (5 * 6 + 2) * 3 - 100);
     assert_eq!(a[[9, 2]], (14 * 6 + 4) * 3 - 100);
@@ -62,7 +62,7 @@ fn a_one_dimensional_variable_is_rank_one() {
     let a = file
         .variable("/subgroup/nested_i16")
         .unwrap()
-        .read_array_i64()
+        .get::<i64, _>(..)
         .unwrap();
     assert_eq!(a.shape(), &[6]);
     assert_eq!(a[[0]], 1000);
@@ -88,11 +88,11 @@ fn arrays_work_on_a_real_compressed_variable() {
     let Some(file) = argo() else { return };
     let temp = file.variable("TEMP").unwrap();
 
-    let a = temp.read_array_f64().unwrap();
+    let a = temp.get::<f64, _>(..).unwrap();
     assert_eq!(a.shape(), &[8, 6]);
 
     // Cross-check a couple of cells against the flat read.
-    let flat = temp.read().unwrap().to_f64().unwrap();
+    let flat = temp.read().unwrap().get::<f64>().unwrap();
     assert_eq!(a[[0, 0]], flat[0]);
     assert_eq!(a[[7, 5]], flat[47]);
 
@@ -107,6 +107,6 @@ fn a_shape_mismatch_is_reported() {
     // public path by reading a real variable and checking the happy case holds,
     // since constructing a mismatch requires a corrupt file.
     let file = NetcdfFile::open(FIXTURE).unwrap();
-    let a = file.variable("/contig_f32be").unwrap().read_array_f64().unwrap();
+    let a = file.variable("/contig_f32be").unwrap().get::<f64, _>(..).unwrap();
     assert_eq!(a.len(), 40);
 }

@@ -17,7 +17,7 @@ fn reads_variable_length_strings() {
     let file = NetcdfFile::open(VLEN).unwrap();
     let v = file.variable("/station_name").expect("station_name");
 
-    assert_eq!(v.dtype(), DType::String);
+    assert_eq!(v.vartype(), DType::String);
     assert_eq!(v.shape, vec![4]);
 
     let values = v.read().unwrap();
@@ -38,8 +38,8 @@ fn reads_variable_length_strings() {
 fn reads_a_slice_of_a_variable_length_string_variable() {
     let file = NetcdfFile::open(VLEN).unwrap();
     let v = file.variable("/comment").unwrap();
-    let ranges: Vec<std::ops::Range<u64>> = (0..1).map(|_| 1u64..3).collect();
-    let got = v.read_slice(&ranges).unwrap().to_strings().unwrap();
+    let ranges: Vec<std::ops::Range<usize>> = (0..1).map(|_| 1usize..3).collect();
+    let got = v.get_strings(ranges).unwrap();
     assert_eq!(got, vec!["beta", "gamma"]);
 }
 
@@ -56,7 +56,7 @@ fn numeric_variables_alongside_strings_still_read() {
     let file = NetcdfFile::open(VLEN).unwrap();
     let t = file.variable("/temperature").unwrap();
     assert_eq!(t.shape, vec![4, 6]);
-    let values = t.read().unwrap().to_f64().unwrap();
+    let values = t.read().unwrap().get::<f64>().unwrap();
     let expected: Vec<f64> = (0..24).map(|i| i as f64 + 1.5).collect();
     assert_eq!(values, expected);
 }
@@ -383,13 +383,13 @@ fn reads_ragged_float_sequences() {
     let file = NetcdfFile::open(VLEN_SEQ).unwrap();
     let v = file.variable("/rows").expect("rows");
 
-    assert_eq!(v.dtype(), DType::Vlen(Box::new(DType::Float(4))));
+    assert_eq!(v.vartype(), DType::Vlen(Box::new(DType::Float(4))));
     assert_eq!(v.shape, vec![4]);
 
     let values = v.read().unwrap();
     assert!(values.is_variable_length());
     assert_eq!(
-        values.to_sequences_f64().unwrap(),
+        values.to_sequences::<f64>().unwrap(),
         vec![
             vec![1.5, 2.5],
             vec![],
@@ -405,9 +405,9 @@ fn reads_ragged_integer_sequences() {
     let file = NetcdfFile::open(VLEN_SEQ).unwrap();
     let v = file.variable("/indices").unwrap();
 
-    assert_eq!(v.dtype(), DType::Vlen(Box::new(DType::Int(4))));
+    assert_eq!(v.vartype(), DType::Vlen(Box::new(DType::Int(4))));
     assert_eq!(
-        v.read().unwrap().to_sequences_i64().unwrap(),
+        v.read().unwrap().to_sequences::<i64>().unwrap(),
         vec![vec![1], vec![2, 3], vec![], vec![4, 5, 6, 7]]
     );
 }
@@ -416,8 +416,9 @@ fn reads_ragged_integer_sequences() {
 fn reads_a_slice_of_a_sequence_variable() {
     let file = NetcdfFile::open(VLEN_SEQ).unwrap();
     let v = file.variable("/rows").unwrap();
-    let ranges: Vec<std::ops::Range<u64>> = (0..1).map(|_| 2u64..4).collect();
-    let got = v.read_slice(&ranges).unwrap().to_sequences_f64().unwrap();
+    // A ragged array has no netCDF read of its own, so go through `Values`.
+    let slab = oxcdf::Hyperslab::new(vec![2], vec![2], &v.shape).unwrap();
+    let got = v.read_selection(&slab).unwrap().to_sequences::<f64>().unwrap();
     assert_eq!(got, vec![vec![3.5, 4.5, 5.5], vec![-0.25]]);
 }
 
@@ -441,7 +442,7 @@ fn sequence_and_string_accessors_do_not_mix() {
 
     let str_file = NetcdfFile::open(VLEN).unwrap();
     let text = str_file.variable("/station_name").unwrap().read().unwrap();
-    assert!(text.to_sequences_f64().is_err());
+    assert!(text.to_sequences::<f64>().is_err());
 }
 
 // ── the fallback contract, on a real szip file ────────────────────────────

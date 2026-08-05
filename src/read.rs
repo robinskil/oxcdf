@@ -132,15 +132,6 @@ impl RawData {
         self.get_of(&dataset.datatype, &dataset.path)
     }
 
-    /// Decode as `f64`. Shorthand for [`RawData::get`].
-    pub fn to_f64(&self, dataset: &DatasetIndex) -> Result<Vec<f64>> {
-        self.get(dataset)
-    }
-
-    /// Decode as `i64`. Shorthand for [`RawData::get`].
-    pub fn to_i64(&self, dataset: &DatasetIndex) -> Result<Vec<i64>> {
-        self.get(dataset)
-    }
 
     /// Decode as `T`, given the datatype directly.
     ///

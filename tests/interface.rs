@@ -28,14 +28,14 @@ fn navigates_variables_and_reports_their_types() {
     let v = file.variable("/contig_f64").unwrap();
     assert_eq!(v.name, "contig_f64");
     assert_eq!(v.shape, vec![40, 6]);
-    assert_eq!(v.dtype(), DType::Float(8));
-    assert!(v.dtype().is_float());
-    assert_eq!(v.element_count(), 240);
+    assert_eq!(v.vartype(), DType::Float(8));
+    assert!(v.vartype().is_float());
+    assert_eq!(v.len(), 240);
     assert!(v.is_readable());
 
-    assert_eq!(file.variable("/chunked_i32").unwrap().dtype(), DType::Int(4));
+    assert_eq!(file.variable("/chunked_i32").unwrap().vartype(), DType::Int(4));
     assert_eq!(
-        file.variable("/fixed_strings").unwrap().dtype(),
+        file.variable("/fixed_strings").unwrap().vartype(),
         // A fixed string wider than one byte is not a netCDF type. netcdf-c
         // never writes one; this fixture comes from plain HDF5.
         DType::FixedString(8)
@@ -62,7 +62,7 @@ fn reads_a_whole_variable() {
 
     assert_eq!(values.shape(), &[40, 6]);
     assert_eq!(values.len(), 240);
-    let f = values.to_f64().unwrap();
+    let f = values.get::<f64>().unwrap();
     assert_eq!(f[0], 0.0);
     assert_eq!(f[239], 239.0 * 0.5);
 }
@@ -72,10 +72,9 @@ fn reads_a_slice_given_ranges_per_axis() {
     let file = NetcdfFile::open(FIXTURE).unwrap();
     let v = file.variable("/chunked_i32").unwrap();
 
-    let block = v.read_slice(&[5..15, 2..5]).unwrap();
-    assert_eq!(block.shape(), &[10, 3]);
+    let values = v.get_values::<i64, _>([5..15, 2..5]).unwrap();
+    assert_eq!(values.len(), 30);
 
-    let values = block.to_i64().unwrap();
     for row in 0..10usize {
         for col in 0..3usize {
             let global = (5 + row) * 6 + (2 + col);
@@ -89,17 +88,26 @@ fn rejects_a_slice_of_the_wrong_rank_or_a_reversed_range() {
     let file = NetcdfFile::open(FIXTURE).unwrap();
     let v = file.variable("/chunked_i32").unwrap();
     // Built indirectly so the deliberately-invalid bounds stay opaque to lints.
-    let (lo, hi) = (0u64, 4u64);
+    let (lo, hi) = (0usize, 4usize);
 
     // One range for a rank-2 variable.
-    let wrong_rank: Vec<std::ops::Range<u64>> = (0..1).map(|_| lo..hi).collect();
-    assert!(v.read_slice(&wrong_rank).is_err(), "rank must match");
+    let wrong_rank: Vec<std::ops::Range<usize>> = (0..1).map(|_| lo..hi).collect();
+    assert!(
+        v.get_values::<i64, _>(wrong_rank).is_err(),
+        "rank must match"
+    );
 
     let reversed = vec![hi..lo, lo..2];
-    assert!(v.read_slice(&reversed).is_err(), "range must not reverse");
+    assert!(
+        v.get_values::<i64, _>(reversed).is_err(),
+        "range must not reverse"
+    );
 
     let out_of_bounds = vec![lo..99, lo..2];
-    assert!(v.read_slice(&out_of_bounds).is_err(), "must stay in bounds");
+    assert!(
+        v.get_values::<i64, _>(out_of_bounds).is_err(),
+        "must stay in bounds"
+    );
 }
 
 #[test]
@@ -125,7 +133,7 @@ fn exposes_the_chunk_grid_and_reads_one_chunk_at_a_time() {
         assert_eq!(block.len() as u64, chunk.element_count());
 
         // Spot-check the first element of each chunk against the formula.
-        let values = block.to_i64().unwrap();
+        let values = block.get::<i64>().unwrap();
         let global = chunk.offset[0] * 6 + chunk.offset[1];
         assert_eq!(values[0], global as i64 * 3 - 100);
 
@@ -158,7 +166,7 @@ fn chunks_can_be_read_from_many_threads_at_once() {
         let file = Arc::clone(&file);
         handles.push(std::thread::spawn(move || {
             let v = file.variable("/chunked_i32").unwrap();
-            let values = v.read_chunk(&chunk).unwrap().to_i64().unwrap();
+            let values = v.read_chunk(&chunk).unwrap().get::<i64>().unwrap();
             let global = chunk.offset[0] * 6 + chunk.offset[1];
             assert_eq!(values[0], global as i64 * 3 - 100);
             values.len()
@@ -180,7 +188,7 @@ fn reads_strings_and_nested_group_variables() {
     );
 
     let n = file.variable("/subgroup/nested_i16").unwrap();
-    assert_eq!(n.read().unwrap().to_i64().unwrap(), (1000..1006).collect::<Vec<_>>());
+    assert_eq!(n.read().unwrap().get::<i64>().unwrap(), (1000..1006).collect::<Vec<_>>());
     assert!(file.group("/subgroup").is_some());
     assert!(file.group("/").is_some());
 }
@@ -197,7 +205,7 @@ fn dimensions_and_variable_axes_are_reachable_on_a_real_file() {
 
     let temp = file.variable("/TEMP").expect("TEMP");
     assert_eq!(temp.dimensions, vec!["N_PROF", "N_LEVELS"]);
-    assert_eq!(temp.dtype(), DType::Float(4));
+    assert_eq!(temp.vartype(), DType::Float(4));
     assert!(temp.attribute("units").is_some());
     assert!(
         temp.attribute("DIMENSION_LIST").is_none(),
@@ -214,22 +222,25 @@ fn slices_and_chunks_work_on_a_real_compressed_variable() {
     assert!(temp.chunk_shape().is_some());
     assert!(!temp.dataset().pipeline.is_empty());
 
-    let rows = temp.shape[0].min(2);
-    let cols = temp.shape[1].min(3);
-    let slice = temp.read_slice(&[0..rows, 0..cols]).unwrap();
-    assert_eq!(slice.shape(), &[rows, cols]);
+    let rows = temp.shape[0].min(2) as usize;
+    let cols = temp.shape[1].min(3) as usize;
+    let slice = temp.get_values::<f64, _>([0..rows, 0..cols]).unwrap();
+    assert_eq!(slice.len(), rows * cols);
 
     // Reading every chunk must yield the same element count as the variable.
     let total: u64 = temp.chunks().iter().map(|c| c.element_count()).sum();
-    assert_eq!(total, temp.element_count());
+    assert_eq!(total, temp.len());
 
     // And a chunk read must agree with the equivalent slice read.
     let chunk = &temp.chunks()[0];
-    let from_chunk = temp.read_chunk(chunk).unwrap().to_f64().unwrap();
-    let ranges: Vec<_> = (0..chunk.offset.len())
-        .map(|a| chunk.offset[a]..chunk.offset[a] + chunk.shape[a])
+    let from_chunk = temp.read_chunk(chunk).unwrap().get::<f64>().unwrap();
+    let ranges: Vec<std::ops::Range<usize>> = (0..chunk.offset.len())
+        .map(|a| {
+            let start = chunk.offset[a] as usize;
+            start..start + chunk.shape[a] as usize
+        })
         .collect();
-    let from_slice = temp.read_slice(&ranges).unwrap().to_f64().unwrap();
+    let from_slice = temp.get_values::<f64, _>(ranges).unwrap();
     assert_eq!(from_chunk, from_slice);
 }
 
