@@ -1,0 +1,39 @@
+[package]
+name = "oxcdf-hdf5"
+description = "A pure-Rust, parallel-safe reader for the HDF5 container format"
+readme = "README.md"
+keywords = ["hdf5", "reader", "parallel", "parser", "scientific"]
+categories = ["science", "parser-implementations", "filesystem"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Read from S3, GCS, Azure or HTTP by byte range. No local copy is needed.
+object-store = ["dep:object_store", "dep:tokio"]
+# The asynchronous engine. It shares every pure part with the synchronous one.
+async = ["dep:async-trait", "dep:tokio"]
+
+[package.metadata.docs.rs]
+# Document the asynchronous engine and object storage.
+features = ["async", "object-store"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+thiserror.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+lz4_flex.workspace = true
+moka.workspace = true
+bytes.workspace = true
+
+object_store = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["full"] }
+zstd.workspace = true

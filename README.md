@@ -23,6 +23,19 @@ oxcdf = { version = "0.1", features = ["async", "object-store"] }
 | `ndarray` | Return `ArrayD` |
 | `diff-tests` | Compare against netcdf-c in tests |
 
+## Crates
+
+The workspace holds two crates.
+
+| Crate | Content |
+|---|---|
+| `oxcdf-hdf5` | The HDF5 container. It knows nothing about netCDF. |
+| `oxcdf` | The netCDF conventions, and the classic formats. |
+
+`oxcdf` depends on `oxcdf-hdf5` and re-exports it. One dependency is enough.
+
+Depend on `oxcdf-hdf5` alone to read a plain HDF5 file.
+
 ## Read
 
 ```rust
@@ -47,7 +60,7 @@ With the `ndarray` feature, `get` returns an `ArrayD` of the selection's shape.
 An open awaits. A read of values awaits. Every other call answers at once.
 
 ```rust
-let file = oxcdf::AsyncFile::open_store(store, path).await?;
+let file = oxcdf::AsyncNetcdfFile::open_store(store, path).await?;
 
 for d in file.dimensions() { println!("{} = {}", d.name, d.len); }
 
@@ -87,10 +100,12 @@ only.
 | `Float(4)` `Float(8)` | `float` `double` | `get_values::<f32>` `::<f64>` |
 | `Char` | `char` | `get_strings` or `get_raw_values` |
 | `String` | `string` | `get_strings` |
-| `Vlen(..)` | ragged array | `read()?.to_sequences::<T>()` |
 
-A classic file has no ragged array and no variable-length string. Every other
-row applies to both containers.
+A classic file has no variable-length string. Every other row applies to both
+containers.
+
+A ragged array (HDF5 calls it a variable-length sequence) has no netCDF read.
+The `netcdf` crate has none either. Read one through `oxcdf::hdf5`.
 
 A read converts between any two numeric types, as the `netcdf` crate does. Ask
 for the type `vartype()` reports. The read then copies the values.
@@ -100,6 +115,24 @@ loses integers above 2^53. A float to an integer truncates toward zero.
 
 A read of text as a number returns `Error::TypeMismatch`. The message names the
 stored type.
+
+## The variable interface
+
+Every read call matches the `netcdf` crate, name for name.
+
+| Call | Returns |
+|---|---|
+| `get_values::<T,_>(extents)` | `Vec<T>` |
+| `get_value::<T,_>(extents)` | `T` |
+| `get_strings(extents)` | `Vec<String>` |
+| `get_string(extents)` | `String` |
+| `get::<T,_>(extents)` | `ArrayD<T>`, with the `ndarray` feature |
+| `get_raw_values(extents)` | `Vec<u8>`, as stored |
+| `vartype()` `len()` `chunking()` `fill_value::<T>()` | metadata |
+
+`shape`, `dimensions`, `name` and `attributes` come from the variable directly.
+
+The asynchronous interface is the same list. Only the reads await.
 
 ## Strings
 
@@ -134,16 +167,19 @@ match &temp.attribute("_FillValue").unwrap().value {
 let scale = temp.attribute("scale_factor").and_then(|a| a.value.as_f64());
 ```
 
-## Chunks
+## Parallel reads
 
-A chunk is a separate byte range with its own filters. Read chunks in parallel.
-No coordination is necessary.
+The reader holds no lock, so many threads read one file at the same time. Split
+the work by selection:
 
 ```rust
-let blocks: Vec<_> = temp.chunks().par_iter().map(|c| temp.read_chunk(c)).collect();
+let rows: Vec<_> = (0..8).into_par_iter()
+    .map(|r| temp.get_values::<f32, _>([r..r + 1, 0..30]))
+    .collect();
 ```
 
-A chunk is clipped to the variable. The chunks cover it exactly once.
+To split by stored chunk instead, use `oxcdf::hdf5`. The netCDF interface has no
+chunk API, because the `netcdf` crate has none.
 
 ## Containers
 
@@ -155,7 +191,7 @@ above behave the same way for each.
 | Container | HDF5 | CDF-1 and CDF-2 |
 | Groups | nested | one root group |
 | Storage | contiguous, chunked or compact | contiguous |
-| `chunks()` | the stored chunk grid | one chunk for the whole variable |
+| `chunking()` | the chunk shape, or `None` | `None` |
 | `hdf5()` | the HDF5 index | `None` |
 | `classic()` | `None` | the classic file |
 
@@ -224,10 +260,10 @@ Every other error marks a damaged file or a defect here. Match on
 ## Tests
 
 ```bash
-cargo test --features "diff-tests,object-store,ndarray,async"
+cargo test --workspace --features "oxcdf/diff-tests,oxcdf/object-store,oxcdf/ndarray,oxcdf/async"
 ```
 
-394 tests.
+396 tests.
 
 | File | Compares against |
 |---|---|

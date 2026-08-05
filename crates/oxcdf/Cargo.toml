@@ -1,0 +1,45 @@
+[package]
+name = "oxcdf"
+description = "A pure-Rust, parallel-safe reader for netCDF-4 and netCDF classic files"
+readme = "README.md"
+keywords = ["netcdf", "hdf5", "scientific", "reader", "parallel"]
+categories = ["science", "parser-implementations", "filesystem"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Return reads as `ndarray::ArrayD` instead of flat vectors.
+ndarray = ["dep:ndarray"]
+# Read from S3, GCS, Azure or HTTP by byte range. No local copy is needed.
+object-store = ["oxcdf-hdf5/object-store", "dep:object_store", "dep:tokio"]
+# The asynchronous engine. It shares every pure part with the synchronous one.
+async = ["oxcdf-hdf5/async", "dep:async-trait", "dep:tokio"]
+# Compare this reader against netcdf-c, value by value. Off by default: the
+# crate exists to avoid that library.
+diff-tests = ["dep:netcdf"]
+
+[package.metadata.docs.rs]
+# Document the asynchronous engine, object storage and ndarray output. Leave
+# `diff-tests` off: it needs the netcdf-c library and adds nothing to the docs.
+features = ["async", "object-store", "ndarray"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxcdf-hdf5.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+
+ndarray = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+netcdf = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["full"] }
+# `new_features` compresses its own fixtures before it reads them back.
+zstd.workspace = true
