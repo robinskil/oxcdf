@@ -6,6 +6,9 @@ The reader parses the HDF5 container. It never calls netcdf-c. That C library is
 not thread safe. Its Rust bindings put one process-global mutex around every
 call. This crate has no mutex. Many threads read one file at the same time.
 
+`oxcdf::open` reads the magic bytes and picks the container. netCDF-4 and
+classic then use the same interface.
+
 The API matches the `netcdf` crate. A program moves across with few changes.
 
 ```toml
@@ -86,6 +89,9 @@ only.
 | `String` | `string` | `get_strings` |
 | `Vlen(..)` | ragged array | `read()?.to_sequences::<T>()` |
 
+A classic file has no ragged array and no variable-length string. Every other
+row applies to both containers.
+
 A read converts between any two numeric types, as the `netcdf` crate does. Ask
 for the type `vartype()` reports. The read then copies the values.
 
@@ -139,6 +145,23 @@ let blocks: Vec<_> = temp.chunks().par_iter().map(|c| temp.read_chunk(c)).collec
 
 A chunk is clipped to the variable. The chunks cover it exactly once.
 
+## Containers
+
+`oxcdf::open` and `oxcdf::open_async` both accept either container. The methods
+above behave the same way for each.
+
+| | netCDF-4 | classic |
+|---|---|---|
+| Container | HDF5 | CDF-1 and CDF-2 |
+| Groups | nested | one root group |
+| Storage | contiguous, chunked or compact | contiguous |
+| `chunks()` | the stored chunk grid | one chunk for the whole variable |
+| `hdf5()` | the HDF5 index | `None` |
+| `classic()` | `None` | the classic file |
+
+`container()` reports which one. `vartype()`, `get_values`, `get_strings`,
+`Extents` and `AttributeValue` do not change.
+
 ## Design
 
 Both engines share every pure part. Only the fetch differs.
@@ -178,7 +201,7 @@ Three caches remove repeated work. All three use `moka`. A hit takes no lock.
 
 Supported:
 
-- netCDF-4, and classic CDF-1 and CDF-2
+- netCDF-4, and classic CDF-1 and CDF-2, through one interface
 - All five version 4 chunk indexes
 - Filters: shuffle, deflate, fletcher32, zstd and blosc
 - Every netCDF type, big-endian values and fill values
@@ -204,7 +227,7 @@ Every other error marks a damaged file or a defect here. Match on
 cargo test --features "diff-tests,object-store,ndarray,async"
 ```
 
-382 tests.
+394 tests.
 
 | File | Compares against |
 |---|---|
@@ -213,6 +236,7 @@ cargo test --features "diff-tests,object-store,ndarray,async"
 | `attributes.rs` | the `netcdf` crate, 421 attribute values |
 | `netcdf_layer.rs` | `ncdump`, variables and dimensions and axes |
 | `async_open.rs` | the synchronous engine, file by file |
+| `classic_interface.rs` | the `netcdf` crate, and the two engines, on classic files |
 | `readme_api.rs` | this page, every example |
 
 Floats compare by bit pattern, not by tolerance.

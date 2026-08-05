@@ -420,3 +420,33 @@ fn the_attribute_example_works() -> oxcdf::Result<()> {
     let _ = scale;
     Ok(())
 }
+
+// ─── "Containers" ──────────────────────────────────────────────────────────
+
+#[test]
+fn one_interface_covers_both_containers() -> oxcdf::Result<()> {
+    for name in ["test_file.nc", "classic.nc"] {
+        let Some(path) = corpus(name) else { continue };
+        let file = oxcdf::open(&path)?;
+
+        // The same calls, whichever container holds the file.
+        let _ = file.container();
+        let _ = file.dimensions();
+        let _ = file.attributes();
+        let v = file.variables().into_iter().next().expect("a variable");
+        let _ = v.vartype();
+        let _ = v.chunks();
+
+        match file.container() {
+            oxcdf::Container::Hdf5 => {
+                assert!(file.hdf5().is_some());
+                assert!(file.classic().is_none());
+            }
+            _ => {
+                assert!(file.hdf5().is_none());
+                assert!(file.classic().is_some());
+            }
+        }
+    }
+    Ok(())
+}

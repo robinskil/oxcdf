@@ -32,9 +32,9 @@
 use std::sync::Arc;
 
 use crate::async_source::AsyncByteSource;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::hdf5::context::Ctx;
-use crate::index::{DatasetIndex, Hdf5File, OpenOptions};
+use crate::index::{DatasetIndex, OpenOptions};
 use crate::netcdf::{Chunk, NcAttribute, NcDimension, NcGroup, NcVariable, NetcdfFile, Values};
 use crate::read::Hyperslab;
 
@@ -73,10 +73,9 @@ impl AsyncFile {
             io_cache.as_ref(),
             page_size,
             options.prefetch_bytes(),
-            |bytes| {
-                let hdf5 = Hdf5File::from_source_reusing(bytes, &options, None)?;
-                NetcdfFile::from_hdf5(hdf5)
-            },
+            // `from_source` reads the magic bytes, so one walk opens either
+            // container.
+            NetcdfFile::from_source,
         )
         .await?;
 
@@ -150,10 +149,15 @@ impl AsyncFile {
         self.netcdf.group(path)
     }
 
+    /// Which container holds the file.
+    pub fn container(&self) -> crate::Container {
+        self.netcdf.container()
+    }
+
     /// The parsed file, for the metadata this layer does not model.
     ///
-    /// Its synchronous read methods fail with [`crate::Error::Incomplete`]. Only its
-    /// metadata is in memory.
+    /// Its synchronous read methods fail with [`crate::Error::Incomplete`].
+    /// Only its metadata is in memory.
     pub fn netcdf(&self) -> &NetcdfFile {
         &self.netcdf
     }
@@ -167,16 +171,37 @@ impl AsyncFile {
         Some(AsyncVariable {
             file: self,
             info,
-            dataset: self.netcdf.hdf5().dataset(&info.path)?,
+            store: self.netcdf.store_for(info)?,
         })
     }
 
-    /// Run a synchronous walk over the file, fetching whatever it needs.
+    /// Run a synchronous walk over raw bytes, fetching whatever it needs.
+    ///
+    /// This serves the classic container, which addresses bytes directly and
+    /// has no HDF5 context.
+    async fn walk_bytes<T, F>(&self, build: F) -> Result<T>
+    where
+        F: Fn(Arc<dyn crate::source::ByteSource>) -> Result<T>,
+    {
+        crate::replay::replay(
+            self.source.as_ref(),
+            self.netcdf.hdf5().and_then(|h| h.io_cache()),
+            self.options.request_size(),
+            self.options.request_size(),
+            build,
+        )
+        .await
+    }
+
+    /// Run a synchronous HDF5 walk over the file, fetching whatever it needs.
     async fn walk<T, F>(&self, build: F) -> Result<T>
     where
         F: Fn(Ctx<'_>) -> Result<T>,
     {
-        let hdf5 = self.netcdf.hdf5();
+        let hdf5 = self
+            .netcdf
+            .hdf5()
+            .ok_or_else(|| Error::malformed("an HDF5 walk on a classic file"))?;
         crate::replay::replay(
             self.source.as_ref(),
             hdf5.io_cache(),
@@ -203,7 +228,7 @@ impl AsyncFile {
 pub struct AsyncVariable<'a> {
     file: &'a AsyncFile,
     info: &'a NcVariable,
-    dataset: &'a DatasetIndex,
+    store: crate::netcdf::VarStore<'a>,
 }
 
 impl std::fmt::Debug for AsyncVariable<'_> {
@@ -228,9 +253,9 @@ impl<'a> AsyncVariable<'a> {
         self.info
     }
 
-    /// The HDF5 dataset behind the variable.
-    pub fn dataset(&self) -> &'a DatasetIndex {
-        self.dataset
+    /// The HDF5 dataset behind the variable. `None` for a classic file.
+    pub fn dataset(&self) -> Option<&'a DatasetIndex> {
+        self.store.hdf5()
     }
 
     /// The variable's attributes.
@@ -245,12 +270,12 @@ impl<'a> AsyncVariable<'a> {
 
     /// The variable's netCDF type. This matches `netcdf::Variable::vartype`.
     pub fn vartype(&self) -> crate::netcdf::DType {
-        crate::netcdf::DType::of(&self.dataset.datatype)
+        crate::netcdf::DType::of(self.store.datatype())
     }
 
     /// The element type as HDF5 records it.
     pub fn datatype(&self) -> &'a crate::hdf5::message::Datatype {
-        &self.dataset.datatype
+        self.store.datatype()
     }
 
     /// Total number of elements. This matches `netcdf::Variable::len`.
@@ -267,7 +292,7 @@ impl<'a> AsyncVariable<'a> {
     ///
     /// `None` means the variable is stored contiguously and has no chunk grid.
     pub fn chunk_shape(&self) -> Option<Vec<u64>> {
-        match &self.dataset.layout {
+        match &self.store.hdf5()?.layout {
             crate::hdf5::message::Layout::Chunked { chunk_dims, .. } => {
                 Some(chunk_dims.iter().map(|&d| d as u64).collect())
             }
@@ -279,7 +304,7 @@ impl<'a> AsyncVariable<'a> {
     ///
     /// Cheap. It reads nothing.
     pub fn is_readable(&self) -> bool {
-        self.dataset.is_readable()
+        self.store.hdf5().is_none_or(|d| d.is_readable())
     }
 
     /// Read values as `T`, over any selection.
@@ -380,7 +405,14 @@ impl<'a> AsyncVariable<'a> {
 
     /// Read an explicit selection as [`Values`].
     pub async fn read_selection(&self, slab: &Hyperslab) -> Result<Values> {
-        let hdf5 = self.file.netcdf.hdf5();
+        let Some(dataset) = self.store.hdf5() else {
+            return self.read_classic_selection(slab).await;
+        };
+        let hdf5 = self
+            .file
+            .netcdf
+            .hdf5()
+            .ok_or_else(|| Error::malformed("an HDF5 variable without an HDF5 file"))?;
         self.resolve_index().await?;
 
         let raw = crate::read::read_hyperslab_async_with(
@@ -389,15 +421,48 @@ impl<'a> AsyncVariable<'a> {
             hdf5.cache(),
             hdf5.io_cache(),
             hdf5.io(),
-            self.dataset,
+            dataset,
             slab,
         )
         .await?;
 
         // A variable-length value stores a pointer into a heap. Follow it.
         self.file
-            .walk(|ctx| crate::netcdf::values_from_raw(ctx, self.dataset, raw.clone()))
+            .walk(|ctx| crate::netcdf::values_from_raw(ctx, dataset, raw.clone()))
             .await
+    }
+
+    /// Read a classic variable.
+    ///
+    /// A classic read is a set of byte ranges over a parsed header. The header
+    /// is already in memory, so the replay driver only fetches the data pages.
+    /// It holds them in the same byte cache the metadata walk filled.
+    async fn read_classic_selection(&self, slab: &Hyperslab) -> Result<Values> {
+        let classic = self
+            .file
+            .netcdf
+            .classic()
+            .ok_or_else(|| Error::malformed("a classic variable without a classic file"))?;
+        let variable = classic
+            .variables
+            .iter()
+            .find(|v| v.name == self.info.name)
+            .ok_or_else(|| Error::not_found(format!("classic variable {}", self.info.name)))?;
+
+        slab.validate(&self.info.shape)?;
+        let bytes = self
+            .file
+            .walk_bytes(|source| classic.read_selection_with(source.as_ref(), variable, slab))
+            .await?;
+
+        Ok(Values::from_parts(
+            crate::read::RawData {
+                bytes,
+                element_size: variable.nc_type.size(),
+                shape: slab.count.clone(),
+            },
+            variable.datatype.clone(),
+        ))
     }
 
     /// Every storage chunk of the variable.
@@ -406,7 +471,16 @@ impl<'a> AsyncVariable<'a> {
     /// Read them concurrently: each one is a separate byte range.
     pub async fn chunks(&self) -> Result<Vec<Chunk>> {
         self.resolve_index().await?;
-        crate::netcdf::chunks_of(self.dataset)
+        match self.store.hdf5() {
+            Some(dataset) => crate::netcdf::chunks_of(dataset),
+            // A classic variable is one contiguous block, so it reports one
+            // chunk. A caller then uses the same loop for either container.
+            None => Ok(vec![Chunk {
+                offset: vec![0; self.info.shape.len()],
+                shape: self.info.shape.clone(),
+                stored_size: self.len() * self.store.datatype().size as u64,
+            }]),
+        }
     }
 
     /// Read one chunk.
@@ -419,10 +493,15 @@ impl<'a> AsyncVariable<'a> {
     /// The walk is pure. Two tasks that race it both do the work. The duplicate
     /// wastes effort. It does not give a wrong answer, and it avoids a lock.
     async fn resolve_index(&self) -> Result<()> {
-        if self.dataset.is_prepared() {
+        let Some(dataset) = self.store.hdf5() else {
+            // A classic file stores every variable contiguously. There is no
+            // index to resolve.
+            return Ok(());
+        };
+        if dataset.is_prepared() {
             return Ok(());
         }
-        self.file.walk(|ctx| self.dataset.prepare(ctx)).await
+        self.file.walk(|ctx| dataset.prepare(ctx)).await
     }
 }
 

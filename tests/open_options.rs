@@ -95,6 +95,6 @@ fn the_netcdf_layer_forwards_the_options() {
         OpenOptions::new().io_request_size(128 * 1024).io_cache_bytes(4 << 20),
     )
     .unwrap();
-    assert_eq!(file.hdf5().io_cache().unwrap().page_size(), 128 * 1024);
+    assert_eq!(file.hdf5().unwrap().io_cache().unwrap().page_size(), 128 * 1024);
     assert_eq!(file.variables().len(), 5);
 }

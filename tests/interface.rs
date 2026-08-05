@@ -220,7 +220,7 @@ fn slices_and_chunks_work_on_a_real_compressed_variable() {
 
     // TEMP is chunked, shuffled and deflated in this file.
     assert!(temp.chunk_shape().is_some());
-    assert!(!temp.dataset().pipeline.is_empty());
+    assert!(!temp.dataset().unwrap().pipeline.is_empty());
 
     let rows = temp.shape[0].min(2) as usize;
     let cols = temp.shape[1].min(3) as usize;

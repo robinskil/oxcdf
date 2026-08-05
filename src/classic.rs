@@ -96,6 +96,52 @@ impl NcType {
     }
 
     /// Whether values of this type are integers of any signedness.
+    /// The crate's canonical element descriptor for this type.
+    ///
+    /// The netCDF layer decodes every value through
+    /// [`crate::hdf5::message::Datatype`], whatever container holds it. A
+    /// classic file therefore describes its types the same way an HDF5 file
+    /// does, and one decode path serves both.
+    ///
+    /// Classic files store values big-endian, and the order says so.
+    pub fn to_datatype(&self) -> crate::hdf5::message::Datatype {
+        use crate::hdf5::message::{ByteOrder, CharSet, DatatypeClass, StringPad};
+
+        let size = self.size() as u32;
+        let class = match self {
+            // netCDF `char` is a one-byte string, exactly as netcdf-c writes it
+            // into HDF5. The last dimension carries the string length.
+            NcType::Char => DatatypeClass::String {
+                pad: StringPad::NullTerminate,
+                charset: CharSet::Ascii,
+            },
+            NcType::Float | NcType::Double => DatatypeClass::FloatingPoint {
+                order: ByteOrder::Big,
+                bit_offset: 0,
+                bit_precision: (size * 8) as u16,
+                exponent_location: if size == 4 { 23 } else { 52 },
+                exponent_size: if size == 4 { 8 } else { 11 },
+                mantissa_location: 0,
+                mantissa_size: if size == 4 { 23 } else { 52 },
+                exponent_bias: if size == 4 { 127 } else { 1023 },
+                sign_location: (size * 8 - 1) as u8,
+            },
+            other => DatatypeClass::FixedPoint {
+                order: ByteOrder::Big,
+                signed: other.is_signed_integer(),
+                bit_offset: 0,
+                bit_precision: (size * 8) as u16,
+            },
+        };
+
+        crate::hdf5::message::Datatype {
+            version: 1,
+            size,
+            class,
+        }
+    }
+
+    /// Whether this is an integer type. `char` is not one.
     pub fn is_integer(&self) -> bool {
         !matches!(self, NcType::Float | NcType::Double | NcType::Char)
     }
@@ -123,7 +169,15 @@ pub struct ClassicAttribute {
     /// Text value, for `char` attributes.
     pub text: Option<String>,
     /// Numeric values, widened to `f64`.
+    ///
+    /// The netCDF layer does not use this. It decodes [`ClassicAttribute::raw`]
+    /// into a typed value instead.
     pub numbers: Vec<f64>,
+    /// The values as stored, still big-endian.
+    ///
+    /// The netCDF layer decodes these through the same path an HDF5 attribute
+    /// takes. The byte order lives in the datatype, so one decoder serves both.
+    pub raw: Vec<u8>,
 }
 
 /// One variable.
@@ -137,6 +191,11 @@ pub struct ClassicVariable {
     pub shape: Vec<u64>,
     /// Element type.
     pub nc_type: NcType,
+    /// The same type as the crate's canonical descriptor.
+    ///
+    /// The netCDF layer reads through this, so one decode path serves a classic
+    /// file and an HDF5 file alike.
+    pub datatype: crate::hdf5::message::Datatype,
     /// The variable's attributes.
     pub attributes: Vec<ClassicAttribute>,
     /// Byte offset of the variable's first element.
@@ -248,6 +307,19 @@ impl ClassicFile {
         variable: &ClassicVariable,
         slab: &Hyperslab,
     ) -> Result<Vec<u8>> {
+        self.read_selection_with(self.source.as_ref(), variable, slab)
+    }
+
+    /// Read a selection through another byte source.
+    ///
+    /// The parsed header stays. Only the bytes come from somewhere else. The
+    /// asynchronous engine uses this to serve a read from pages it holds.
+    pub fn read_selection_with(
+        &self,
+        source: &dyn ByteSource,
+        variable: &ClassicVariable,
+        slab: &Hyperslab,
+    ) -> Result<Vec<u8>> {
         slab.validate(&variable.shape)?;
         let element_size = variable.nc_type.size();
         let total = (slab.element_count() as usize)
@@ -256,9 +328,9 @@ impl ClassicFile {
         let mut out = vec![0u8; total];
 
         if variable.is_record {
-            self.read_record_variable(variable, slab, &mut out, element_size)?;
+            self.read_record_variable(source, variable, slab, &mut out, element_size)?;
         } else {
-            self.read_fixed_variable(variable, slab, &mut out, element_size)?;
+            self.read_fixed_variable(source, variable, slab, &mut out, element_size)?;
         }
 
         // Classic files are always big-endian.
@@ -273,6 +345,7 @@ impl ClassicFile {
     /// A fixed-size variable is one contiguous run.
     fn read_fixed_variable(
         &self,
+        source: &dyn ByteSource,
         variable: &ClassicVariable,
         slab: &Hyperslab,
         out: &mut [u8],
@@ -283,7 +356,7 @@ impl ClassicFile {
         let rank = variable.shape.len();
 
         if rank == 0 {
-            let bytes = self.source.read_vec(variable.begin, element_size)?;
+            let bytes = source.read_vec(variable.begin, element_size)?;
             out[..element_size].copy_from_slice(&bytes);
             return Ok(());
         }
@@ -323,6 +396,7 @@ impl ClassicFile {
     /// every other record variable, then the next record.
     fn read_record_variable(
         &self,
+        source: &dyn ByteSource,
         variable: &ClassicVariable,
         slab: &Hyperslab,
         out: &mut [u8],
@@ -360,9 +434,7 @@ impl ClassicFile {
                 }
 
                 let len = run as usize * element_size;
-                let bytes = self
-                    .source
-                    .read_vec(record_base + src * element_size as u64, len)?;
+                let bytes = source.read_vec(record_base + src * element_size as u64, len)?;
                 let db = dst as usize * element_size;
                 out[db..db + len].copy_from_slice(&bytes);
 
@@ -549,6 +621,7 @@ impl Header {
                     dimensions: dimension_names,
                     shape,
                     nc_type,
+                    datatype: nc_type.to_datatype(),
                     attributes,
                     begin,
                     record_size: per_record,
@@ -630,6 +703,7 @@ fn read_attributes(
             nc_type,
             text,
             numbers,
+            raw,
         });
     }
     Ok(out)

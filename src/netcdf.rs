@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::hdf5::heap::{GlobalHeap, VlenDescriptor};
-use crate::hdf5::message::{Attribute, DatatypeClass, Layout, StringPad};
+use crate::hdf5::message::{Attribute, Dataspace, DatatypeClass, Layout, StringPad};
 use crate::index::{DatasetIndex, GroupIndex, Hdf5File};
 use crate::extent::Extents;
 use crate::read::{read_hyperslab, Hyperslab, RawData};
@@ -303,21 +303,40 @@ impl NcGroup {
     }
 }
 
-/// An open netCDF-4 file.
+/// Which container holds the file.
 ///
-/// Wraps an [`Hdf5File`] and interprets it through the netCDF conventions. The
-/// HDF5 index underneath stays available, so a caller can drop to that level for
-/// anything this layer does not model.
+/// netCDF-4 sits in an HDF5 container. netCDF classic has its own. The
+/// interface above this is the same either way.
+// An open file is large either way. Boxing would add an indirection to every
+// read to save a field that is allocated once per file.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+enum Backend {
+    Hdf5(Hdf5File),
+    Classic(crate::classic::ClassicFile),
+}
+
+/// An open netCDF file.
+///
+/// The file may be netCDF-4 or netCDF classic. [`NetcdfFile::open`] reads the
+/// magic bytes and picks the container. Every method below behaves the same
+/// either way.
+///
+/// For a netCDF-4 file the HDF5 index stays available through
+/// [`NetcdfFile::hdf5`], for anything this layer does not model.
 #[derive(Debug, Clone)]
 pub struct NetcdfFile {
-    hdf5: Hdf5File,
+    backend: Backend,
     root: NcGroup,
 }
 
 impl NetcdfFile {
-    /// Open a netCDF-4 file from the filesystem with default options.
+    /// Open a netCDF file from the filesystem with default options.
+    ///
+    /// This reads the magic bytes. A netCDF-4 file goes through HDF5. A classic
+    /// file goes through the classic parser. The result is the same type.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_hdf5(Hdf5File::open(path)?)
+        Self::from_byte_source(Arc::new(crate::source::FileSource::open(path)?), None)
     }
 
     /// Open a netCDF-4 file with explicit I/O and cache options.
@@ -337,12 +356,33 @@ impl NetcdfFile {
         path: impl AsRef<std::path::Path>,
         options: crate::index::OpenOptions,
     ) -> Result<Self> {
-        Self::from_hdf5(Hdf5File::open_with(path, options)?)
+        Self::from_byte_source(
+            Arc::new(crate::source::FileSource::open(path)?),
+            Some(options),
+        )
     }
 
-    /// Open a netCDF-4 file over any byte source.
+    /// Open a netCDF file over any byte source.
     pub fn from_source(source: Arc<dyn crate::source::ByteSource>) -> Result<Self> {
-        Self::from_hdf5(Hdf5File::from_source(source)?)
+        Self::from_byte_source(source, None)
+    }
+
+    fn from_byte_source(
+        source: Arc<dyn crate::source::ByteSource>,
+        options: Option<crate::index::OpenOptions>,
+    ) -> Result<Self> {
+        match crate::detect_container(source.as_ref())? {
+            crate::Container::Hdf5 => {
+                let hdf5 = match options {
+                    Some(o) => Hdf5File::from_source_with(source, o)?,
+                    None => Hdf5File::from_source(source)?,
+                };
+                Self::from_hdf5(hdf5)
+            }
+            // The classic parser reads the whole header at open. It has no
+            // cache to size, so the options do not apply.
+            _ => Self::from_classic(crate::classic::ClassicFile::from_source(source)?),
+        }
     }
 
     /// Interpret an already-open HDF5 file as netCDF-4.
@@ -353,7 +393,71 @@ impl NetcdfFile {
         let scales = collect_dimension_scales(&hdf5)?;
         let mut heaps = HeapCache::default();
         let root = build_group(&hdf5, hdf5.root(), &scales, &mut heaps)?;
-        Ok(Self { hdf5, root })
+        Ok(Self {
+            backend: Backend::Hdf5(hdf5),
+            root,
+        })
+    }
+
+    /// Interpret an already-open classic file through the netCDF conventions.
+    ///
+    /// A classic file is flat. It has one group and no nested groups.
+    pub fn from_classic(classic: crate::classic::ClassicFile) -> Result<Self> {
+        let dimensions = classic
+            .dimensions
+            .iter()
+            .map(|d| NcDimension {
+                name: d.name.clone(),
+                len: d.len,
+                is_unlimited: d.is_unlimited,
+                // Classic files list dimensions in order and store no id.
+                id: None,
+                has_coordinate_variable: classic.variables.iter().any(|v| v.name == d.name),
+            })
+            .collect();
+
+        let variables = classic
+            .variables
+            .iter()
+            .map(|v| NcVariable {
+                name: v.name.clone(),
+                path: format!("/{}", v.name),
+                dimensions: v.dimensions.clone(),
+                shape: v.shape.clone(),
+                attributes: classic_attributes(&v.attributes),
+                // The classic header lists every attribute, so nothing is lost.
+                attributes_complete: true,
+                is_coordinate: v.dimensions.len() == 1 && v.dimensions[0] == v.name,
+            })
+            .collect();
+
+        Ok(Self {
+            root: NcGroup {
+                name: String::new(),
+                path: "/".to_string(),
+                dimensions,
+                variables,
+                attributes: classic_attributes(&classic.attributes),
+                groups: Vec::new(),
+            },
+            backend: Backend::Classic(classic),
+        })
+    }
+
+    /// The classic file behind this one, when the container is classic.
+    pub fn classic(&self) -> Option<&crate::classic::ClassicFile> {
+        match &self.backend {
+            Backend::Classic(c) => Some(c),
+            Backend::Hdf5(_) => None,
+        }
+    }
+
+    /// Which container holds the file.
+    pub fn container(&self) -> crate::Container {
+        match &self.backend {
+            Backend::Hdf5(_) => crate::Container::Hdf5,
+            Backend::Classic(c) => c.container,
+        }
     }
 
     /// The root group.
@@ -361,24 +465,32 @@ impl NetcdfFile {
         &self.root
     }
 
-    /// The underlying HDF5 index.
-    pub fn hdf5(&self) -> &Hdf5File {
-        &self.hdf5
+    /// The HDF5 index behind this file, when the container is HDF5.
+    ///
+    /// `None` for a classic file, which has no HDF5 layer.
+    pub fn hdf5(&self) -> Option<&Hdf5File> {
+        match &self.backend {
+            Backend::Hdf5(h) => Some(h),
+            Backend::Classic(_) => None,
+        }
     }
 
     /// Replace the underlying HDF5 file, keeping the netCDF view.
     ///
     /// Use this to attach caches after an open. The netCDF view describes
-    /// names, shapes and axes. None of those depend on how bytes arrive.
+    /// names, shapes and axes. None of those depend on how bytes arrive. A
+    /// classic file passes through unchanged.
     pub fn map_hdf5(mut self, f: impl FnOnce(Hdf5File) -> Hdf5File) -> Self {
-        self.hdf5 = f(self.hdf5);
+        if let Backend::Hdf5(h) = self.backend {
+            self.backend = Backend::Hdf5(f(h));
+        }
         self
     }
 
     /// The HDF5 dataset behind a variable, for the storage this layer does not
-    /// model.
+    /// model. `None` for a classic file.
     pub fn dataset(&self, variable: &NcVariable) -> Option<&DatasetIndex> {
-        self.hdf5.dataset(&variable.path)
+        self.hdf5()?.dataset(&variable.path)
     }
 
     pub(crate) fn variable_info(&self, path: &str) -> Option<&NcVariable> {
@@ -645,6 +757,34 @@ fn resolve_from_dimension_list(
     Ok(Some(names))
 }
 
+/// Decode a classic file's attributes.
+///
+/// Each one becomes the same [`Attribute`] an HDF5 file would hold, so the
+/// value goes through one decoder and keeps its type. A classic file has no
+/// reserved attribute names and no variable-length values.
+fn classic_attributes(attributes: &[crate::classic::ClassicAttribute]) -> Vec<NcAttribute> {
+    attributes
+        .iter()
+        .map(|a| {
+            let width = a.nc_type.size().max(1);
+            let attr = Attribute {
+                name: a.name.clone(),
+                datatype: a.nc_type.to_datatype(),
+                dataspace: Dataspace {
+                    kind: crate::hdf5::message::DataspaceKind::Simple,
+                    dims: vec![(a.raw.len() / width) as u64],
+                    max_dims: None,
+                },
+                data: a.raw.clone(),
+            };
+            NcAttribute {
+                name: a.name.clone(),
+                value: decode_value(None, &a.name, &attr),
+            }
+        })
+        .collect()
+}
+
 /// Drop the netCDF bookkeeping attributes and decode the rest.
 fn visible_attributes(hdf5: &Hdf5File, owner: &str, attributes: &[Attribute]) -> Vec<NcAttribute> {
     attributes
@@ -652,7 +792,7 @@ fn visible_attributes(hdf5: &Hdf5File, owner: &str, attributes: &[Attribute]) ->
         .filter(|a| !RESERVED_ATTRIBUTES.contains(&a.name.as_str()))
         .map(|a| NcAttribute {
             name: a.name.clone(),
-            value: decode_value(hdf5, owner, a),
+            value: decode_value(Some(hdf5), owner, a),
         })
         .collect()
 }
@@ -663,11 +803,11 @@ fn visible_attributes(hdf5: &Hdf5File, owner: &str, attributes: &[Attribute]) ->
 /// and several values get the plural one, which is what the `netcdf` crate
 /// does. A type this reader cannot decode stays as [`AttributeValue::Raw`]
 /// rather than vanishing.
-fn decode_value(hdf5: &Hdf5File, owner: &str, attr: &Attribute) -> AttributeValue {
+fn decode_value(hdf5: Option<&Hdf5File>, owner: &str, attr: &Attribute) -> AttributeValue {
     decode_typed(hdf5, owner, attr).unwrap_or_else(|| AttributeValue::Raw(attr.data.clone()))
 }
 
-fn decode_typed(hdf5: &Hdf5File, owner: &str, attr: &Attribute) -> Option<AttributeValue> {
+fn decode_typed(hdf5: Option<&Hdf5File>, owner: &str, attr: &Attribute) -> Option<AttributeValue> {
     use AttributeValue as A;
 
     /// One value stays singular. Several become a list.
@@ -702,7 +842,7 @@ fn decode_typed(hdf5: &Hdf5File, owner: &str, attr: &Attribute) -> Option<Attrib
             };
             // A netCDF `string` attribute is always plural, even with one
             // value. The `netcdf` crate does the same.
-            let text = crate::read::resolve_vlen_strings_of(hdf5.ctx(), owner, &raw).ok()?;
+            let text = crate::read::resolve_vlen_strings_of(hdf5?.ctx(), owner, &raw).ok()?;
             Some(A::Strs(text))
         }
         DatatypeClass::FloatingPoint { .. } => {
@@ -1223,6 +1363,20 @@ pub struct Values {
 }
 
 impl Values {
+    /// Build values that hold no heap reference.
+    ///
+    /// A classic file has no variable-length type, so nothing needs to be
+    /// followed into a heap.
+    pub(crate) fn from_parts(raw: RawData, datatype: crate::hdf5::message::Datatype) -> Self {
+        Self {
+            raw,
+            datatype,
+            vlen_strings: None,
+            vlen_sequences: None,
+            vlen_base: None,
+        }
+    }
+
     /// Shape of the block that was read.
     pub fn shape(&self) -> &[u64] {
         &self.raw.shape
@@ -1386,7 +1540,31 @@ fn shape_into_array<T>(shape: &[u64], values: Vec<T>) -> Result<ndarray::ArrayD<
 pub struct Variable<'a> {
     file: &'a NetcdfFile,
     info: &'a NcVariable,
-    dataset: &'a DatasetIndex,
+    store: VarStore<'a>,
+}
+
+/// Where a variable's values live.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VarStore<'a> {
+    Hdf5(&'a DatasetIndex),
+    Classic(&'a crate::classic::ClassicVariable),
+}
+
+impl<'a> VarStore<'a> {
+    /// The element type, whichever container holds it.
+    pub(crate) fn datatype(&self) -> &'a crate::hdf5::message::Datatype {
+        match self {
+            VarStore::Hdf5(d) => &d.datatype,
+            VarStore::Classic(v) => &v.datatype,
+        }
+    }
+
+    pub(crate) fn hdf5(&self) -> Option<&'a DatasetIndex> {
+        match self {
+            VarStore::Hdf5(d) => Some(d),
+            VarStore::Classic(_) => None,
+        }
+    }
 }
 
 impl<'a> std::ops::Deref for Variable<'a> {
@@ -1402,19 +1580,19 @@ impl<'a> Variable<'a> {
         self.info
     }
 
-    /// The HDF5 dataset backing this variable.
-    pub fn dataset(&self) -> &'a DatasetIndex {
-        self.dataset
+    /// The HDF5 dataset backing this variable. `None` for a classic file.
+    pub fn dataset(&self) -> Option<&'a DatasetIndex> {
+        self.store.hdf5()
     }
 
-    /// The full HDF5 datatype.
+    /// The full element type, whichever container holds it.
     pub fn datatype(&self) -> &'a crate::hdf5::message::Datatype {
-        &self.dataset.datatype
+        self.store.datatype()
     }
 
     /// The variable's netCDF type. This matches `netcdf::Variable::vartype`.
     pub fn vartype(&self) -> DType {
-        DType::of(&self.dataset.datatype)
+        DType::of(self.store.datatype())
     }
 
     /// The variable's attributes. This matches `netcdf::Variable::attributes`.
@@ -1441,7 +1619,9 @@ impl<'a> Variable<'a> {
     ///
     /// Check this before reading if netcdf-c is kept as a fallback.
     pub fn is_readable(&self) -> bool {
-        self.dataset.is_readable()
+        // A classic file has no filters and no exotic types, so every variable
+        // in one is readable.
+        self.store.hdf5().is_none_or(|d| d.is_readable())
     }
 
     /// Read values as `T`, over any selection.
@@ -1569,16 +1749,44 @@ impl<'a> Variable<'a> {
 
     /// Read an explicit selection as [`Values`].
     pub fn read_selection(&self, slab: &Hyperslab) -> Result<Values> {
-        let ctx = self.file.hdf5().ctx();
-        let raw = read_hyperslab(ctx, self.dataset, slab)?;
-        values_from_raw(ctx, self.dataset, raw)
+        match self.store {
+            VarStore::Hdf5(dataset) => {
+                let ctx = self
+                    .file
+                    .hdf5()
+                    .ok_or_else(|| Error::malformed("an HDF5 variable without an HDF5 file"))?
+                    .ctx();
+                let raw = read_hyperslab(ctx, dataset, slab)?;
+                values_from_raw(ctx, dataset, raw)
+            }
+            VarStore::Classic(variable) => {
+                let classic = self
+                    .file
+                    .classic()
+                    .ok_or_else(|| Error::malformed("a classic variable without a classic file"))?;
+                slab.validate(&self.info.shape)?;
+                // `read_selection` returns native order already, so the bytes
+                // arrive exactly as the HDF5 path leaves them.
+                let bytes = classic.read_selection(variable, slab)?;
+                let width = variable.nc_type.size();
+
+                Ok(Values::from_parts(
+                    RawData {
+                        bytes,
+                        element_size: width,
+                        shape: slab.count.clone(),
+                    },
+                    variable.datatype.clone(),
+                ))
+            }
+        }
     }
 
     /// The shape of one storage chunk, when the variable is chunked.
     ///
     /// `None` means the variable is stored contiguously and has no chunk grid.
     pub fn chunk_shape(&self) -> Option<Vec<u64>> {
-        match &self.dataset.layout {
+        match &self.store.hdf5()?.layout {
             Layout::Chunked { chunk_dims, .. } => {
                 Some(chunk_dims.iter().map(|&d| d as u64).collect())
             }
@@ -1612,13 +1820,27 @@ impl<'a> Variable<'a> {
     ///
     /// This is an optimisation. A read resolves the index itself.
     pub fn prepare(&self) -> Result<()> {
-        self.dataset.prepare(self.file.hdf5().ctx())
+        match (self.store.hdf5(), self.file.hdf5()) {
+            (Some(dataset), Some(hdf5)) => dataset.prepare(hdf5.ctx()),
+            // A classic file stores every variable contiguously. There is no
+            // index to resolve.
+            _ => Ok(()),
+        }
     }
 
     /// Every stored chunk, reporting a chunk index this reader cannot walk.
     pub fn try_chunks(&self) -> Result<Vec<Chunk>> {
-        self.dataset.chunks(self.file.hdf5().ctx())?;
-        chunks_of(self.dataset)
+        let (Some(dataset), Some(hdf5)) = (self.store.hdf5(), self.file.hdf5()) else {
+            // A classic variable is one contiguous block, so it reports one
+            // chunk. A caller then uses the same loop for either container.
+            return Ok(vec![Chunk {
+                offset: vec![0; self.info.shape.len()],
+                shape: self.info.shape.clone(),
+                stored_size: self.len() * self.store.datatype().size as u64,
+            }]);
+        };
+        dataset.chunks(hdf5.ctx())?;
+        chunks_of(dataset)
     }
 
     /// Read one chunk. The result covers exactly the chunk's clipped region.
@@ -1725,12 +1947,22 @@ impl NetcdfFile {
     /// A variable by absolute path, bound to the file so it can be read.
     pub fn variable(&self, path: &str) -> Option<Variable<'_>> {
         let info = self.variable_info(path)?;
-        let dataset = self.hdf5.dataset(&info.path)?;
         Some(Variable {
             file: self,
             info,
-            dataset,
+            store: self.store_for(info)?,
         })
+    }
+
+    pub(crate) fn store_for(&self, info: &NcVariable) -> Option<VarStore<'_>> {
+        match &self.backend {
+            Backend::Hdf5(h) => h.dataset(&info.path).map(VarStore::Hdf5),
+            Backend::Classic(c) => c
+                .variables
+                .iter()
+                .find(|v| v.name == info.name)
+                .map(VarStore::Classic),
+        }
     }
 
     /// Every variable in the file, bound for reading.
@@ -1739,10 +1971,10 @@ impl NetcdfFile {
             .variables_recursive()
             .into_iter()
             .filter_map(|info| {
-                self.hdf5.dataset(&info.path).map(|dataset| Variable {
+                self.store_for(info).map(|store| Variable {
                     file: self,
                     info,
-                    dataset,
+                    store,
                 })
             })
             .collect()
