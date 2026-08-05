@@ -1,6 +1,6 @@
 # oxcdf
 
-Iron netCDF. A pure-Rust reader for netCDF-4 and netCDF classic files.
+A pure-Rust reader for netCDF-4 and netCDF classic files.
 
 The reader parses the HDF5 container. It never calls netcdf-c. That C library is
 not thread safe. Its Rust bindings put one process-global mutex around every
@@ -173,21 +173,6 @@ Three caches remove repeated work. All three use `moka`. A hit takes no lock.
 | `IoCache` | Raw file bytes, in pages |
 | `ChunkCache` | Decoded chunks, plus read ahead |
 | Chunk index | One index for each variable. It resolves on first use. |
-
-## Performance
-
-An Argo file with 68 datasets. See `tests/bench.rs`.
-
-| Threads | netcdf-c | oxcdf |
-|---|---|---|
-| 1 | 11.9 ms | 8.8 ms |
-| 8 | 38.6 ms | 3.7 ms |
-
-netcdf-c gets slower with each added thread. oxcdf gets faster. The mutex causes
-the difference. An open costs 277 microseconds against 1.40 milliseconds.
-
-The chunk cache helps these numbers. All measurements use a local file. No test
-bucket is available. The gain on object storage is unknown.
 
 ## State
 
