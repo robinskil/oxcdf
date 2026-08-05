@@ -139,6 +139,30 @@ integer truncates toward zero.
 | `Vlen(..)` | ragged array | `to_sequences::<T>` |
 | `FixedString(n)` | not netCDF | `get_strings` |
 
+## Attributes
+
+An attribute value keeps the type the file stores. `AttributeValue` mirrors
+`netcdf::AttributeValue`, variant for variant: one value gets the singular
+variant, several get the plural one.
+
+```rust
+match &temp.attribute("_FillValue").unwrap().value {
+    AttributeValue::Float(v) => println!("f32 fill value {v}"),
+    AttributeValue::Double(v) => println!("f64 fill value {v}"),
+    other => println!("{other:?}"),
+}
+
+// Or take whatever is there.
+let units = temp.attribute("units").and_then(|a| a.value.as_text());
+let scale = temp.attribute("scale_factor").and_then(|a| a.value.as_f64());
+```
+
+`as_f64` and `as_f64s` convert. Match on the variant to keep the stored type.
+
+A `char` attribute arrives as one `Str`, and a `string` attribute as `Strs`,
+which is what the `netcdf` crate does. A type netCDF does not define arrives as
+`Raw`; netcdf-c refuses such a file, so that variant has no counterpart there.
+
 ## Strings
 
 netCDF stores text two ways, and this reader keeps them apart.
@@ -408,9 +432,10 @@ The crate does not write files. Keep netcdf-c for writes.
 cargo test --features "diff-tests,object-store,ndarray,async"
 ```
 
-372 tests. `differential.rs` compares every value against netcdf-c.
+382 tests. `differential.rs` compares every value against netcdf-c.
 `typed_reads.rs` reads every corpus variable as its stored type through both
 this crate and the `netcdf` crate, and compares element by element.
+`attributes.rs` compares 421 attribute values against that crate the same way.
 `netcdf_layer.rs` compares variables, dimensions and axes against `ncdump`.
 `async_open.rs` compares the two engines, file by file and value by value.
 `readme_api.rs` runs every example on this page, so the page cannot drift from

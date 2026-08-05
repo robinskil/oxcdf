@@ -52,34 +52,156 @@ const RESERVED_ATTRIBUTES: &[&str] = &[
 ];
 
 /// A decoded attribute value.
+///
+/// This mirrors `netcdf::AttributeValue`. The value keeps the type the file
+/// stores. A single value gets the singular variant, and several values get the
+/// plural one, exactly as that crate does.
+///
+/// ```no_run
+/// # use oxcdf::AttributeValue;
+/// # fn run(var: oxcdf::Variable<'_>) -> oxcdf::Result<()> {
+/// match &var.attribute("_FillValue").unwrap().value {
+///     AttributeValue::Float(v) => println!("f32 fill value {v}"),
+///     AttributeValue::Double(v) => println!("f64 fill value {v}"),
+///     other => println!("{other:?}"),
+/// }
+///
+/// // Or take whatever number is there.
+/// let scale = var.attribute("scale_factor").and_then(|a| a.value.as_f64());
+/// # Ok(()) }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
+#[allow(missing_docs)] // Each variant is its netCDF type; the names say it.
 pub enum AttributeValue {
-    /// A fixed-length string, or several of them.
-    Text(Vec<String>),
-    /// Floating-point values.
-    Floats(Vec<f64>),
-    /// Integer values.
-    Ints(Vec<i64>),
-    /// A value this layer does not decode. The bytes are as stored.
+    Uchar(u8),
+    Uchars(Vec<u8>),
+    Schar(i8),
+    Schars(Vec<i8>),
+    Ushort(u16),
+    Ushorts(Vec<u16>),
+    Short(i16),
+    Shorts(Vec<i16>),
+    Uint(u32),
+    Uints(Vec<u32>),
+    Int(i32),
+    Ints(Vec<i32>),
+    Ulonglong(u64),
+    Ulonglongs(Vec<u64>),
+    Longlong(i64),
+    Longlongs(Vec<i64>),
+    Float(f32),
+    Floats(Vec<f32>),
+    Double(f64),
+    Doubles(Vec<f64>),
+    Str(String),
+    Strs(Vec<String>),
+    /// A value this reader does not decode. The bytes are as stored.
+    ///
+    /// The `netcdf` crate has no such variant, because netcdf-c refuses the
+    /// file. This reader parses HDF5 directly, so it can meet a type netCDF
+    /// never defines. The attribute stays visible rather than vanishing.
     Raw(Vec<u8>),
 }
 
 impl AttributeValue {
-    /// The value as a single string, when it is textual.
+    /// The value as one string, when it is textual.
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            AttributeValue::Text(v) => v.first().map(|s| s.as_str()),
+            AttributeValue::Str(s) => Some(s.as_str()),
+            AttributeValue::Strs(v) => v.first().map(|s| s.as_str()),
             _ => None,
         }
     }
 
-    /// The value as a single number, when it is numeric.
-    pub fn as_f64(&self) -> Option<f64> {
+    /// Every string, when the value is textual.
+    pub fn as_texts(&self) -> Option<Vec<&str>> {
         match self {
-            AttributeValue::Floats(v) => v.first().copied(),
-            AttributeValue::Ints(v) => v.first().map(|&i| i as f64),
+            AttributeValue::Str(s) => Some(vec![s.as_str()]),
+            AttributeValue::Strs(v) => Some(v.iter().map(|s| s.as_str()).collect()),
             _ => None,
         }
+    }
+
+    /// The first value as `f64`, when it is numeric.
+    ///
+    /// This converts. Match on the variant to keep the stored type.
+    pub fn as_f64(&self) -> Option<f64> {
+        self.as_f64s().and_then(|v| v.first().copied())
+    }
+
+    /// Every value as `f64`, when they are numeric.
+    ///
+    /// This converts. Match on the variant to keep the stored type.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn as_f64s(&self) -> Option<Vec<f64>> {
+        use AttributeValue as A;
+        Some(match self {
+            A::Uchar(v) => vec![*v as f64],
+            A::Uchars(v) => v.iter().map(|&x| x as f64).collect(),
+            A::Schar(v) => vec![*v as f64],
+            A::Schars(v) => v.iter().map(|&x| x as f64).collect(),
+            A::Ushort(v) => vec![*v as f64],
+            A::Ushorts(v) => v.iter().map(|&x| x as f64).collect(),
+            A::Short(v) => vec![*v as f64],
+            A::Shorts(v) => v.iter().map(|&x| x as f64).collect(),
+            A::Uint(v) => vec![*v as f64],
+            A::Uints(v) => v.iter().map(|&x| x as f64).collect(),
+            A::Int(v) => vec![*v as f64],
+            A::Ints(v) => v.iter().map(|&x| x as f64).collect(),
+            A::Ulonglong(v) => vec![*v as f64],
+            A::Ulonglongs(v) => v.iter().map(|&x| x as f64).collect(),
+            A::Longlong(v) => vec![*v as f64],
+            A::Longlongs(v) => v.iter().map(|&x| x as f64).collect(),
+            A::Float(v) => vec![*v as f64],
+            A::Floats(v) => v.iter().map(|&x| x as f64).collect(),
+            A::Double(v) => vec![*v],
+            A::Doubles(v) => v.clone(),
+            A::Str(_) | A::Strs(_) | A::Raw(_) => return None,
+        })
+    }
+
+    /// The netCDF type of the value.
+    pub fn vartype(&self) -> DType {
+        use AttributeValue as A;
+        match self {
+            A::Uchar(_) | A::Uchars(_) => DType::Uint(1),
+            A::Schar(_) | A::Schars(_) => DType::Int(1),
+            A::Ushort(_) | A::Ushorts(_) => DType::Uint(2),
+            A::Short(_) | A::Shorts(_) => DType::Int(2),
+            A::Uint(_) | A::Uints(_) => DType::Uint(4),
+            A::Int(_) | A::Ints(_) => DType::Int(4),
+            A::Ulonglong(_) | A::Ulonglongs(_) => DType::Uint(8),
+            A::Longlong(_) | A::Longlongs(_) => DType::Int(8),
+            A::Float(_) | A::Floats(_) => DType::Float(4),
+            A::Double(_) | A::Doubles(_) => DType::Float(8),
+            A::Str(_) | A::Strs(_) => DType::String,
+            A::Raw(_) => DType::Other,
+        }
+    }
+
+    /// Number of values.
+    pub fn len(&self) -> usize {
+        use AttributeValue as A;
+        match self {
+            A::Uchars(v) => v.len(),
+            A::Schars(v) => v.len(),
+            A::Ushorts(v) => v.len(),
+            A::Shorts(v) => v.len(),
+            A::Uints(v) => v.len(),
+            A::Ints(v) => v.len(),
+            A::Ulonglongs(v) => v.len(),
+            A::Longlongs(v) => v.len(),
+            A::Floats(v) => v.len(),
+            A::Doubles(v) => v.len(),
+            A::Strs(v) => v.len(),
+            A::Raw(v) => v.len(),
+            _ => 1,
+        }
+    }
+
+    /// Whether the value holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -394,7 +516,7 @@ fn build_group(
         path: group.path.clone(),
         dimensions,
         variables,
-        attributes: visible_attributes(&group.attributes),
+        attributes: visible_attributes(hdf5, &group.path, &group.attributes),
         groups,
     })
 }
@@ -414,7 +536,7 @@ fn build_variable(
         path: dataset.path.clone(),
         dimensions,
         shape: dataset.shape.clone(),
-        attributes: visible_attributes(&dataset.attributes),
+        attributes: visible_attributes(hdf5, &dataset.path, &dataset.attributes),
         attributes_complete: dataset.attributes_complete,
         is_coordinate,
     })
@@ -524,33 +646,120 @@ fn resolve_from_dimension_list(
 }
 
 /// Drop the netCDF bookkeeping attributes and decode the rest.
-fn visible_attributes(attributes: &[Attribute]) -> Vec<NcAttribute> {
+fn visible_attributes(hdf5: &Hdf5File, owner: &str, attributes: &[Attribute]) -> Vec<NcAttribute> {
     attributes
         .iter()
         .filter(|a| !RESERVED_ATTRIBUTES.contains(&a.name.as_str()))
         .map(|a| NcAttribute {
             name: a.name.clone(),
-            value: decode_value(a),
+            value: decode_value(hdf5, owner, a),
         })
         .collect()
 }
 
 /// Decode an attribute's bytes according to its datatype.
-fn decode_value(attr: &Attribute) -> AttributeValue {
+///
+/// The value keeps the stored type. A single value gets the singular variant
+/// and several values get the plural one, which is what the `netcdf` crate
+/// does. A type this reader cannot decode stays as [`AttributeValue::Raw`]
+/// rather than vanishing.
+fn decode_value(hdf5: &Hdf5File, owner: &str, attr: &Attribute) -> AttributeValue {
+    decode_typed(hdf5, owner, attr).unwrap_or_else(|| AttributeValue::Raw(attr.data.clone()))
+}
+
+fn decode_typed(hdf5: &Hdf5File, owner: &str, attr: &Attribute) -> Option<AttributeValue> {
+    use AttributeValue as A;
+
+    /// One value stays singular. Several become a list.
+    fn fold<T, S, P>(mut values: Vec<T>, single: S, plural: P) -> AttributeValue
+    where
+        S: FnOnce(T) -> AttributeValue,
+        P: FnOnce(Vec<T>) -> AttributeValue,
+    {
+        if values.len() == 1 {
+            single(values.pop().expect("length checked"))
+        } else {
+            plural(values)
+        }
+    }
+
+    let size = attr.datatype.size;
     match &attr.datatype.class {
-        DatatypeClass::String { .. } => match decode_all_text(attr) {
-            Some(v) => AttributeValue::Text(v),
-            None => AttributeValue::Raw(attr.data.clone()),
-        },
-        DatatypeClass::FloatingPoint { .. } => match decode_floats(attr) {
-            Ok(v) => AttributeValue::Floats(v),
-            Err(_) => AttributeValue::Raw(attr.data.clone()),
-        },
-        DatatypeClass::FixedPoint { .. } => match decode_ints(attr) {
-            Ok(v) => AttributeValue::Ints(v),
-            Err(_) => AttributeValue::Raw(attr.data.clone()),
-        },
-        _ => AttributeValue::Raw(attr.data.clone()),
+        // A netCDF `char` attribute is always one string, however many
+        // elements the dataspace holds. The `netcdf` crate reads the whole
+        // buffer as one text, so join the parts rather than fold on count.
+        DatatypeClass::String { .. } => Some(A::Str(decode_all_text(attr)?.concat())),
+        DatatypeClass::VariableLength {
+            kind: crate::hdf5::message::VlenKind::String,
+            ..
+        } => {
+            // The value is a descriptor into the global heap, so follow it.
+            // Without this the attribute would surface as raw heap pointers.
+            let raw = RawData {
+                bytes: attr.data.clone(),
+                element_size: size as usize,
+                shape: vec![attr.element_count()],
+            };
+            // A netCDF `string` attribute is always plural, even with one
+            // value. The `netcdf` crate does the same.
+            let text = crate::read::resolve_vlen_strings_of(hdf5.ctx(), owner, &raw).ok()?;
+            Some(A::Strs(text))
+        }
+        DatatypeClass::FloatingPoint { .. } => {
+            let values = decode_floats(attr).ok()?;
+            match size {
+                4 => Some(fold(
+                    values.into_iter().map(|v| v as f32).collect(),
+                    A::Float,
+                    A::Floats,
+                )),
+                8 => Some(fold(values, A::Double, A::Doubles)),
+                _ => None,
+            }
+        }
+        DatatypeClass::FixedPoint { signed, .. } => {
+            let values = decode_ints(attr).ok()?;
+            Some(match (signed, size) {
+                (true, 1) => fold(
+                    values.into_iter().map(|v| v as i8).collect(),
+                    A::Schar,
+                    A::Schars,
+                ),
+                (true, 2) => fold(
+                    values.into_iter().map(|v| v as i16).collect(),
+                    A::Short,
+                    A::Shorts,
+                ),
+                (true, 4) => fold(
+                    values.into_iter().map(|v| v as i32).collect(),
+                    A::Int,
+                    A::Ints,
+                ),
+                (true, 8) => fold(values, A::Longlong, A::Longlongs),
+                (false, 1) => fold(
+                    values.into_iter().map(|v| v as u8).collect(),
+                    A::Uchar,
+                    A::Uchars,
+                ),
+                (false, 2) => fold(
+                    values.into_iter().map(|v| v as u16).collect(),
+                    A::Ushort,
+                    A::Ushorts,
+                ),
+                (false, 4) => fold(
+                    values.into_iter().map(|v| v as u32).collect(),
+                    A::Uint,
+                    A::Uints,
+                ),
+                (false, 8) => fold(
+                    values.into_iter().map(|v| v as u64).collect(),
+                    A::Ulonglong,
+                    A::Ulonglongs,
+                ),
+                _ => return None,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -715,16 +924,26 @@ mod tests {
 
     #[test]
     fn attribute_values_expose_text_and_numbers() {
-        let text = AttributeValue::Text(vec!["degrees_north".into()]);
+        let text = AttributeValue::Str("degrees_north".into());
         assert_eq!(text.as_text(), Some("degrees_north"));
         assert_eq!(text.as_f64(), None);
+        assert_eq!(text.vartype(), DType::String);
 
         let nums = AttributeValue::Floats(vec![1.5, 2.5]);
         assert_eq!(nums.as_f64(), Some(1.5));
+        assert_eq!(nums.as_f64s(), Some(vec![1.5, 2.5]));
         assert_eq!(nums.as_text(), None);
+        assert_eq!(nums.vartype(), DType::Float(4));
+        assert_eq!(nums.len(), 2);
 
-        let ints = AttributeValue::Ints(vec![7]);
+        let ints = AttributeValue::Int(7);
         assert_eq!(ints.as_f64(), Some(7.0));
+        assert_eq!(ints.vartype(), DType::Int(4));
+        assert_eq!(ints.len(), 1);
+
+        // An unsigned 64-bit value above `i64::MAX` must survive decoding.
+        let big = AttributeValue::Ulonglong(u64::MAX);
+        assert_eq!(big.as_f64(), Some(u64::MAX as f64));
     }
 
     #[test]
@@ -1193,6 +1412,16 @@ impl<'a> Variable<'a> {
     /// The variable's netCDF type. This matches `netcdf::Variable::vartype`.
     pub fn vartype(&self) -> DType {
         DType::of(&self.dataset.datatype)
+    }
+
+    /// The variable's attributes. This matches `netcdf::Variable::attributes`.
+    pub fn attributes(&self) -> &'a [NcAttribute] {
+        &self.info.attributes
+    }
+
+    /// One attribute by name. This matches `netcdf::Variable::attribute`.
+    pub fn attribute(&self, name: &str) -> Option<&'a NcAttribute> {
+        self.info.attributes.iter().find(|a| a.name == name)
     }
 
     /// Total number of elements. This matches `netcdf::Variable::len`.

@@ -395,3 +395,28 @@ fn the_char_raw_bytes_example_works() -> oxcdf::Result<()> {
     assert_eq!(bytes.len(), 47 * 40);
     Ok(())
 }
+
+// ─── "Attributes" ──────────────────────────────────────────────────────────
+
+#[test]
+fn the_attribute_example_works() -> oxcdf::Result<()> {
+    use oxcdf::AttributeValue;
+
+    let Some(path) = corpus("test_file.nc") else {
+        return Ok(());
+    };
+    let file = oxcdf::open(&path)?;
+    let temp = file.variable("TEMP").unwrap();
+
+    match &temp.attribute("_FillValue").unwrap().value {
+        AttributeValue::Float(v) => println!("f32 fill value {v}"),
+        AttributeValue::Double(v) => println!("f64 fill value {v}"),
+        other => println!("{other:?}"),
+    }
+
+    let units = temp.attribute("units").and_then(|a| a.value.as_text());
+    let scale = temp.attribute("scale_factor").and_then(|a| a.value.as_f64());
+    assert!(units.is_some(), "TEMP has units");
+    let _ = scale;
+    Ok(())
+}

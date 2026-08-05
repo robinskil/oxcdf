@@ -365,8 +365,15 @@ pub fn resolve_vlen_strings(
             "variable-length sequences are not decoded as strings",
         ));
     }
+    resolve_vlen_strings_of(ctx, &dataset.path, raw)
+}
 
-    with_vlen_descriptors(ctx, dataset, raw, |bytes, length| {
+/// Follow variable-length string descriptors into the global heap.
+///
+/// This takes the descriptors directly, so an attribute uses it as well as a
+/// variable. `what` names the source in an error message.
+pub fn resolve_vlen_strings_of(ctx: Ctx<'_>, what: &str, raw: &RawData) -> Result<Vec<String>> {
+    with_vlen_descriptors(ctx, what, raw, |bytes, length| {
         let len = (length as usize).min(bytes.len());
         let bytes = &bytes[..len];
         // A stored string may still carry a terminator inside its length.
@@ -402,8 +409,9 @@ pub fn resolve_vlen_sequences(
 
     let base_size = base.size as usize;
     let swap = matches!(base.byte_order(), Some(ByteOrder::Big)) && base_size > 1;
+    let what = dataset.path.as_str();
 
-    with_vlen_descriptors(ctx, dataset, raw, |bytes, length| {
+    with_vlen_descriptors(ctx, what, raw, |bytes, length| {
         let want = (length as usize).saturating_mul(base_size);
         let take = want.min(bytes.len());
         let mut values = bytes[..take].to_vec();
@@ -423,7 +431,7 @@ pub fn resolve_vlen_sequences(
 /// normally share very few of them.
 fn with_vlen_descriptors<T, F>(
     ctx: Ctx<'_>,
-    dataset: &DatasetIndex,
+    what: &str,
     raw: &RawData,
     mut decode: F,
 ) -> Result<Vec<T>>
@@ -464,7 +472,7 @@ where
         let object = heap.object(descriptor.object_index as u16).ok_or_else(|| {
             Error::malformed(format!(
                 "variable-length element {i} of {} names global heap object {} which is absent",
-                dataset.path, descriptor.object_index
+                what, descriptor.object_index
             ))
         })?;
 
