@@ -26,7 +26,12 @@ jobs:
         with:
           toolchain: "1.91"
           components: rustfmt
-      - run: cargo fmt --all --check
+      - name: format the workspace
+        run: cargo fmt --all --check
+      # `fuzz` sits outside the workspace, so `--all` does not reach it. Check
+      # it separately, or unformatted code lands there unnoticed.
+      - name: format the fuzz crate
+        run: cargo fmt --check --manifest-path fuzz/Cargo.toml
 
   clippy:
     name: clippy (${{ matrix.name }})

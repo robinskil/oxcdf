@@ -286,7 +286,7 @@ GitHub Actions runs every check on each push and pull request.
 
 | Job | Checks |
 |---|---|
-| `format` | `cargo fmt --all --check` |
+| `format` | `cargo fmt` over the workspace and over `fuzz`. |
 | `clippy` | Five feature sets, both crates. A warning fails the build. |
 | `test` | Linux, macOS and Windows. Default features, then every feature. |
 | `docs` | Three builds. A broken link fails the build. |
@@ -304,4 +304,12 @@ that is not safe Rust. A nightly job runs them, seeded from the corpus.
 
 ```bash
 cargo +nightly fuzz run open -- -max_total_time=60
+```
+
+`rustfmt.toml` holds the format. Every value is a rustfmt default, written down
+so a later toolchain cannot change one and reformat the tree. Format everything
+before a commit:
+
+```bash
+cargo fmt --all && cargo fmt --manifest-path fuzz/Cargo.toml
 ```
