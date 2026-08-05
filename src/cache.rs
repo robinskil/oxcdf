@@ -365,6 +365,7 @@ impl IoCache {
     /// The cache itself is synchronous; only the fetch awaits. Everything else
     /// — page bookkeeping, run detection, assembly — is shared.
     #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub async fn read_async(
         &self,
         source: &dyn crate::async_source::AsyncByteSource,

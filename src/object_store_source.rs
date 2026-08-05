@@ -4,7 +4,7 @@
 //! HTTP, with no local copy and no `#mode=bytes` trick. It exists because the
 //! whole reader addresses bytes by absolute offset and never seeks: a netCDF-4
 //! file on object storage is just a byte range server, and that is precisely
-//! what [`ObjectStore::get_range`] provides.
+//! what `ObjectStore::get_range` provides.
 //!
 //! # Why this is a good fit
 //!

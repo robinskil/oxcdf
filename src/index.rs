@@ -135,6 +135,7 @@ impl OpenOptions {
     /// size normally covers a whole open in one request. A window that is too
     /// small still works. It costs more round trips.
     #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn open_prefetch_bytes(mut self, bytes: usize) -> Self {
         self.open_prefetch = bytes.max(1);
         self
@@ -147,6 +148,7 @@ impl OpenOptions {
 
     /// The window an asynchronous open fetches before its first walk.
     #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn prefetch_bytes(&self) -> usize {
         self.open_prefetch
     }

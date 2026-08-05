@@ -22,6 +22,12 @@ async = ["dep:async-trait", "dep:tokio"]
 # crate exists to avoid that library.
 diff-tests = ["dep:netcdf"]
 
+[package.metadata.docs.rs]
+# Document the asynchronous engine, object storage and ndarray output. Leave
+# `diff-tests` off: it needs the netcdf-c library and adds nothing to the docs.
+features = ["async", "object-store", "ndarray"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 thiserror = "2.0.12"
 # Pure-Rust inflate. Never turn on the C zlib backends.

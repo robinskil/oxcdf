@@ -1,14 +1,14 @@
 //! Byte sources for asynchronous access.
 //!
-//! This is the fetch half of the async engine. It sits beside [`ByteSource`].
+//! This is the fetch half of the async engine. It sits beside [`crate::source::ByteSource`].
 //! It does not replace it. Both engines share every pure part of the crate.
 //!
 //! # Why a separate trait
 //!
-//! [`ByteSource`] is synchronous by design. The parser then needs no runtime.
+//! [`crate::source::ByteSource`] is synchronous by design. The parser then needs no runtime.
 //! It runs under `rayon` or under a plain thread pool.
 //!
-//! An async [`ByteSource`] would move inflate and unshuffle onto runtime
+//! An async [`crate::source::ByteSource`] would move inflate and unshuffle onto runtime
 //! workers. Those steps use the processor. They would block the reactor.
 //!
 //! # Why not the blocking adapter
@@ -106,6 +106,7 @@ impl<S: crate::source::ByteSource + 'static> AsyncByteSource for SyncAsAsync<S> 
 /// Unlike the blocking adapter this needs no runtime handle, never blocks, and
 /// works on a current-thread runtime.
 #[cfg(feature = "object-store")]
+#[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
 #[derive(Debug, Clone)]
 pub struct AsyncObjectStoreSource {
     store: Arc<dyn object_store::ObjectStore>,
@@ -114,6 +115,7 @@ pub struct AsyncObjectStoreSource {
 }
 
 #[cfg(feature = "object-store")]
+#[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
 impl AsyncObjectStoreSource {
     /// Build a source, taking the object's size from a `head` request.
     pub async fn new(
@@ -155,6 +157,7 @@ impl AsyncObjectStoreSource {
 }
 
 #[cfg(feature = "object-store")]
+#[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
 #[async_trait::async_trait]
 impl AsyncByteSource for AsyncObjectStoreSource {
     fn size(&self) -> u64 {
@@ -255,6 +258,7 @@ mod tests {
     }
 
     #[cfg(feature = "object-store")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
     #[tokio::test]
     async fn reads_ranges_from_an_object_store_without_blocking() {
         use object_store::memory::InMemory;
@@ -280,6 +284,7 @@ mod tests {
     /// The whole point: this works on a current-thread runtime, which the
     /// blocking adapter cannot do.
     #[cfg(feature = "object-store")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
     #[test]
     fn works_on_a_current_thread_runtime() {
         use object_store::memory::InMemory;

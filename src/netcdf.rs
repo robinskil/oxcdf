@@ -1100,7 +1100,7 @@ impl DType {
 /// `f64` loses integers above 2^53. A float to an integer truncates toward
 /// zero, and saturates at the limits of the target.
 ///
-/// Call [`Values::dtype`] or [`Variable::dtype`] to learn the stored type, then
+/// Call [`Values::dtype`] or [`Variable::vartype`] to learn the stored type, then
 /// ask for that type. The read then copies the values and changes nothing.
 ///
 /// This trait is sealed. Only the ten types above implement it.
@@ -1293,6 +1293,7 @@ impl Values {
     ///
     /// Row-major, so the array's axes match the variable's dimensions in order.
     #[cfg(feature = "ndarray")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
     pub fn to_array<T: Element>(&self) -> Result<ndarray::ArrayD<T>> {
         shape_into_array(self.shape(), self.get::<T>()?)
     }
@@ -1305,6 +1306,7 @@ impl Values {
     /// would be wrong, so the last axis is dropped and each row becomes one
     /// string.
     #[cfg(feature = "ndarray")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
     pub fn to_array_strings(&self) -> Result<ndarray::ArrayD<String>> {
         let strings = self.to_strings()?;
         // Variable-length strings are one per element, so the shape is intact.
@@ -1358,6 +1360,7 @@ impl Values {
 
 /// Wrap a flat, row-major vector in an `ndarray` of the given shape.
 #[cfg(feature = "ndarray")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
 fn shape_into_array<T>(shape: &[u64], values: Vec<T>) -> Result<ndarray::ArrayD<T>> {
     let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
     let expected: usize = dims.iter().product::<usize>().max(if dims.is_empty() {
@@ -1456,7 +1459,7 @@ impl<'a> Variable<'a> {
     /// # Ok(()) }
     /// ```
     ///
-    /// A `T` equal to [`Variable::dtype`] copies the values. Any other numeric
+    /// A `T` equal to [`Variable::vartype`] copies the values. Any other numeric
     /// type converts. See [`Element`].
     pub fn get_values<T: Element, E>(&self, extents: E) -> Result<Vec<T>>
     where
@@ -1528,6 +1531,7 @@ impl<'a> Variable<'a> {
     /// This matches `netcdf::Variable::get`. The array's shape is the
     /// selection's shape, and its axes follow the variable's dimensions.
     #[cfg(feature = "ndarray")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
     pub fn get<T: Element, E>(&self, extents: E) -> Result<ndarray::ArrayD<T>>
     where
         E: TryInto<Extents>,

@@ -94,12 +94,17 @@
 //! error marks a damaged file or a defect here. A fall back then never hides a
 //! defect.
 
+// docs.rs builds with `--cfg docsrs` on nightly, so every feature-gated item
+// carries a badge that names the feature. A stable build ignores this.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 #![deny(rust_2018_idioms)]
 
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub mod async_file;
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub mod async_source;
 pub mod cache;
 pub mod checksum;
@@ -112,10 +117,12 @@ pub mod hdf5;
 pub mod index;
 pub mod io;
 #[cfg(feature = "object-store")]
+#[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
 pub mod object_store_source;
 pub mod netcdf;
 pub mod read;
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub mod replay;
 pub mod source;
 
@@ -132,8 +139,10 @@ pub use netcdf::{
 pub use read::Hyperslab;
 
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub use async_file::{AsyncFile, AsyncVariable};
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub use async_source::{AsyncByteSource, SyncAsAsync};
 
 /// Open a netCDF file for reading.
@@ -171,6 +180,7 @@ pub fn open_with(path: impl AsRef<std::path::Path>, options: OpenOptions) -> Res
 /// # Ok(()) }
 /// ```
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub async fn open_async(source: std::sync::Arc<dyn AsyncByteSource>) -> Result<AsyncFile> {
     AsyncFile::open(source).await
 }
@@ -179,6 +189,7 @@ pub async fn open_async(source: std::sync::Arc<dyn AsyncByteSource>) -> Result<A
 ///
 /// Use [`OpenOptions::remote`] for object storage.
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub async fn open_async_with(
     source: std::sync::Arc<dyn AsyncByteSource>,
     options: OpenOptions,

@@ -152,7 +152,7 @@ impl AsyncFile {
 
     /// The parsed file, for the metadata this layer does not model.
     ///
-    /// Its synchronous read methods fail with [`Error::Incomplete`]. Only its
+    /// Its synchronous read methods fail with [`crate::Error::Incomplete`]. Only its
     /// metadata is in memory.
     pub fn netcdf(&self) -> &NetcdfFile {
         &self.netcdf
@@ -347,6 +347,7 @@ impl<'a> AsyncVariable<'a> {
     ///
     /// The asynchronous twin of [`crate::netcdf::Variable::get`].
     #[cfg(feature = "ndarray")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
     pub async fn get<T: crate::netcdf::Element, E>(&self, extents: E) -> Result<ndarray::ArrayD<T>>
     where
         E: TryInto<crate::extent::Extents>,
@@ -426,6 +427,7 @@ impl<'a> AsyncVariable<'a> {
 }
 
 #[cfg(feature = "object-store")]
+#[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
 impl AsyncFile {
     /// Open a file held in object storage.
     ///

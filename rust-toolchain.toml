@@ -1,0 +1,8 @@
+# The crate needs 1.91. A homebrew cargo, or an older rustup default, fails to
+# build it. This file makes plain `cargo` pick the right toolchain.
+#
+# An explicit `cargo +nightly` still overrides this, which is how the docs.rs
+# build is reproduced locally.
+[toolchain]
+channel = "1.91"
+components = ["rustfmt", "clippy"]

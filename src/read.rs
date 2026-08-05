@@ -804,7 +804,7 @@ fn read_chunked(
 
 // ─── the asynchronous engine ───────────────────────────────────────────────
 
-/// Read a hyperslab through an [`AsyncByteSource`].
+/// Read a hyperslab through an [`crate::async_source::AsyncByteSource`].
 ///
 /// This is the async twin of [`read_hyperslab`]. It shares every pure part of
 /// the crate: the same chunk index, the same run coalescing, the same filters,
@@ -827,6 +827,7 @@ fn read_chunked(
 /// [`crate::async_file::AsyncVariable::read`] instead, which resolves the index
 /// itself.
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub async fn read_hyperslab_async(
     source: &dyn crate::async_source::AsyncByteSource,
     superblock: &crate::hdf5::superblock::Superblock,
@@ -848,6 +849,7 @@ pub async fn read_hyperslab_async(
 
 /// As [`read_hyperslab_async`], with an explicit byte-range merging policy.
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 #[allow(clippy::too_many_arguments)]
 pub async fn read_hyperslab_async_with(
     source: &dyn crate::async_source::AsyncByteSource,
@@ -1054,6 +1056,7 @@ pub async fn read_hyperslab_async_with(
 /// reads pulled in, so it subsumes explicit coalescing. Without one, ranges are
 /// merged into a single batch and sliced back apart zero-copy.
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 async fn fetch_bytes(
     source: &dyn crate::async_source::AsyncByteSource,
     io_cache: Option<&crate::cache::IoCache>,
@@ -1080,6 +1083,7 @@ async fn fetch_bytes(
 /// how they arrived. Only the asynchronous engine calls it: the synchronous one
 /// decodes and copies in one pass, because it holds the bytes already.
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 #[allow(clippy::too_many_arguments)]
 fn copy_chunk(
     out: &mut [u8],
