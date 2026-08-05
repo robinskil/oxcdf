@@ -128,7 +128,7 @@ impl RawData {
     }
 
     /// Decode as `T`.
-    pub fn get<T: crate::netcdf::Element>(&self, dataset: &DatasetIndex) -> Result<Vec<T>> {
+    pub fn get<T: crate::dtype::Element>(&self, dataset: &DatasetIndex) -> Result<Vec<T>> {
         self.get_of(&dataset.datatype, &dataset.path)
     }
 
@@ -139,8 +139,8 @@ impl RawData {
     /// converts, which is what the `netcdf` crate does. A stored string or
     /// compound returns [`Error::TypeMismatch`], naming the stored type.
     ///
-    /// A conversion can lose information. See [`crate::netcdf::Element`].
-    pub fn get_of<T: crate::netcdf::Element>(
+    /// A conversion can lose information. See [`crate::dtype::Element`].
+    pub fn get_of<T: crate::dtype::Element>(
         &self,
         datatype: &crate::hdf5::message::Datatype,
         what: &str,
@@ -150,7 +150,7 @@ impl RawData {
         let element = |i: usize| &self.bytes[i * size..(i + 1) * size];
 
         // The stored type is the asked-for type: copy, do not convert.
-        if crate::netcdf::DType::of(datatype) == T::DTYPE && size == std::mem::size_of::<T>() {
+        if crate::dtype::DType::of(datatype) == T::DTYPE && size == std::mem::size_of::<T>() {
             return Ok((0..count).map(|i| T::from_ne_bytes(element(i))).collect());
         }
 
@@ -175,7 +175,7 @@ impl RawData {
                 })
                 .collect(),
             _ => Err(Error::TypeMismatch {
-                stored: crate::netcdf::DType::of(datatype).name(),
+                stored: crate::dtype::DType::of(datatype).name(),
                 asked: T::NAME,
                 what: what.to_string(),
             }),
