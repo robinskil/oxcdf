@@ -1,0 +1,37 @@
+// Every netCDF user-defined type becomes an HDF5 committed datatype: the type
+// sits in its own object header and each variable points at it with a shared
+// datatype message. A dataset here therefore exercises that indirection.
+//
+// Rebuild with:
+//   ncgen -k nc4 -o committed_types.nc committed_types.cdl
+netcdf committed_types {
+types:
+    compound reading_t {
+        int station ;
+        float value ;
+        char label(8) ;
+    }; // reading_t
+    byte enum quality_t {bad = 0, good = 1, missing = 9} ;
+    opaque(4) tag_t ;
+    float(*) profile_t ;
+dimensions:
+    n = 3 ;
+variables:
+    reading_t readings(n) ;
+        readings:long_name = "compound readings" ;
+    quality_t quality(n) ;
+    tag_t tags(n) ;
+    profile_t profiles(n) ;
+    // A plain variable beside them, so the file still opens as ordinary netCDF.
+    int plain(n) ;
+        plain:units = "count" ;
+data:
+    readings =
+        {11, 1.5, {"alpha"}},
+        {22, -2.25, {"beta"}},
+        {33, 0.0, {"gamma"}} ;
+    quality = good, bad, missing ;
+    tags = 0x01020304, 0xaabbccdd, 0x00000000 ;
+    profiles = {1.5, 2.5}, {}, {3.5, 4.5, 5.5} ;
+    plain = 7, 8, 9 ;
+}

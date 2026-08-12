@@ -32,6 +32,9 @@ fn corpus() -> Vec<(&'static str, String)> {
         ("test_file.nc", "test_file.nc"),
         ("gridded-example.nc", "gridded-example.nc"),
         ("wod_ctd_1964.nc", "wod_ctd_1964.nc"),
+        // Declares a compound type, so its variables reach the committed
+        // datatype path.
+        ("wod_osd_1930.nc", "wod_osd_1930.nc"),
     ]
     .iter()
     .map(|(name, p)| (*name, format!("{root}/{p}")))

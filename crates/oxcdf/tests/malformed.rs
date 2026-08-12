@@ -29,6 +29,9 @@ fn corpus() -> Vec<(String, Vec<u8>)> {
         "classic.nc",
         "classic64.nc",
         "vlen_strings.nc",
+        // Declares user-defined types, so mutating it exercises the committed
+        // datatype path.
+        "committed_types.nc",
         "legacy_v1_objheader.h5",
     ]
     .iter()
@@ -189,6 +192,57 @@ fn random_bytes_are_refused() {
 /// A file that keeps its HDF5 signature but holds rubbish after it.
 ///
 /// This gets past the container check, so the superblock parser sees it.
+/// Corrupt every byte of the classic fixtures, one at a time, to every value
+/// that changes the parse in a different way.
+///
+/// The other corruption test samples offsets, because the HDF5 corpus is large.
+/// The classic fixtures are a few hundred bytes, so this one covers all of them
+/// and leaves no gap for a header field to hide in.
+///
+/// A classic header is nothing but counts, lengths and offsets. Reserving on a
+/// count before the buffer bounds it hands the allocator a claim it cannot
+/// meet, and a failed allocation aborts the process instead of returning an
+/// error, which no caller can catch.
+#[test]
+fn every_single_byte_corruption_of_a_classic_file_is_handled() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_files");
+    let mut failures = Vec::new();
+
+    for name in ["classic.nc", "classic64.nc"] {
+        let Ok(bytes) = std::fs::read(format!("{root}/{name}")) else {
+            continue;
+        };
+
+        for offset in 0..bytes.len() {
+            // Zero, one, both signs of a byte and both all-ones patterns. These
+            // are what turn a small count into an enormous one.
+            for value in [0x00u8, 0x01, 0x7F, 0x80, 0xFE, 0xFF] {
+                if bytes[offset] == value {
+                    continue;
+                }
+                let mut mutant = bytes.clone();
+                mutant[offset] = value;
+
+                let label = format!("{name} byte {offset} set to {value:#04x}");
+                match opens_without_panic(&label, mutant) {
+                    Err(e) => failures.push(e),
+                    Ok(Some(file)) => {
+                        failures.extend(reads_without_panic(&label, &file, bytes.len()))
+                    }
+                    Ok(None) => {}
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 #[test]
 fn a_valid_signature_over_rubbish_is_refused() {
     let mut failures = Vec::new();

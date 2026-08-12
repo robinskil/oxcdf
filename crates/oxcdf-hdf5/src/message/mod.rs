@@ -12,6 +12,7 @@ pub mod fillvalue;
 pub mod filter;
 pub mod layout;
 pub mod link;
+pub mod shared;
 
 pub use attribute::Attribute;
 pub use dataspace::{Dataspace, DataspaceKind};
@@ -20,15 +21,24 @@ pub use fillvalue::FillValue;
 pub use filter::{Filter, FilterPipeline};
 pub use layout::{ChunkIndex, Layout};
 pub use link::{AttributeInfo, Link, LinkInfo, LinkTarget, SymbolTable};
+pub use shared::{SharedLocation, SharedMessage};
 
+use crate::context::Ctx;
 use crate::cursor::Sizes;
 use crate::error::{Error, Result};
 use crate::objheader::{HeaderMessage, MessageType, ObjectHeader};
 
-/// Reject a message whose body is a pointer into the shared message table.
+/// How many committed datatypes one lookup will follow before giving up.
 ///
-/// netcdf-c never enables shared messages, so rather than decode the pointer as
-/// if it were the message itself, say plainly that it is not supported.
+/// A well-formed file needs one hop: the committed type holds its datatype
+/// inline. The limit only stops a damaged or hostile file from looping.
+const MAX_SHARED_HOPS: usize = 8;
+
+/// Reject a message whose body is a pointer to a message stored elsewhere.
+///
+/// Only the datatype message is worth following, because that is the one
+/// netcdf-c shares (see [`ObjectHeader::datatype`]). For the rest, say plainly
+/// that it is not supported rather than decode the pointer as the message.
 fn reject_shared(msg: &HeaderMessage, what: &str) -> Result<()> {
     if msg.is_shared() {
         return Err(Error::unsupported(format!("shared {what} message")));
@@ -50,14 +60,42 @@ impl ObjectHeader {
     }
 
     /// The object's datatype, when it has one.
-    pub fn datatype(&self) -> Result<Option<Datatype>> {
-        match self.message_of(MessageType::Datatype) {
-            Some(m) => {
-                reject_shared(m, "datatype")?;
-                Ok(Some(Datatype::parse(&m.data)?))
-            }
-            None => Ok(None),
+    ///
+    /// A dataset of a user-defined type does not hold the type inline. netCDF-4
+    /// commits each such type to its own object header, and the dataset carries
+    /// a pointer to it. This follows that pointer, so a compound, enum, opaque
+    /// or vlen variable reads like any other.
+    pub fn datatype(&self, ctx: Ctx<'_>) -> Result<Option<Datatype>> {
+        let Some(msg) = self.message_of(MessageType::Datatype) else {
+            return Ok(None);
+        };
+        if !msg.is_shared() {
+            return Ok(Some(Datatype::parse(&msg.data)?));
         }
+
+        // Follow the pointer. The target is a committed datatype, whose own
+        // header holds the type inline; the loop only guards against a file
+        // that points one committed type at another, or at itself.
+        let sizes = ctx.sizes();
+        let mut address = SharedMessage::parse(&msg.data, sizes)?.committed_address("datatype")?;
+
+        for _ in 0..MAX_SHARED_HOPS {
+            let committed = ObjectHeader::read(ctx, address)?;
+            let target = committed.message_of(MessageType::Datatype).ok_or_else(|| {
+                Error::malformed(format!(
+                    "committed datatype at {address} has no datatype message"
+                ))
+            })?;
+
+            if !target.is_shared() {
+                return Ok(Some(Datatype::parse(&target.data)?));
+            }
+            address = SharedMessage::parse(&target.data, sizes)?.committed_address("datatype")?;
+        }
+
+        Err(Error::malformed(
+            "committed datatype chain is too long; the file may be cyclic",
+        ))
     }
 
     /// The object's data layout, when it has one.
@@ -160,5 +198,16 @@ impl ObjectHeader {
     /// Whether this object is a dataset.
     pub fn is_dataset(&self) -> bool {
         self.message_of(MessageType::DataLayout).is_some()
+    }
+
+    /// Whether this object is a committed, or named, datatype.
+    ///
+    /// netCDF-4 writes one into the group for every user-defined type, and the
+    /// datasets of that type point at it. It holds a datatype but no values, so
+    /// it is neither a group nor a dataset. A group never carries a datatype
+    /// message, which is what separates the two.
+    pub fn is_committed_datatype(&self) -> bool {
+        self.message_of(MessageType::Datatype).is_some()
+            && self.message_of(MessageType::DataLayout).is_none()
     }
 }

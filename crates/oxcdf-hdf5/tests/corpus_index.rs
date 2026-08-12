@@ -10,6 +10,10 @@ fn corpus() -> Vec<(&'static str, String)> {
         ("test_file.nc", "test_file.nc"),
         ("gridded-example.nc", "gridded-example.nc"),
         ("wod_ctd_1964.nc", "wod_ctd_1964.nc"),
+        ("committed_types.nc", "committed_types.nc"),
+        // A real file that declares a compound type. Untracked because of its
+        // size, so the corpus skips it when it is absent.
+        ("wod_osd_1930.nc", "wod_osd_1930.nc"),
     ]
     .iter()
     .map(|(name, p)| (*name, format!("{root}/{p}")))

@@ -581,7 +581,7 @@ impl Header {
             for _ in 0..count {
                 let name = read_name(&mut cur, is_cdf5)?;
                 let rank = read_size(&mut cur)? as usize;
-                let mut dim_ids = Vec::with_capacity(rank);
+                let mut dim_ids = sized_for(rank, &cur, MIN_DIM_ID_BYTES);
                 for _ in 0..rank {
                     dim_ids.push(read_size(&mut cur)? as usize);
                 }
@@ -590,8 +590,8 @@ impl Header {
                 let _vsize = read_size(&mut cur)?;
                 let begin = read_offset(&mut cur)?;
 
-                let mut shape = Vec::with_capacity(rank);
-                let mut dimension_names = Vec::with_capacity(rank);
+                let mut shape = Vec::with_capacity(dim_ids.len());
+                let mut dimension_names = Vec::with_capacity(dim_ids.len());
                 for &id in &dim_ids {
                     let d = dimensions.get(id).ok_or_else(|| {
                         Error::malformed(format!(
@@ -670,12 +670,18 @@ fn read_attributes(
         return Ok(Vec::new());
     }
 
-    let mut out = Vec::with_capacity(count);
+    let mut out = sized_for(count, cur, MIN_ATTRIBUTE_BYTES);
     for _ in 0..count {
         let name = read_name(cur, is_cdf5)?;
         let nc_type = NcType::from_code(be_u32(cur)?)?;
         let n = read_size(cur)? as usize;
-        let bytes = n * nc_type.size();
+        // A corrupt element count times the element width overflows, which
+        // panics in a debug build and wraps to a plausible length in release.
+        let bytes = n.checked_mul(nc_type.size()).ok_or_else(|| {
+            Error::malformed(format!(
+                "attribute {name} claims {n} elements, which overflows a byte count"
+            ))
+        })?;
         let raw = cur.take(bytes)?.to_vec();
         cur.skip(pad4(bytes as u64) as usize - bytes)?;
 
@@ -720,6 +726,25 @@ fn read_name(cur: &mut Cursor<'_>, is_cdf5: bool) -> Result<String> {
     cur.skip(pad4(len as u64) as usize - len)?;
     Ok(name)
 }
+
+/// A vector sized for `count` items, without trusting `count` on its own.
+///
+/// A damaged header can claim any count. Reserving on that claim alone asks the
+/// allocator for the claim times the item size, which the allocator answers by
+/// aborting the process. An abort is not an error a caller can catch, so the
+/// claim has to meet the buffer before it reaches the allocator.
+///
+/// `min_bytes` is the smallest number of bytes one item can occupy on disk. The
+/// bytes left in the header therefore bound how many items can be real. A
+/// truthful count is far below that bound and still reserves exactly once.
+fn sized_for<T>(count: usize, cur: &Cursor<'_>, min_bytes: usize) -> Vec<T> {
+    Vec::with_capacity(count.min(cur.remaining() / min_bytes))
+}
+
+/// Smallest encoding of one attribute: a zero-length name, a type and a count.
+const MIN_ATTRIBUTE_BYTES: usize = 12;
+/// Smallest encoding of one dimension id, which is a four-byte index.
+const MIN_DIM_ID_BYTES: usize = 4;
 
 fn pad4(n: u64) -> u64 {
     n.div_ceil(4) * 4

@@ -589,6 +589,11 @@ fn build_group(
                 child_path,
                 child.address,
             )?);
+        } else if child_header.is_committed_datatype() {
+            // A user-defined type, which netCDF-4 stores beside the variables
+            // that use it. It holds no values, and reading it as a group would
+            // invent one the file does not have.
+            continue;
         } else {
             groups.push(build_group(
                 ctx,
@@ -714,7 +719,7 @@ fn build_dataset(
         max_dims: None,
     });
     let datatype = header
-        .datatype()?
+        .datatype(ctx)?
         .ok_or_else(|| Error::malformed(format!("dataset {path} has no datatype message")))?;
     let layout = header
         .layout(sizes)?

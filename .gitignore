@@ -21,3 +21,4 @@ Cargo.lock
 generate_legacy
 generate_latest
 generate_szip
+test_files/wod_osd_1930.nc
