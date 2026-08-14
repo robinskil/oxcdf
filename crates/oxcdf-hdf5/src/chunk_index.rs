@@ -43,6 +43,27 @@ const SBLK_FIRST_IDX: usize = 2;
 /// Client ID marking an index over filtered chunks.
 const CLIENT_FILTERED_CHUNKS: u8 = 1;
 
+/// Refuse a chunk count the file could not possibly hold.
+///
+/// The implicit and fixed-array indexes build one record for every cell of the
+/// chunk grid, so a damaged shape would allocate without bound. A stored chunk
+/// takes at least one byte, so a file cannot hold more chunks than it has
+/// bytes. The bound is generous on purpose: it is here to stop a runaway
+/// allocation, not to judge a file.
+///
+/// The indexes that read their records from the file, rather than counting
+/// them, are not bounded here. A large sparse dataset with three stored chunks
+/// is perfectly ordinary, and its grid says nothing about how much it stores.
+fn chunk_count(ctx: Ctx<'_>, total: u64) -> Result<u64> {
+    let size = ctx.source.size();
+    if total > size {
+        return Err(Error::malformed(format!(
+            "a chunk index claims {total} chunks, and the file holds {size} bytes"
+        )));
+    }
+    Ok(total)
+}
+
 /// Resolve a version 4 chunk index into chunk records.
 ///
 /// `shape` and `chunk_dims` describe the dataset, and `element_size` the width
@@ -57,8 +78,10 @@ pub fn read(
     filtered: bool,
 ) -> Result<Vec<ChunkRecord>> {
     let grid = chunk_grid(shape, chunk_dims);
-    let total: u64 = grid.iter().product();
-    let unfiltered_size = chunk_dims.iter().product::<u64>() * element_size as u64;
+    let total = crate::read::element_count(&grid);
+    let unfiltered_size =
+        crate::read::element_count(chunk_dims).saturating_mul(element_size as u64);
+    let stored_size = u32::try_from(unfiltered_size).unwrap_or(u32::MAX);
 
     let Some(address) = address else {
         return Ok(Vec::new());
@@ -72,7 +95,7 @@ pub fn read(
             size: if filtered {
                 *filtered_size as u32
             } else {
-                unfiltered_size as u32
+                stored_size
             },
             filter_mask: *filter_mask,
             offset: vec![0; shape.len()],
@@ -81,17 +104,17 @@ pub fn read(
 
         // Chunks sit back to back in row-major chunk order, so each address is
         // arithmetic. An implicit index only exists for unfiltered data.
-        ChunkIndex::Implicit => (0..total)
+        ChunkIndex::Implicit => (0..chunk_count(ctx, total)?)
             .map(|i| ChunkRecord {
-                size: unfiltered_size as u32,
+                size: stored_size,
                 filter_mask: 0,
                 offset: chunk_offset(i, &grid, chunk_dims),
-                address: address + i * unfiltered_size,
+                address: address.saturating_add(i.saturating_mul(unfiltered_size)),
             })
             .collect(),
 
         ChunkIndex::FixedArray { .. } => {
-            let elements = read_fixed_array(ctx, address, total as usize)?;
+            let elements = read_fixed_array(ctx, address, chunk_count(ctx, total)? as usize)?;
             elements_to_records(elements, &grid, chunk_dims, unfiltered_size)
         }
 
@@ -105,7 +128,7 @@ pub fn read(
             // An unfiltered record stores no size; it is the full chunk.
             for r in records.iter_mut() {
                 if r.size == 0 {
-                    r.size = unfiltered_size as u32;
+                    r.size = stored_size;
                 }
             }
             records

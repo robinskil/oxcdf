@@ -164,6 +164,16 @@ pub trait Element: Copy + Sized + sealed::Sealed {
     /// The read path normalises byte order, so the bytes are always native by
     /// the time they arrive here.
     fn from_ne_bytes(bytes: &[u8]) -> Self;
+    /// Decode a whole block of elements of exactly this type.
+    ///
+    /// This exists to be fast, not to add expressiveness: a read of a variable
+    /// stored as the type it is asked for is the common case, and it is a copy.
+    /// Calling [`Element::from_ne_bytes`] for each element leaves the width
+    /// opaque across the call and runs at half the speed.
+    ///
+    /// `bytes` must be native-order values of this exact type. A trailing
+    /// partial element is dropped.
+    fn from_ne_slice(bytes: &[u8]) -> Vec<Self>;
     /// Convert from a stored signed integer.
     fn from_i64(value: i64) -> Self;
     /// Convert from a stored unsigned integer.
@@ -183,10 +193,20 @@ macro_rules! element {
         impl Element for $rust {
             const DTYPE: DType = $dtype;
             const NAME: &'static str = $name;
+            #[inline]
             fn from_ne_bytes(bytes: &[u8]) -> Self {
                 // The caller checked the width against `size_of`, so this
                 // cannot fail.
                 <$rust>::from_ne_bytes(bytes.try_into().expect("width checked"))
+            }
+            fn from_ne_slice(bytes: &[u8]) -> Vec<Self> {
+                // Written out here rather than through `from_ne_bytes` so the
+                // width is a constant in the loop. That is the whole point of
+                // the method: it compiles to a copy.
+                bytes
+                    .chunks_exact(std::mem::size_of::<$rust>())
+                    .map(|b| <$rust>::from_ne_bytes(b.try_into().expect("width checked")))
+                    .collect()
             }
             #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
             #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]

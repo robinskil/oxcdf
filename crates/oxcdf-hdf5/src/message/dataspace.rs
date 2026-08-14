@@ -40,7 +40,7 @@ impl Dataspace {
         match self.kind {
             DataspaceKind::Null => 0,
             DataspaceKind::Scalar => 1,
-            DataspaceKind::Simple => self.dims.iter().product(),
+            DataspaceKind::Simple => crate::read::element_count(&self.dims),
         }
     }
 

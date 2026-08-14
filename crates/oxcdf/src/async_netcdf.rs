@@ -276,7 +276,7 @@ impl<'a> AsyncVariable<'a> {
 
     /// Total number of elements. This matches `netcdf::Variable::len`.
     pub fn len(&self) -> u64 {
-        self.info.shape.iter().product()
+        oxcdf_hdf5::read::element_count(&self.info.shape)
     }
 
     /// Whether the variable holds no elements.
@@ -433,6 +433,15 @@ impl<'a> AsyncVariable<'a> {
         .await?;
 
         // A variable-length value stores a pointer into a heap. Follow it.
+        //
+        // Only that case needs the file again. The walk is a replay, so it
+        // takes the block by value and may run its closure more than once;
+        // asking for it unconditionally copied every byte just read, which was
+        // 3.3% of the profile in issue #2.
+        if !crate::netcdf::holds_heap_pointers(dataset) {
+            return Ok(Values::from_parts(raw, dataset.datatype.clone()));
+        }
+
         self.file
             .walk(|ctx| crate::netcdf::values_from_raw(ctx, dataset, raw.clone()))
             .await

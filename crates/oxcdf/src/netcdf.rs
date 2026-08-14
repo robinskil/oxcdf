@@ -1196,9 +1196,12 @@ impl Values {
 #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
 fn shape_into_array<T>(shape: &[u64], values: Vec<T>) -> Result<ndarray::ArrayD<T>> {
     let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    // Saturating, because the shape comes from the file. The count is only
+    // compared against the values actually read, so a shape that multiplies
+    // past `usize` simply fails to match and is reported.
     let expected: usize = dims
         .iter()
-        .product::<usize>()
+        .fold(1usize, |total, &dim| total.saturating_mul(dim))
         .max(if dims.is_empty() { 1 } else { 0 });
     if values.len() != expected {
         return Err(Error::malformed(format!(
@@ -1285,7 +1288,7 @@ impl<'a> Variable<'a> {
 
     /// Total number of elements. This matches `netcdf::Variable::len`.
     pub fn len(&self) -> u64 {
-        self.info.shape.iter().product()
+        oxcdf_hdf5::read::element_count(&self.info.shape)
     }
 
     /// Whether the variable holds no elements.
@@ -1538,22 +1541,37 @@ pub(crate) fn values_from_raw(
     dataset: &DatasetIndex,
     raw: RawData,
 ) -> Result<Values> {
-    let mut vlen_strings = None;
-
-    if let DatatypeClass::VariableLength { kind, .. } = &dataset.datatype.class {
-        // A ragged sequence has no netCDF-style reader, so it is not followed
-        // here. `oxcdf_hdf5::read::resolve_vlen_sequences` still reads one for
-        // a caller working at the HDF5 layer.
-        if matches!(kind, oxcdf_hdf5::message::VlenKind::String) {
-            vlen_strings = Some(oxcdf_hdf5::read::resolve_vlen_strings(ctx, dataset, &raw)?);
-        }
-    }
+    let vlen_strings = if holds_heap_pointers(dataset) {
+        Some(oxcdf_hdf5::read::resolve_vlen_strings(ctx, dataset, &raw)?)
+    } else {
+        None
+    };
 
     Ok(Values {
         raw,
         datatype: dataset.datatype.clone(),
         vlen_strings,
     })
+}
+
+/// Whether a read of this variable is still incomplete once the bytes are in
+/// hand, because its elements point into the global heap.
+///
+/// A ragged sequence has no netCDF-style reader, so it is not followed here.
+/// `oxcdf_hdf5::read::resolve_vlen_sequences` still reads one for a caller
+/// working at the HDF5 layer.
+///
+/// The asynchronous engine asks first: following a heap pointer means another
+/// walk over the file, and a walk needs the block by value. Everything else is
+/// complete already, and pays for neither.
+pub(crate) fn holds_heap_pointers(dataset: &DatasetIndex) -> bool {
+    matches!(
+        &dataset.datatype.class,
+        DatatypeClass::VariableLength {
+            kind: oxcdf_hdf5::message::VlenKind::String,
+            ..
+        }
+    )
 }
 
 impl NetcdfFile {

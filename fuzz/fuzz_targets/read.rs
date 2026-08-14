@@ -20,6 +20,15 @@ use oxcdf::MemorySource;
 /// `open` target. Here it only starves the fuzzer.
 const MAX_ELEMENTS: u64 = 1 << 20;
 
+/// The same bound in bytes.
+///
+/// An element width comes from the file just as the shape does, so counting
+/// elements alone does not bound the read. A variable of a million elements
+/// that are 30 KB each asks for 30 GB, and a 10 KB input can declare exactly
+/// that. Reading it is the caller's decision to make, from the length and the
+/// type, which is what this does.
+const MAX_BYTES: u64 = 1 << 26;
+
 /// Read at most this many variables, so one input cannot dominate the run.
 const MAX_VARIABLES: usize = 16;
 
@@ -32,7 +41,10 @@ fuzz_target!(|data: &[u8]| {
     };
 
     for v in file.variables().into_iter().take(MAX_VARIABLES) {
-        if v.len() > MAX_ELEMENTS {
+        // The widest output any read below asks for, so one bound covers them
+        // all: the stored width, or eight bytes once decoded as `f64`.
+        let width = (v.datatype().size as u64).max(8);
+        if v.len() > MAX_ELEMENTS || v.len().saturating_mul(width) > MAX_BYTES {
             continue;
         }
         // Each decode path, because each one reaches different code.

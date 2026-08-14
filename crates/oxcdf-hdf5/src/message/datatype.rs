@@ -319,7 +319,11 @@ impl Datatype {
                         base
                     } else {
                         let dims = dims[..rank as usize].to_vec();
-                        let size = base.size * dims.iter().product::<u32>();
+                        // Dimensions come from the file, so the width of an
+                        // array member can multiply past `u32`. Saturating
+                        // leaves a width nothing will read, which the size
+                        // checks downstream refuse.
+                        let size = dims.iter().fold(base.size, |w, &d| w.saturating_mul(d));
                         Datatype {
                             version,
                             size,
