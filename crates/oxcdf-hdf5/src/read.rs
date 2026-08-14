@@ -338,6 +338,12 @@ fn chunks_cover(
 }
 
 /// Whether a chunk overlaps the selection.
+///
+/// A chunk offset comes from the file and a damaged one can sit anywhere in the
+/// address space, so its far edge saturates. A chunk that claims to reach past
+/// the end of the address space does reach past the selection, which is inside
+/// the dataset's shape, so saturating gives the right answer as well as a safe
+/// one. Every other place that takes a chunk's far edge does the same.
 fn intersects(
     record: &crate::btree1::ChunkRecord,
     chunk_shape: &[u64],
@@ -346,7 +352,7 @@ fn intersects(
 ) -> bool {
     (0..rank).all(|axis| {
         let chunk_lo = record.offset[axis];
-        let chunk_hi = chunk_lo + chunk_shape[axis];
+        let chunk_hi = chunk_lo.saturating_add(chunk_shape[axis]);
         let sel_lo = slab.start[axis];
         let sel_hi = sel_lo + slab.count[axis];
         chunk_lo.max(sel_lo) < chunk_hi.min(sel_hi)
@@ -851,7 +857,7 @@ fn read_chunked(
         let mut empty = false;
         for axis in 0..rank {
             let chunk_lo = record.offset[axis];
-            let chunk_hi = chunk_lo + chunk_shape[axis];
+            let chunk_hi = chunk_lo.saturating_add(chunk_shape[axis]);
             let sel_lo = slab.start[axis];
             let sel_hi = slab.start[axis] + slab.count[axis];
             lo[axis] = chunk_lo.max(sel_lo);
@@ -1227,8 +1233,9 @@ fn copy_chunk(
     let mut hi = vec![0u64; rank];
     for axis in 0..rank {
         lo[axis] = record.offset[axis].max(slab.start[axis]);
-        hi[axis] =
-            (record.offset[axis] + chunk_shape[axis]).min(slab.start[axis] + slab.count[axis]);
+        hi[axis] = record.offset[axis]
+            .saturating_add(chunk_shape[axis])
+            .min(slab.start[axis] + slab.count[axis]);
     }
 
     let run = hi[rank - 1] - lo[rank - 1];
@@ -1357,12 +1364,15 @@ mod tests {
     }
 
     /// A chunk record at `offset`, stored and non-empty.
+    ///
+    /// The address is where the bytes live, which none of these tests read, so
+    /// one address serves them all.
     fn record(offset: &[u64]) -> crate::btree1::ChunkRecord {
         crate::btree1::ChunkRecord {
             size: 64,
             filter_mask: 0,
             offset: offset.to_vec(),
-            address: 4096 + offset.iter().sum::<u64>(),
+            address: 4096,
         }
     }
 
@@ -1417,6 +1427,41 @@ mod tests {
         // An offset that is not a multiple of the chunk shape is not a cell.
         let chunks = [record(&[1, 0])];
         assert!(!chunks_cover(&chunks, &[4, 4], &slab(&[0, 0], &[4, 4]), 2));
+    }
+
+    /// A damaged chunk index can put a chunk anywhere in the address space and
+    /// give it any shape. Adding the two must not overflow, in any of the three
+    /// places a read takes a chunk's far edge.
+    #[test]
+    fn a_chunk_reaching_past_the_address_space_does_not_overflow() {
+        let at_zero = record(&[0]);
+        assert!(intersects(&at_zero, &[u64::MAX], &slab(&[0], &[4]), 1));
+
+        // Far past the selection, and its far edge wraps. It intersects
+        // nothing, and it must say so rather than panic.
+        let far = record(&[u64::MAX - 1]);
+        assert!(!intersects(&far, &[u64::MAX], &slab(&[0], &[4]), 1));
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn a_chunk_reaching_past_the_address_space_copies_only_the_selection() {
+        // `copy_chunk` clips the same edge, so it must clip it the same way.
+        let record = record(&[0]);
+        let mut out = vec![0u8; 4];
+        let decoded: Vec<u8> = vec![7, 8, 9, 10];
+        copy_chunk(
+            &mut out,
+            &decoded,
+            &record,
+            &[u64::MAX],
+            &[1],
+            &slab(&[0], &[4]),
+            &[1],
+            1,
+            1,
+        );
+        assert_eq!(out, decoded);
     }
 
     #[test]
