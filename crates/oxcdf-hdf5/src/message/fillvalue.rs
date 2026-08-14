@@ -25,6 +25,10 @@ impl FillValue {
     ///
     /// Falls back to zeroing when no fill value is defined, which is what the
     /// format specifies.
+    ///
+    /// A read only needs this for the part of a selection no chunk covers. See
+    /// [`crate::read::read_hyperslab`], which skips the call entirely when the
+    /// stored chunks cover everything.
     pub fn fill(&self, buf: &mut [u8], element_size: usize) {
         let Some(bytes) = self.bytes.as_ref() else {
             buf.fill(0);
@@ -39,9 +43,19 @@ impl FillValue {
             buf.fill(0);
             return;
         }
-        for slot in buf.chunks_mut(element_size) {
-            let n = slot.len().min(bytes.len());
-            slot[..n].copy_from_slice(&bytes[..n]);
+
+        // Tile by doubling: write one element, then copy everything already
+        // written over the rest, twice as much each time. That is a handful of
+        // `memcpy` calls over the buffer instead of one four-byte copy for
+        // every element, which showed up as 8.5% of a whole scan.
+        let head = element_size.min(buf.len());
+        buf[..head].copy_from_slice(&bytes[..head]);
+        let mut done = head;
+        while done < buf.len() {
+            let take = done.min(buf.len() - done);
+            let (written, rest) = buf.split_at_mut(done);
+            rest[..take].copy_from_slice(&written[..take]);
+            done += take;
         }
     }
 
@@ -160,6 +174,48 @@ mod tests {
         let mut buf = vec![0u8; 6];
         f.fill(&mut buf, 2);
         assert_eq!(buf, vec![0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn fill_tiles_a_buffer_that_is_not_whole_elements() {
+        // The doubling must not run past the end, and the part of an element
+        // that fits gets the start of the value.
+        let f = FillValue {
+            bytes: Some(vec![1, 2, 3, 4]),
+        };
+        let mut buf = vec![0u8; 10];
+        f.fill(&mut buf, 4);
+        assert_eq!(buf, vec![1, 2, 3, 4, 1, 2, 3, 4, 1, 2]);
+    }
+
+    #[test]
+    fn fill_tiles_a_buffer_shorter_than_one_element() {
+        let f = FillValue {
+            bytes: Some(vec![9, 8, 7, 6]),
+        };
+        let mut buf = vec![0u8; 3];
+        f.fill(&mut buf, 4);
+        assert_eq!(buf, vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn fill_tiles_a_long_buffer_exactly() {
+        // Long enough that the doubling takes several rounds.
+        let value = (-2147483647i32).to_ne_bytes();
+        let f = FillValue {
+            bytes: Some(value.to_vec()),
+        };
+        let mut buf = vec![0u8; 4 * 1000];
+        f.fill(&mut buf, 4);
+        assert!(buf.chunks_exact(4).all(|c| c == value));
+    }
+
+    #[test]
+    fn fill_leaves_an_empty_buffer_alone() {
+        let f = FillValue {
+            bytes: Some(vec![1, 2]),
+        };
+        f.fill(&mut [], 2);
     }
 
     #[test]

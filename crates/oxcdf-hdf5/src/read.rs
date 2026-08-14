@@ -145,24 +145,29 @@ impl RawData {
         what: &str,
     ) -> Result<Vec<T>> {
         let size = self.element_size;
-        let count = self.len();
-        let element = |i: usize| &self.bytes[i * size..(i + 1) * size];
 
-        // The stored type is the asked-for type: copy, do not convert.
+        // The stored type is the asked-for type: copy, do not convert. That is
+        // what a read of a netCDF variable normally is, and
+        // [`crate::dtype::Element::from_ne_slice`] makes it the copy it should
+        // be. Walking the buffer element by element instead cost a third of a
+        // whole scan in issue #2.
         if crate::dtype::DType::of(datatype) == T::DTYPE && size == std::mem::size_of::<T>() {
-            return Ok((0..count).map(|i| T::from_ne_bytes(element(i))).collect());
+            return Ok(T::from_ne_slice(&self.bytes));
         }
 
+        // `len` is already zero for a zero-width element, which a damaged file
+        // can declare. `chunks_exact` would panic on that width, so ask it for
+        // one byte and take nothing.
+        let elements = self.bytes.chunks_exact(size.max(1)).take(self.len());
         match &datatype.class {
-            DatatypeClass::FixedPoint { signed: true, .. } => (0..count)
-                .map(|i| Ok(T::from_i64(read_integer(element(i), true)?)))
+            DatatypeClass::FixedPoint { signed: true, .. } => elements
+                .map(|b| Ok(T::from_i64(read_integer(b, true)?)))
                 .collect(),
-            DatatypeClass::FixedPoint { signed: false, .. } => (0..count)
-                .map(|i| Ok(T::from_u64(read_unsigned(element(i))?)))
+            DatatypeClass::FixedPoint { signed: false, .. } => elements
+                .map(|b| Ok(T::from_u64(read_unsigned(b)?)))
                 .collect(),
-            DatatypeClass::FloatingPoint { .. } => (0..count)
-                .map(|i| {
-                    let b = element(i);
+            DatatypeClass::FloatingPoint { .. } => elements
+                .map(|b| {
                     let v = match size {
                         4 => f32::from_ne_bytes(b.try_into().unwrap()) as f64,
                         8 => f64::from_ne_bytes(b.try_into().unwrap()),
@@ -224,6 +229,112 @@ impl RawData {
 
         Ok(out)
     }
+}
+
+/// Whether the data a read is about to copy covers every byte of its output.
+///
+/// A read starts from the fill value, because storage that was never written
+/// must read as it. When the copies that follow cover the whole selection,
+/// every one of those bytes is overwritten and the fill is a wasted pass over
+/// the buffer. A netCDF4 variable stored as one chunk is exactly that case, and
+/// the pass cost 8.5% of the profile in issue #2.
+///
+/// `chunks` is the resolved chunk index, needed only for a chunked dataset.
+fn selection_is_covered(
+    dataset: &DatasetIndex,
+    chunks: Option<&[crate::btree1::ChunkRecord]>,
+    slab: &Hyperslab,
+) -> bool {
+    match &dataset.layout {
+        // The whole image is in memory and every run of the selection is
+        // copied out of it.
+        Layout::Compact { .. } => true,
+        // A written contiguous dataset is one run per row of the selection,
+        // and the runs tile the output exactly. An unwritten one has no bytes
+        // at all, so the fill value is the answer.
+        Layout::Contiguous { address, .. } => address.is_some(),
+        Layout::Chunked { chunk_dims, .. } => {
+            let rank = dataset.shape.len();
+            if rank == 0 || chunk_dims.len() != rank {
+                return false;
+            }
+            let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+            chunks.is_some_and(|chunks| chunks_cover(chunks, &chunk_shape, slab, rank))
+        }
+    }
+}
+
+/// Whether the stored chunks cover every element of the selection.
+///
+/// The test marks each cell of the chunk grid the selection touches. Summing
+/// the intersection volumes would be shorter and wrong: a damaged index that
+/// names one chunk twice would then stand in for a chunk that is missing, and
+/// the read would return zeros where it owes the fill value.
+///
+/// A grid holding more cells than the index holds chunks is missing one, so the
+/// marker allocation never grows past the chunk count.
+fn chunks_cover(
+    chunks: &[crate::btree1::ChunkRecord],
+    chunk_shape: &[u64],
+    slab: &Hyperslab,
+    rank: usize,
+) -> bool {
+    if slab.element_count() == 0 {
+        return true; // nothing to fill
+    }
+
+    // The block of grid cells the selection touches.
+    let mut first = vec![0u64; rank];
+    let mut span = vec![0u64; rank];
+    let mut cells = 1u64;
+    for axis in 0..rank {
+        let width = chunk_shape[axis];
+        if width == 0 {
+            return false;
+        }
+        let lo = slab.start[axis] / width;
+        let hi = (slab.start[axis] + slab.count[axis] - 1) / width;
+        first[axis] = lo;
+        span[axis] = hi - lo + 1;
+        match cells.checked_mul(span[axis]) {
+            // More cells than chunks means at least one cell has no chunk.
+            Some(n) if n <= chunks.len() as u64 => cells = n,
+            _ => return false,
+        }
+    }
+
+    let mut seen = vec![false; cells as usize];
+    let mut missing = cells;
+    for record in chunks {
+        if record.size == 0 || record.offset.len() != rank {
+            continue; // never written, or not this dataset's shape
+        }
+        let mut cell = 0u64;
+        let mut inside = true;
+        for axis in 0..rank {
+            let width = chunk_shape[axis];
+            let offset = record.offset[axis];
+            // A chunk off the grid is not this reader's idea of a chunk.
+            if !offset.is_multiple_of(width) {
+                inside = false;
+                break;
+            }
+            let index = offset / width;
+            if index < first[axis] || index >= first[axis] + span[axis] {
+                inside = false;
+                break;
+            }
+            cell = cell * span[axis] + (index - first[axis]);
+        }
+        if inside && !seen[cell as usize] {
+            seen[cell as usize] = true;
+            missing -= 1;
+            if missing == 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether a chunk overlaps the selection.
@@ -499,11 +610,27 @@ pub fn read_hyperslab(ctx: Ctx<'_>, dataset: &DatasetIndex, slab: &Hyperslab) ->
         .and_then(|n| usize::try_from(n).ok())
         .ok_or_else(|| Error::bad_request("selection is too large to hold in memory"))?;
 
+    // Resolve the chunk index first: whether the fill value is needed at all
+    // depends on which chunks are stored.
+    let chunks = match &dataset.layout {
+        Layout::Chunked { .. } => Some(
+            dataset
+                .chunks(ctx)?
+                .ok_or_else(|| Error::malformed("chunked dataset has no chunk index"))?,
+        ),
+        _ => None,
+    };
+
     // Start from the fill value, not from zeros. A dataset that was never
     // written, or a chunk that was never allocated, must read as its fill
     // value; netCDF's default for a 32-bit integer is -2147483647, not 0.
+    //
+    // Stored data that covers the whole selection overwrites every one of those
+    // bytes, so the pass is skipped there.
     let mut out = vec![0u8; total];
-    dataset.fill_value.fill(&mut out, element_size);
+    if !selection_is_covered(dataset, chunks, slab) {
+        dataset.fill_value.fill(&mut out, element_size);
+    }
 
     match &dataset.layout {
         Layout::Compact { data } => {
@@ -517,9 +644,8 @@ pub fn read_hyperslab(ctx: Ctx<'_>, dataset: &DatasetIndex, slab: &Hyperslab) ->
             }
         },
         Layout::Chunked { chunk_dims, .. } => {
-            let chunks = dataset
-                .chunks(ctx)?
-                .ok_or_else(|| Error::malformed("chunked dataset has no chunk index"))?;
+            let chunks =
+                chunks.ok_or_else(|| Error::malformed("chunked dataset has no chunk index"))?;
             read_chunked(
                 ctx,
                 dataset,
@@ -873,8 +999,13 @@ pub async fn read_hyperslab_async_with(
         .and_then(|n| usize::try_from(n).ok())
         .ok_or_else(|| Error::bad_request("selection is too large to hold in memory"))?;
 
+    // The chunk index is metadata, which this function does not fetch, so a
+    // chunked dataset arrives with it resolved. Whether the fill value is
+    // needed at all depends on which chunks are stored.
     let mut out = vec![0u8; total];
-    dataset.fill_value.fill(&mut out, element_size);
+    if !selection_is_covered(dataset, dataset.resolved_chunks(), slab) {
+        dataset.fill_value.fill(&mut out, element_size);
+    }
 
     match &dataset.layout {
         Layout::Compact { data } => {
@@ -1223,6 +1354,74 @@ mod tests {
         let mut buf = vec![1, 2, 3];
         swap_bytes_in_place(&mut buf, 1);
         assert_eq!(buf, vec![1, 2, 3]);
+    }
+
+    /// A chunk record at `offset`, stored and non-empty.
+    fn record(offset: &[u64]) -> crate::btree1::ChunkRecord {
+        crate::btree1::ChunkRecord {
+            size: 64,
+            filter_mask: 0,
+            offset: offset.to_vec(),
+            address: 4096 + offset.iter().sum::<u64>(),
+        }
+    }
+
+    fn slab(start: &[u64], count: &[u64]) -> Hyperslab {
+        Hyperslab {
+            start: start.to_vec(),
+            count: count.to_vec(),
+        }
+    }
+
+    #[test]
+    fn one_chunk_over_the_whole_variable_covers_every_selection() {
+        let chunks = [record(&[0, 0])];
+        let shape = [514, 1938];
+        assert!(chunks_cover(
+            &chunks,
+            &shape,
+            &slab(&[0, 0], &[514, 1938]),
+            2
+        ));
+        assert!(chunks_cover(&chunks, &shape, &slab(&[100, 7], &[9, 11]), 2));
+    }
+
+    #[test]
+    fn a_selection_reaching_an_absent_chunk_is_not_covered() {
+        // A 2x2 grid of 4x4 chunks with the bottom-right one never written.
+        let chunks = [record(&[0, 0]), record(&[0, 4]), record(&[4, 0])];
+        let shape = [4, 4];
+        assert!(chunks_cover(&chunks, &shape, &slab(&[0, 0], &[4, 8]), 2));
+        assert!(!chunks_cover(&chunks, &shape, &slab(&[0, 0], &[8, 8]), 2));
+        assert!(!chunks_cover(&chunks, &shape, &slab(&[5, 5], &[2, 2]), 2));
+    }
+
+    #[test]
+    fn a_chunk_with_no_stored_bytes_covers_nothing() {
+        let mut empty = record(&[0, 0]);
+        empty.size = 0;
+        assert!(!chunks_cover(&[empty], &[4, 4], &slab(&[0, 0], &[4, 4]), 2));
+    }
+
+    /// A damaged index can name one chunk twice. Counting how much area the
+    /// records add up to would then hide a chunk that is missing, and the read
+    /// would return zeros where it owes the fill value.
+    #[test]
+    fn one_chunk_named_twice_does_not_stand_in_for_a_missing_one() {
+        let chunks = [record(&[0, 0]), record(&[0, 0]), record(&[0, 4])];
+        assert!(!chunks_cover(&chunks, &[4, 4], &slab(&[0, 0], &[8, 8]), 2));
+    }
+
+    #[test]
+    fn a_chunk_off_the_grid_covers_nothing() {
+        // An offset that is not a multiple of the chunk shape is not a cell.
+        let chunks = [record(&[1, 0])];
+        assert!(!chunks_cover(&chunks, &[4, 4], &slab(&[0, 0], &[4, 4]), 2));
+    }
+
+    #[test]
+    fn an_empty_selection_needs_no_fill() {
+        assert!(chunks_cover(&[], &[4, 4], &slab(&[0, 0], &[0, 4]), 2));
     }
 
     #[test]

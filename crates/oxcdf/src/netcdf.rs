@@ -1538,22 +1538,37 @@ pub(crate) fn values_from_raw(
     dataset: &DatasetIndex,
     raw: RawData,
 ) -> Result<Values> {
-    let mut vlen_strings = None;
-
-    if let DatatypeClass::VariableLength { kind, .. } = &dataset.datatype.class {
-        // A ragged sequence has no netCDF-style reader, so it is not followed
-        // here. `oxcdf_hdf5::read::resolve_vlen_sequences` still reads one for
-        // a caller working at the HDF5 layer.
-        if matches!(kind, oxcdf_hdf5::message::VlenKind::String) {
-            vlen_strings = Some(oxcdf_hdf5::read::resolve_vlen_strings(ctx, dataset, &raw)?);
-        }
-    }
+    let vlen_strings = if holds_heap_pointers(dataset) {
+        Some(oxcdf_hdf5::read::resolve_vlen_strings(ctx, dataset, &raw)?)
+    } else {
+        None
+    };
 
     Ok(Values {
         raw,
         datatype: dataset.datatype.clone(),
         vlen_strings,
     })
+}
+
+/// Whether a read of this variable is still incomplete once the bytes are in
+/// hand, because its elements point into the global heap.
+///
+/// A ragged sequence has no netCDF-style reader, so it is not followed here.
+/// `oxcdf_hdf5::read::resolve_vlen_sequences` still reads one for a caller
+/// working at the HDF5 layer.
+///
+/// The asynchronous engine asks first: following a heap pointer means another
+/// walk over the file, and a walk needs the block by value. Everything else is
+/// complete already, and pays for neither.
+pub(crate) fn holds_heap_pointers(dataset: &DatasetIndex) -> bool {
+    matches!(
+        &dataset.datatype.class,
+        DatatypeClass::VariableLength {
+            kind: oxcdf_hdf5::message::VlenKind::String,
+            ..
+        }
+    )
 }
 
 impl NetcdfFile {
