@@ -68,7 +68,7 @@ impl Hyperslab {
 
     /// Total number of elements selected.
     pub fn element_count(&self) -> u64 {
-        self.count.iter().product()
+        element_count(&self.count)
     }
 
     /// Check the selection lies inside `shape`.
@@ -99,6 +99,43 @@ impl Hyperslab {
         }
         Ok(())
     }
+}
+
+/// How many elements a shape holds, saturating rather than overflowing.
+///
+/// Every dimension here comes from the file. A damaged one multiplies past
+/// `u64`, and the answer a reader wants for that is "more than anything can
+/// hold", which is what `u64::MAX` says. Wrapping would say "a handful", and
+/// the read would go on to trust it.
+///
+/// Saturating is safe because of what callers do with the count: they compare
+/// it against a limit, or multiply it into a byte count with
+/// [`u64::checked_mul`] and refuse the read when that fails. Neither turns a
+/// saturated count into a wrong answer.
+pub fn element_count(dims: &[u64]) -> u64 {
+    saturating_product(dims.iter().copied())
+}
+
+/// The product of an iterator of dimensions, saturating at [`u64::MAX`].
+fn saturating_product(dims: impl Iterator<Item = u64>) -> u64 {
+    dims.fold(1u64, |total, dim| total.saturating_mul(dim))
+}
+
+/// How many bytes one chunk decodes to.
+///
+/// A chunk shape and an element width both come from the file, so their product
+/// can exceed anything this machine could hold. That is a damaged file rather
+/// than a large one: no chunk of that size was ever written. Say so, instead of
+/// wrapping the width and decoding into a buffer of the wrong size.
+fn decoded_chunk_len(chunk_shape: &[u64], element_size: usize, what: &str) -> Result<usize> {
+    element_count(chunk_shape)
+        .checked_mul(element_size as u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| {
+            Error::malformed(format!(
+                "one chunk of dataset {what} claims more bytes than this reader can hold"
+            ))
+        })
 }
 
 /// Raw values read from a dataset, in native byte order and row-major layout.
@@ -731,13 +768,13 @@ where
     while first > 0 && slab.start[first] == 0 && slab.count[first] == shape[first] {
         first -= 1;
     }
-    let run: u64 = slab.count[first..].iter().product();
+    let run: u64 = element_count(&slab.count[first..]);
     if run == 0 {
         return Ok(());
     }
 
     // Iterate whatever axes remain outside the run.
-    let outer: u64 = slab.count[..first].iter().product();
+    let outer: u64 = element_count(&slab.count[..first]);
     let mut index = vec![0u64; first];
 
     for _ in 0..outer {
@@ -827,10 +864,9 @@ fn read_chunked(
         )));
     }
 
-    let chunk_elements: u64 = chunk_dims.iter().map(|&d| d as u64).product();
-    let decoded_len = chunk_elements as usize * element_size;
     let dst_strides = strides(&slab.count);
     let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+    let decoded_len = decoded_chunk_len(&chunk_shape, element_size, &dataset.path)?;
     let chunk_strides = strides(&chunk_shape);
 
     // Which chunks this read touches. Computing them up front turns the reads
@@ -900,7 +936,7 @@ fn read_chunked(
 
         // Copy the intersection, innermost axis at a time.
         let run = hi[rank - 1] - lo[rank - 1];
-        let outer: u64 = (0..rank - 1).map(|a| hi[a] - lo[a]).product();
+        let outer: u64 = saturating_product((0..rank - 1).map(|a| hi[a] - lo[a]));
         let mut index = vec![0u64; rank.saturating_sub(1)];
 
         for _ in 0..outer.max(if rank == 1 { 1 } else { 0 }) {
@@ -1074,7 +1110,7 @@ pub async fn read_hyperslab_async_with(
                 )));
             }
             let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
-            let decoded_len = chunk_shape.iter().product::<u64>() as usize * element_size;
+            let decoded_len = decoded_chunk_len(&chunk_shape, element_size, &dataset.path)?;
 
             // Which chunks this read touches.
             let needed: Vec<usize> = chunks
@@ -1239,7 +1275,7 @@ fn copy_chunk(
     }
 
     let run = hi[rank - 1] - lo[rank - 1];
-    let outer: u64 = (0..rank - 1).map(|a| hi[a] - lo[a]).product();
+    let outer: u64 = saturating_product((0..rank - 1).map(|a| hi[a] - lo[a]));
     let mut index = vec![0u64; rank.saturating_sub(1)];
 
     for _ in 0..outer.max(if rank == 1 { 1 } else { 0 }) {
@@ -1464,6 +1500,40 @@ mod tests {
         assert_eq!(out, decoded);
     }
 
+    /// A shape whose product runs past `u64` must not wrap into a small,
+    /// believable number, and must not panic. It says "more than anything can
+    /// hold" instead, and the byte count built from it then refuses the read.
+    #[test]
+    fn a_shape_that_multiplies_past_u64_saturates() {
+        assert_eq!(element_count(&[u64::MAX, u64::MAX]), u64::MAX);
+        assert_eq!(element_count(&[1 << 40, 1 << 40, 1 << 40]), u64::MAX);
+        assert_eq!(element_count(&[3, 4, 5]), 60);
+        assert_eq!(element_count(&[]), 1);
+    }
+
+    /// A zero anywhere in the shape means no elements, even next to a
+    /// dimension that saturates on its own.
+    #[test]
+    fn a_zero_dimension_still_gives_an_empty_shape() {
+        assert_eq!(element_count(&[u64::MAX, u64::MAX, 0]), 0);
+        assert_eq!(element_count(&[0, u64::MAX]), 0);
+    }
+
+    #[test]
+    fn a_selection_that_multiplies_past_u64_is_refused_not_wrapped() {
+        let slab = slab(&[0, 0], &[u64::MAX, u64::MAX]);
+        assert_eq!(slab.element_count(), u64::MAX);
+        // Which is what `read_hyperslab` turns into a refusal.
+        assert!(slab.element_count().checked_mul(4).is_none());
+    }
+
+    #[test]
+    fn a_chunk_too_large_to_hold_is_reported_not_wrapped() {
+        let err = decoded_chunk_len(&[u64::MAX, 8], 4, "/x").unwrap_err();
+        assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
+        assert_eq!(decoded_chunk_len(&[4, 4], 4, "/x").unwrap(), 64);
+    }
+
     #[test]
     fn an_empty_selection_needs_no_fill() {
         assert!(chunks_cover(&[], &[4, 4], &slab(&[0, 0], &[0, 4]), 2));
@@ -1503,7 +1573,7 @@ pub struct Chunk {
 impl Chunk {
     /// Number of elements this chunk contributes.
     pub fn element_count(&self) -> u64 {
-        self.shape.iter().product()
+        element_count(&self.shape)
     }
 
     /// The selection this chunk covers.
@@ -1533,7 +1603,9 @@ pub fn chunks_of(dataset: &DatasetIndex) -> Result<Vec<Chunk>> {
         return Ok(vec![Chunk {
             offset: vec![0; shape.len()],
             shape: shape.clone(),
-            stored_size: dataset.element_count() * dataset.element_size() as u64,
+            stored_size: dataset
+                .element_count()
+                .saturating_mul(dataset.element_size() as u64),
         }]);
     };
 

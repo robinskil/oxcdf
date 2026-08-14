@@ -216,7 +216,7 @@ pub struct DatasetIndex {
 impl DatasetIndex {
     /// Number of elements in the whole dataset.
     pub fn element_count(&self) -> u64 {
-        self.shape.iter().product()
+        crate::read::element_count(&self.shape)
     }
 
     /// Width of one element in bytes.

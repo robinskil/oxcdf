@@ -1196,9 +1196,12 @@ impl Values {
 #[cfg_attr(docsrs, doc(cfg(feature = "ndarray")))]
 fn shape_into_array<T>(shape: &[u64], values: Vec<T>) -> Result<ndarray::ArrayD<T>> {
     let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    // Saturating, because the shape comes from the file. The count is only
+    // compared against the values actually read, so a shape that multiplies
+    // past `usize` simply fails to match and is reported.
     let expected: usize = dims
         .iter()
-        .product::<usize>()
+        .fold(1usize, |total, &dim| total.saturating_mul(dim))
         .max(if dims.is_empty() { 1 } else { 0 });
     if values.len() != expected {
         return Err(Error::malformed(format!(
@@ -1285,7 +1288,7 @@ impl<'a> Variable<'a> {
 
     /// Total number of elements. This matches `netcdf::Variable::len`.
     pub fn len(&self) -> u64 {
-        self.info.shape.iter().product()
+        oxcdf_hdf5::read::element_count(&self.info.shape)
     }
 
     /// Whether the variable holds no elements.

@@ -276,7 +276,7 @@ impl<'a> AsyncVariable<'a> {
 
     /// Total number of elements. This matches `netcdf::Variable::len`.
     pub fn len(&self) -> u64 {
-        self.info.shape.iter().product()
+        oxcdf_hdf5::read::element_count(&self.info.shape)
     }
 
     /// Whether the variable holds no elements.

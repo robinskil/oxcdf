@@ -207,7 +207,7 @@ pub struct ClassicVariable {
 impl ClassicVariable {
     /// Total number of elements.
     pub fn element_count(&self) -> u64 {
-        self.shape.iter().product()
+        oxcdf_hdf5::read::element_count(&self.shape)
     }
 
     /// An attribute by name.
@@ -356,7 +356,7 @@ impl ClassicFile {
         }
 
         let run = slab.count[rank - 1];
-        let outer: u64 = slab.count[..rank - 1].iter().product();
+        let outer: u64 = oxcdf_hdf5::read::element_count(&slab.count[..rank - 1]);
         let mut index = vec![0u64; rank - 1];
 
         for _ in 0..outer.max(if rank == 1 { 1 } else { 0 }) {
@@ -407,7 +407,7 @@ impl ClassicFile {
         let inner_outer: u64 = if inner_rank <= 1 {
             1
         } else {
-            slab.count[1..rank - 1].iter().product()
+            oxcdf_hdf5::read::element_count(&slab.count[1..rank - 1])
         };
 
         for record in 0..slab.count[0] {
@@ -608,8 +608,8 @@ impl Header {
 
                 // One record's worth of this variable, padded to four bytes.
                 let per_record: u64 = if is_record {
-                    let inner: u64 = shape[1..].iter().product();
-                    pad4(inner * nc_type.size() as u64)
+                    let inner: u64 = oxcdf_hdf5::read::element_count(&shape[1..]);
+                    pad4(inner.saturating_mul(nc_type.size() as u64))
                 } else {
                     0
                 };
@@ -638,8 +638,8 @@ impl Header {
         let record_vars: Vec<&ClassicVariable> = variables.iter().filter(|v| v.is_record).collect();
         let record_stride = if record_vars.len() == 1 {
             let v = record_vars[0];
-            let inner: u64 = v.shape[1..].iter().product();
-            inner * v.nc_type.size() as u64
+            let inner: u64 = oxcdf_hdf5::read::element_count(&v.shape[1..]);
+            inner.saturating_mul(v.nc_type.size() as u64)
         } else {
             record_vars.iter().map(|v| v.record_size).sum()
         };
