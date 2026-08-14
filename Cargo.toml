@@ -8,14 +8,14 @@ resolver = "2"
 # Both crates ship together and share a version. `oxcdf` depends on the exact
 # `oxcdf-hdf5` beside it, so the two never drift.
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.91"
 repository = "https://github.com/robinskil/oxcdf"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-oxcdf-hdf5 = { path = "crates/oxcdf-hdf5", version = "0.2.0" }
+oxcdf-hdf5 = { path = "crates/oxcdf-hdf5", version = "0.3.0" }
 
 thiserror = "2.0.12"
 # Pure-Rust inflate. Never turn on the C zlib backends.

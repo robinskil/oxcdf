@@ -16,7 +16,7 @@ The API matches the `netcdf` crate. A program moves across with few changes.
 
 ```toml
 [dependencies]
-oxcdf = { version = "0.2", features = ["async", "object-store"] }
+oxcdf = { version = "0.3", features = ["async", "object-store"] }
 ```
 
 | Feature | Purpose |
