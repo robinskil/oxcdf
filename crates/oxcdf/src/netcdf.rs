@@ -19,6 +19,16 @@
 //!
 //! A reader that breaks the first two rules reports dimensions as variables.
 //! This module exists to prevent that.
+//!
+//! # Files that follow none of it
+//!
+//! An instrument writes HDF5 directly. Such a file nests groups several levels
+//! and holds no dimension scale at all, so none of the rules above name a
+//! single axis.
+//!
+//! netCDF still needs a dimension for every axis, so it invents one and calls
+//! it `phony_dim_N`. This module follows netcdf-c's rules for that, so
+//! [`NcGroup::dimensions`] agrees with `ncdump`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -226,10 +236,19 @@ pub struct NcDimension {
     pub len: u64,
     /// Whether the dimension can grow.
     pub is_unlimited: bool,
-    /// The netCDF dimension id, from `_Netcdf4Dimid`.
+    /// The netCDF dimension id.
+    ///
+    /// Taken from `_Netcdf4Dimid`. A file that records none, such as a plain
+    /// HDF5 file, gets ids in read order instead. A phony dimension gets the
+    /// number in its name. `None` only for a classic file, which stores no id.
     pub id: Option<i64>,
     /// Whether a variable of the same name shares this dimension.
     pub has_coordinate_variable: bool,
+    /// Whether this reader invented the dimension because the file names none.
+    ///
+    /// A plain HDF5 file has no dimension scales, so every axis lands here. The
+    /// name is then `phony_dim_N`, as `ncdump` reports it.
+    pub is_phony: bool,
 }
 
 /// One netCDF variable.
@@ -396,9 +415,10 @@ impl NetcdfFile {
         // Dimension scales are referenced by object header address from
         // anywhere in the file, so the scan has to cover the whole tree before
         // any variable can resolve its axes.
-        let scales = collect_dimension_scales(&hdf5)?;
+        let (scales, first_free_id) = collect_dimension_scales(&hdf5)?;
         let mut heaps = HeapCache::default();
-        let root = build_group(&hdf5, hdf5.root(), &scales, &mut heaps)?;
+        let mut phony = PhonyDims::new(first_free_id);
+        let root = build_group(&hdf5, hdf5.root(), &scales, &mut heaps, &mut phony)?;
         Ok(Self {
             backend: Backend::Hdf5(hdf5),
             root,
@@ -419,6 +439,7 @@ impl NetcdfFile {
                 // Classic files list dimensions in order and store no id.
                 id: None,
                 has_coordinate_variable: classic.variables.iter().any(|v| v.name == d.name),
+                is_phony: false,
             })
             .collect();
 
@@ -517,7 +538,9 @@ struct DimensionScale {
     name: String,
     len: u64,
     is_unlimited: bool,
-    id: Option<i64>,
+    /// The dimension id. Taken from `_Netcdf4Dimid`, or handed out in read
+    /// order when the file records none.
+    id: i64,
     /// False when `NAME` marks it a dimension with no coordinate variable.
     is_variable: bool,
 }
@@ -526,8 +549,15 @@ struct DimensionScale {
 ///
 /// The address is the key because `DIMENSION_LIST` references point at object
 /// headers, not at names.
-fn collect_dimension_scales(hdf5: &Hdf5File) -> Result<HashMap<u64, DimensionScale>> {
+///
+/// Also returns the first dimension id no scale has taken. netCDF numbers every
+/// dimension it reads before it invents any, so that is where the invented ones
+/// start. A file written by netcdf-c records the number in `_Netcdf4Dimid`; a
+/// plain HDF5 file records none, so the reader hands them out in the order
+/// netCDF would.
+fn collect_dimension_scales(hdf5: &Hdf5File) -> Result<(HashMap<u64, DimensionScale>, i64)> {
     let mut out = HashMap::new();
+    let mut next_id = 0i64;
 
     for dataset in hdf5.datasets() {
         let Some(class) = dataset.attribute("CLASS") else {
@@ -544,10 +574,21 @@ fn collect_dimension_scales(hdf5: &Hdf5File) -> Result<HashMap<u64, DimensionSca
             .as_deref()
             .is_some_and(|n| n.starts_with(PHANTOM_DIMENSION_PREFIX));
 
-        let id = dataset
+        let id = match dataset
             .attribute("_Netcdf4Dimid")
             .and_then(|a| decode_ints(a).ok())
-            .and_then(|v| v.first().copied());
+            .and_then(|v| v.first().copied())
+        {
+            Some(id) => {
+                next_id = next_id.max(id.saturating_add(1));
+                id
+            }
+            None => {
+                let id = next_id;
+                next_id += 1;
+                id
+            }
+        };
 
         let len = dataset.shape.first().copied().unwrap_or(1);
         let is_unlimited = dataset
@@ -568,7 +609,7 @@ fn collect_dimension_scales(hdf5: &Hdf5File) -> Result<HashMap<u64, DimensionSca
         );
     }
 
-    Ok(out)
+    Ok((out, next_id))
 }
 
 /// Global heap collections already read, keyed by address.
@@ -590,50 +631,133 @@ impl HeapCache {
     }
 }
 
+/// Dimensions for the axes that no dimension scale covers.
+///
+/// A plain HDF5 file names no dimension. netCDF still needs one for each axis,
+/// so it invents `phony_dim_N`. The number is a counter over the whole file,
+/// which is why this state outlives any one group.
+///
+/// The rules below match netcdf-c, so `dimensions()` agrees with `ncdump`.
+struct PhonyDims {
+    next: i64,
+}
+
+impl PhonyDims {
+    /// Start at the first id no named dimension has taken, so an invented
+    /// number never collides with one the file already uses.
+    fn new(first_free_id: i64) -> Self {
+        Self {
+            next: first_free_id,
+        }
+    }
+
+    /// The dimension name for one axis of one variable.
+    ///
+    /// `taken` holds the names already given to earlier axes of the same
+    /// variable. netCDF never puts one dimension on two axes of one variable,
+    /// so those are out of reach here.
+    fn resolve(
+        &mut self,
+        dimensions: &mut Vec<NcDimension>,
+        taken: &[String],
+        len: u64,
+        is_unlimited: bool,
+    ) -> String {
+        // Any dimension of the group serves, invented or named, as long as the
+        // length and the growth match.
+        let existing = dimensions
+            .iter()
+            .find(|d| d.len == len && d.is_unlimited == is_unlimited && !taken.contains(&d.name));
+        if let Some(d) = existing {
+            return d.name.clone();
+        }
+
+        let name = format!("phony_dim_{}", self.next);
+        dimensions.push(NcDimension {
+            name: name.clone(),
+            len,
+            // netCDF has no fixed dimension of length zero. An empty axis
+            // becomes an unlimited dimension instead, and so never matches a
+            // later empty axis, which stays fixed. Each one gets its own.
+            is_unlimited: is_unlimited || len == 0,
+            id: Some(self.next),
+            has_coordinate_variable: false,
+            is_phony: true,
+        });
+        self.next += 1;
+        name
+    }
+}
+
 /// Turn one HDF5 group into a netCDF group.
 fn build_group(
     hdf5: &Hdf5File,
     group: &GroupIndex,
     scales: &HashMap<u64, DimensionScale>,
     heaps: &mut HeapCache,
+    phony: &mut PhonyDims,
 ) -> Result<NcGroup> {
-    let mut dimensions = Vec::new();
-    let mut variables = Vec::new();
+    // netcdf-c matches axes to dimensions depth first, and reaches a group's
+    // own variables only after every child group. The phony numbers follow that
+    // walk, so this walk takes the same order.
+    let mut groups = Vec::new();
+    for child in &group.groups {
+        groups.push(build_group(hdf5, child, scales, heaps, phony)?);
+    }
 
-    for dataset in &group.datasets {
+    // netCDF walks a group's links by name, and numbers the dimensions it
+    // invents along that walk. Take the same order, so the numbers are stable
+    // rather than an artefact of how the file happens to store its links.
+    //
+    // A group that records the creation order of its links is walked in that
+    // order instead. Only netcdf-c writes one, and those files name every
+    // dimension, so nothing here is invented for them anyway.
+    let mut by_name: Vec<(usize, &DatasetIndex)> = group.datasets.iter().enumerate().collect();
+    by_name.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
+
+    // Collect the named dimensions before any variable resolves an axis. An
+    // axis with no dimension scale of its own may still land on one of these.
+    let mut dimensions: Vec<NcDimension> = by_name
+        .iter()
+        .filter_map(|(_, d)| scales.get(&d.address))
+        .map(|scale| NcDimension {
+            name: scale.name.clone(),
+            len: scale.len,
+            is_unlimited: scale.is_unlimited,
+            id: Some(scale.id),
+            has_coordinate_variable: scale.is_variable,
+            is_phony: false,
+        })
+        .collect();
+
+    let mut built = Vec::new();
+    for (position, dataset) in by_name {
         let scale = scales.get(&dataset.address);
 
-        if let Some(scale) = scale {
-            dimensions.push(NcDimension {
-                name: scale.name.clone(),
-                len: scale.len,
-                is_unlimited: scale.is_unlimited,
-                id: scale.id,
-                has_coordinate_variable: scale.is_variable,
-            });
-
-            // A dimension with no coordinate variable is not a netCDF variable.
-            if !scale.is_variable {
-                continue;
-            }
+        // A dimension with no coordinate variable is not a netCDF variable.
+        if scale.is_some_and(|s| !s.is_variable) {
+            continue;
         }
 
-        variables.push(build_variable(
+        let variable = build_variable(
             hdf5,
             dataset,
             scales,
             heaps,
             scale.is_some(),
-        )?);
+            &mut dimensions,
+            phony,
+        )?;
+        built.push((position, variable));
     }
+
+    // Report the variables in the order the file stores them, which is the
+    // order netCDF defined them in. Only the numbering above needed names.
+    built.sort_by_key(|(position, _)| *position);
+    let variables: Vec<NcVariable> = built.into_iter().map(|(_, v)| v).collect();
 
     // netCDF reports dimensions in id order where ids exist.
     dimensions.sort_by_key(|d| (d.id.unwrap_or(i64::MAX), d.name.clone()));
-
-    let mut groups = Vec::new();
-    for child in &group.groups {
-        groups.push(build_group(hdf5, child, scales, heaps)?);
-    }
 
     Ok(NcGroup {
         name: group.name.clone(),
@@ -646,14 +770,28 @@ fn build_group(
 }
 
 /// Turn one HDF5 dataset into a netCDF variable.
+///
+/// `group_dimensions` is the group's dimension list. An axis this reader has to
+/// invent a dimension for appends to it.
+#[allow(clippy::too_many_arguments)]
 fn build_variable(
     hdf5: &Hdf5File,
     dataset: &DatasetIndex,
     scales: &HashMap<u64, DimensionScale>,
     heaps: &mut HeapCache,
     is_coordinate: bool,
+    group_dimensions: &mut Vec<NcDimension>,
+    phony: &mut PhonyDims,
 ) -> Result<NcVariable> {
-    let dimensions = resolve_dimensions(hdf5, dataset, scales, heaps, is_coordinate)?;
+    let dimensions = resolve_dimensions(
+        hdf5,
+        dataset,
+        scales,
+        heaps,
+        is_coordinate,
+        group_dimensions,
+        phony,
+    )?;
 
     Ok(NcVariable {
         name: dataset.name.clone(),
@@ -667,12 +805,18 @@ fn build_variable(
 }
 
 /// Work out the dimension name for each axis of a variable.
+///
+/// Each convention fills the axes it can. An axis no convention names gets an
+/// invented dimension, which is appended to `group_dimensions`.
+#[allow(clippy::too_many_arguments)]
 fn resolve_dimensions(
     hdf5: &Hdf5File,
     dataset: &DatasetIndex,
     scales: &HashMap<u64, DimensionScale>,
     heaps: &mut HeapCache,
     is_coordinate: bool,
+    group_dimensions: &mut Vec<NcDimension>,
+    phony: &mut PhonyDims,
 ) -> Result<Vec<String>> {
     let rank = dataset.shape.len();
     if rank == 0 {
@@ -684,30 +828,69 @@ fn resolve_dimensions(
         return Ok(vec![dataset.name.clone()]);
     }
 
+    // One slot per axis, filled by whichever convention names it.
+    let mut named: Vec<Option<String>> = vec![None; rank];
+
     if let Some(attr) = dataset.attribute("DIMENSION_LIST") {
-        if let Some(names) = resolve_from_dimension_list(hdf5, attr, scales, heaps, rank)? {
-            return Ok(names);
-        }
+        resolve_from_dimension_list(hdf5, attr, scales, heaps, &mut named)?;
     }
 
     // Fall back to the dimension ids, which netcdf-c writes for the cases where
     // a reference list alone would be ambiguous.
-    if let Some(attr) = dataset.attribute("_Netcdf4Coordinates") {
-        if let Ok(ids) = decode_ints(attr) {
-            if ids.len() == rank {
-                let by_id: HashMap<i64, &DimensionScale> = scales
-                    .values()
-                    .filter_map(|s| s.id.map(|id| (id, s)))
-                    .collect();
-                if ids.iter().all(|id| by_id.contains_key(id)) {
-                    return Ok(ids.iter().map(|id| by_id[id].name.clone()).collect());
-                }
-            }
+    if named.iter().any(Option::is_none) {
+        if let Some(attr) = dataset.attribute("_Netcdf4Coordinates") {
+            resolve_from_coordinates(attr, scales, &mut named);
         }
     }
 
-    // Nothing resolved. Generate placeholder names rather than invent real ones.
-    Ok((0..rank).map(|i| format!("phony_dim_{i}")).collect())
+    // An axis still unnamed has no dimension in the file. netCDF invents one
+    // rather than leave the axis anonymous.
+    let mut out: Vec<String> = Vec::with_capacity(rank);
+    for (axis, slot) in named.into_iter().enumerate() {
+        let name = match slot {
+            Some(name) => name,
+            None => {
+                let len = dataset.shape[axis];
+                let is_unlimited = dataset
+                    .max_shape
+                    .as_ref()
+                    .and_then(|m| m.get(axis).copied())
+                    .is_some_and(|m| m == u64::MAX);
+                // `out` holds the names the earlier axes took, which this axis
+                // may not reuse.
+                phony.resolve(group_dimensions, &out, len, is_unlimited)
+            }
+        };
+        out.push(name);
+    }
+
+    Ok(out)
+}
+
+/// Name every axis from `_Netcdf4Coordinates`, which lists one dimension id per
+/// axis. It names all the axes or none: a partial list settles nothing.
+fn resolve_from_coordinates(
+    attr: &Attribute,
+    scales: &HashMap<u64, DimensionScale>,
+    named: &mut [Option<String>],
+) {
+    let Ok(ids) = decode_ints(attr) else {
+        return;
+    };
+    if ids.len() != named.len() {
+        return;
+    }
+
+    let by_id: HashMap<i64, &DimensionScale> = scales.values().map(|s| (s.id, s)).collect();
+    if !ids.iter().all(|id| by_id.contains_key(id)) {
+        return;
+    }
+
+    for (slot, id) in named.iter_mut().zip(ids) {
+        if slot.is_none() {
+            *slot = Some(by_id[&id].name.clone());
+        }
+    }
 }
 
 /// Follow a `DIMENSION_LIST` attribute to one dimension name per axis.
@@ -715,54 +898,57 @@ fn resolve_dimensions(
 /// The attribute holds one variable-length sequence per axis. Each sequence
 /// holds object references to the dimension scales for that axis; netCDF uses
 /// the first.
+///
+/// An axis whose sequence is empty or unreadable keeps its slot empty. HDF5
+/// attaches scales one axis at a time, so a file may name some axes and not
+/// others. The caller invents a dimension for what is left.
 fn resolve_from_dimension_list(
     hdf5: &Hdf5File,
     attr: &Attribute,
     scales: &HashMap<u64, DimensionScale>,
     heaps: &mut HeapCache,
-    rank: usize,
-) -> Result<Option<Vec<String>>> {
+    named: &mut [Option<String>],
+) -> Result<()> {
     let DatatypeClass::VariableLength { .. } = attr.datatype.class else {
-        return Ok(None);
+        return Ok(());
     };
 
     let sizes = hdf5.superblock().sizes;
     let descriptor_len = VlenDescriptor::encoded_len(sizes);
-    if attr.data.len() < rank * descriptor_len {
-        return Ok(None);
+    if attr.data.len() < named.len() * descriptor_len {
+        return Ok(());
     }
 
-    let mut names = Vec::with_capacity(rank);
-    for axis in 0..rank {
+    for (axis, slot) in named.iter_mut().enumerate() {
         let start = axis * descriptor_len;
         let descriptor = VlenDescriptor::parse(&attr.data[start..start + descriptor_len], sizes)?;
 
+        // An axis with no scale attached.
         if descriptor.length == 0 {
-            return Ok(None);
+            continue;
         }
 
         let heap = heaps.get(hdf5, descriptor.collection_address)?;
         let Some(object) = heap.object(descriptor.object_index as u16) else {
-            return Ok(None);
+            continue;
         };
 
         // An object reference is the address of the target's object header.
         let width = sizes.offset as usize;
         if object.data.len() < width {
-            return Ok(None);
+            continue;
         }
         let mut address = 0u64;
         for (i, byte) in object.data[..width].iter().enumerate() {
             address |= (*byte as u64) << (8 * i);
         }
 
-        match scales.get(&address) {
-            Some(scale) => names.push(scale.name.clone()),
-            None => return Ok(None),
+        if let Some(scale) = scales.get(&address) {
+            *slot = Some(scale.name.clone());
         }
     }
 
-    Ok(Some(names))
+    Ok(())
 }
 
 /// Decode a classic file's attributes.
@@ -920,6 +1106,27 @@ fn needs_swap(attr: &Attribute) -> bool {
     )
 }
 
+/// How many elements an attribute holds.
+///
+/// The dataspace is the authority, not the buffer. A version 1 attribute
+/// message pads its value to an 8-byte boundary, and the parser keeps
+/// everything the message framing leaves, so the buffer alone turns a scalar
+/// `int` into two values and a scalar `float` into two.
+///
+/// The buffer still bounds the count, so a truncated value yields what is there
+/// rather than a read past the end.
+fn attribute_element_count(attr: &Attribute) -> usize {
+    let size = attr.datatype.size as usize;
+    if size == 0 {
+        return 0;
+    }
+    let available = attr.data.len() / size;
+    match usize::try_from(attr.element_count()) {
+        Ok(declared) => declared.min(available),
+        Err(_) => available,
+    }
+}
+
 /// Take one element's bytes, in native order.
 fn element(attr: &Attribute, index: usize) -> Option<Vec<u8>> {
     let size = attr.datatype.size as usize;
@@ -948,7 +1155,7 @@ fn decode_all_text(attr: &Attribute) -> Option<Vec<String>> {
         return Some(vec![String::new()]);
     }
 
-    let count = (attr.data.len() / size).max(1);
+    let count = attribute_element_count(attr).max(1);
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let start = i * size;
@@ -978,7 +1185,7 @@ fn decode_all_text(attr: &Attribute) -> Option<Vec<String>> {
 /// Decode a floating-point attribute.
 fn decode_floats(attr: &Attribute) -> Result<Vec<f64>> {
     let size = attr.datatype.size as usize;
-    let count = attr.data.len() / size.max(1);
+    let count = attribute_element_count(attr);
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let bytes = element(attr, i)
@@ -1002,7 +1209,7 @@ fn decode_ints(attr: &Attribute) -> Result<Vec<i64>> {
         return Err(Error::unsupported(format!("{size}-byte integer attribute")));
     }
 
-    let count = attr.data.len() / size;
+    let count = attribute_element_count(attr);
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let bytes = element(attr, i)
@@ -1024,24 +1231,134 @@ fn decode_ints(attr: &Attribute) -> Result<Vec<i64>> {
 mod tests {
     use super::*;
 
-    /// The legacy fixture is plain HDF5, not netCDF, so it has no dimension
-    /// scales. Every dataset should therefore be a variable with generated axis
-    /// names, and nothing should be reported as a dimension.
+    /// A scalar attribute holds one value, whatever the message pads its value
+    /// bytes to.
+    ///
+    /// A version 1 attribute message rounds the value up to an 8-byte boundary,
+    /// and the parser keeps everything the framing leaves. Dividing that buffer
+    /// by the datatype size reported two values for a scalar `int` and two for
+    /// a scalar `float`. The dataspace is the authority.
     #[test]
-    fn plain_hdf5_has_no_dimensions_and_all_datasets_are_variables() {
+    fn a_scalar_attribute_decodes_to_one_value() {
+        use oxcdf_hdf5::message::{Dataspace, DataspaceKind, Datatype};
+
+        let scalar = |datatype: Datatype, data: Vec<u8>| Attribute {
+            name: "level".to_string(),
+            datatype,
+            dataspace: Dataspace {
+                kind: DataspaceKind::Scalar,
+                dims: Vec::new(),
+                max_dims: None,
+            },
+            data,
+        };
+
+        // Four bytes of value, padded to eight.
+        let mut padded = 1i32.to_le_bytes().to_vec();
+        padded.extend_from_slice(&[0; 4]);
+
+        let int = scalar(int_datatype(4, true), padded.clone());
+        assert_eq!(decode_ints(&int).unwrap(), vec![1]);
+        assert_eq!(decode_value(None, "/outer", &int), AttributeValue::Int(1));
+
+        let float = scalar(float_datatype(4), 1.5f32.to_le_bytes().to_vec());
+        assert_eq!(
+            decode_value(None, "/outer", &float),
+            AttributeValue::Float(1.5)
+        );
+
+        // A real list still folds to the plural variant.
+        let pair = Attribute {
+            dataspace: Dataspace {
+                kind: DataspaceKind::Simple,
+                dims: vec![2],
+                max_dims: None,
+            },
+            ..scalar(int_datatype(4, true), padded)
+        };
+        assert_eq!(decode_ints(&pair).unwrap(), vec![1, 0]);
+    }
+
+    /// A fixed-point datatype of `size` bytes, for the test above.
+    fn int_datatype(size: u32, signed: bool) -> oxcdf_hdf5::message::Datatype {
+        use oxcdf_hdf5::message::{ByteOrder, Datatype, DatatypeClass};
+        Datatype {
+            version: 1,
+            size,
+            class: DatatypeClass::FixedPoint {
+                order: ByteOrder::Little,
+                signed,
+                bit_offset: 0,
+                bit_precision: (size * 8) as u16,
+            },
+        }
+    }
+
+    /// A floating-point datatype of `size` bytes, for the tests above.
+    fn float_datatype(size: u32) -> oxcdf_hdf5::message::Datatype {
+        use oxcdf_hdf5::message::{ByteOrder, Datatype, DatatypeClass};
+        Datatype {
+            version: 1,
+            size,
+            class: DatatypeClass::FloatingPoint {
+                order: ByteOrder::Little,
+                bit_offset: 0,
+                bit_precision: (size * 8) as u16,
+                exponent_location: 23,
+                exponent_size: 8,
+                mantissa_location: 0,
+                mantissa_size: 23,
+                exponent_bias: 127,
+                sign_location: 31,
+            },
+        }
+    }
+
+    /// The legacy fixture is plain HDF5, not netCDF, so it has no dimension
+    /// scales. Every dataset is therefore a variable, and every axis gets an
+    /// invented dimension named the way `ncdump` names it.
+    #[test]
+    fn plain_hdf5_gets_phony_dimensions_and_every_dataset_is_a_variable() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../test_files/legacy_v1_objheader.h5"
         );
         let file = NetcdfFile::open(path).unwrap();
 
-        assert!(file.root().dimensions.is_empty());
         assert_eq!(file.variables().len(), 5);
+
+        // The numbers match `ncdump`. The child group is walked first, so it
+        // takes `phony_dim_0` and the root starts at one.
+        let root: Vec<(&str, u64)> = file
+            .dimensions()
+            .iter()
+            .map(|d| (d.name.as_str(), d.len))
+            .collect();
+        assert_eq!(
+            root,
+            vec![("phony_dim_1", 40), ("phony_dim_2", 6), ("phony_dim_3", 5)]
+        );
+        assert!(file.dimensions().iter().all(|d| d.is_phony));
+
+        let nested = file.group("/subgroup").unwrap();
+        assert_eq!(nested.dimensions.len(), 1);
+        assert_eq!(nested.dimensions[0].name, "phony_dim_0");
+        assert_eq!(nested.dimensions[0].len, 6);
 
         let v = file.variable("/contig_f64").unwrap();
         assert_eq!(v.shape, vec![40, 6]);
-        assert_eq!(v.dimensions, vec!["phony_dim_0", "phony_dim_1"]);
+        assert_eq!(v.dimensions, vec!["phony_dim_1", "phony_dim_2"]);
         assert!(!v.is_coordinate);
+
+        // One dimension serves every axis of that length in its own group.
+        let c = file.variable("/chunked_i32").unwrap();
+        assert_eq!(c.dimensions, vec!["phony_dim_1", "phony_dim_2"]);
+        let f = file.variable("/contig_f32be").unwrap();
+        assert_eq!(f.dimensions, vec!["phony_dim_1"]);
+
+        // A child group has its own dimensions. The root's 6 does not reach it.
+        let n = file.variable("/subgroup/nested_i16").unwrap();
+        assert_eq!(n.dimensions, vec!["phony_dim_0"]);
     }
 
     #[test]

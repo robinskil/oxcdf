@@ -4,10 +4,15 @@
 //! variable's declared axes. Together they are what catches the mistake this
 //! layer exists to prevent: reporting a dimension as if it were a variable, or
 //! attaching the wrong axes to a variable.
+//!
+//! Every name here is a full path, so a nested group is compared the same way
+//! the root group is. A plain HDF5 file names no dimension, so `ncdump` invents
+//! one for each axis and calls it `phony_dim_N`. This layer must invent the
+//! same ones, with the same numbers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use oxcdf::netcdf::NetcdfFile;
+use oxcdf::netcdf::{NcGroup, NetcdfFile};
 
 fn corpus() -> Vec<(&'static str, String)> {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_files");
@@ -15,6 +20,10 @@ fn corpus() -> Vec<(&'static str, String)> {
         ("test_file.nc", "test_file.nc"),
         ("gridded-example.nc", "gridded-example.nc"),
         ("wod_ctd_1964.nc", "wod_ctd_1964.nc"),
+        // Plain HDF5, so every dimension below is invented.
+        ("nested_groups.h5", "nested_groups.h5"),
+        ("legacy_v1_objheader.h5", "legacy_v1_objheader.h5"),
+        ("latest_v4_layout.h5", "latest_v4_layout.h5"),
     ]
     .iter()
     .map(|(name, p)| (*name, format!("{root}/{p}")))
@@ -28,9 +37,22 @@ fn have_ncdump() -> bool {
 }
 
 struct NcDump {
+    /// Dimension path to its current length.
     dimensions: BTreeMap<String, u64>,
-    /// Variable name to its declared dimension names.
+    /// Variable path to its declared dimension names.
     variables: BTreeMap<String, Vec<String>>,
+}
+
+/// Join a group path and a name the way this layer writes a path, with no
+/// leading slash: `outer/inner/six`.
+fn join(group: &[String], name: &str) -> String {
+    let mut path = String::new();
+    for part in group {
+        path.push_str(part);
+        path.push('/');
+    }
+    path.push_str(name);
+    path
 }
 
 /// Parse the header `ncdump -h` prints.
@@ -48,9 +70,28 @@ fn ncdump(path: &str) -> Option<NcDump> {
     let mut dimensions = BTreeMap::new();
     let mut variables = BTreeMap::new();
     let mut section = "";
+    // The groups open around the current line, outermost first.
+    let mut group: Vec<String> = Vec::new();
 
     for line in text.lines() {
         let t = line.trim();
+
+        // `group: header {` opens one. A bare `}` closes whatever is open; a
+        // `};` closes a compound type declaration instead, which nests inside a
+        // group and must not pop it.
+        if let Some(rest) = t.strip_prefix("group:") {
+            if let Some(name) = rest.split_whitespace().next() {
+                group.push(name.to_string());
+                section = "";
+                continue;
+            }
+        }
+        if t.starts_with('}') && !t.starts_with("};") {
+            group.pop();
+            section = "";
+            continue;
+        }
+
         match t {
             "dimensions:" => {
                 section = "dimensions";
@@ -60,9 +101,14 @@ fn ncdump(path: &str) -> Option<NcDump> {
                 section = "variables";
                 continue;
             }
+            // A group may declare user-defined types before its variables.
+            "types:" => {
+                section = "types";
+                continue;
+            }
             _ => {}
         }
-        if t.starts_with("//") || t == "}" || t == "data:" {
+        if t.starts_with("//") || t == "data:" {
             if t.starts_with("// global") {
                 section = "";
             }
@@ -72,7 +118,7 @@ fn ncdump(path: &str) -> Option<NcDump> {
         if section == "dimensions" {
             // `N_PROF = 8 ;` or `TIME = UNLIMITED ; // (5 currently)`
             if let Some((name, rest)) = t.split_once('=') {
-                let name = name.trim().to_string();
+                let name = name.trim();
                 let value = rest.trim().trim_end_matches(';').trim();
                 let len = if value.starts_with("UNLIMITED") {
                     rest.split_once('(')
@@ -82,29 +128,26 @@ fn ncdump(path: &str) -> Option<NcDump> {
                 } else {
                     value.parse::<u64>().unwrap_or(0)
                 };
-                dimensions.insert(name, len);
+                dimensions.insert(join(&group, name), len);
             }
         } else if section == "variables" {
             // `float TEMP(N_PROF, N_LEVELS) ;` for an array variable, or
-            // `int crs ;` for a scalar one. Attribute lines carry a colon
-            // before any parenthesis.
+            // `int crs ;` for a scalar one. An attribute line carries a `=`.
+            if t.contains('=') {
+                continue;
+            }
+            // `ncdump` escapes a name that is not a plain identifier.
+            let unescape = |s: &str| s.replace('\\', "");
+
             let Some(open) = t.find('(') else {
-                // No parentheses: a scalar declaration, unless it is an
-                // attribute line or a continuation of one.
                 let head = t.trim_end_matches(';').trim();
-                if head.contains(':') || head.contains('=') {
-                    continue;
-                }
                 let parts: Vec<&str> = head.split_whitespace().collect();
                 if parts.len() == 2 {
-                    variables.insert(parts[1].to_string(), Vec::new());
+                    variables.insert(join(&group, &unescape(parts[1])), Vec::new());
                 }
                 continue;
             };
             let head = &t[..open];
-            if head.contains(':') {
-                continue;
-            }
             let Some(name) = head.split_whitespace().nth(1) else {
                 continue;
             };
@@ -116,7 +159,7 @@ fn ncdump(path: &str) -> Option<NcDump> {
                 .map(|d| d.trim().to_string())
                 .filter(|d| !d.is_empty())
                 .collect();
-            variables.insert(name.to_string(), dims);
+            variables.insert(join(&group, &unescape(name)), dims);
         }
     }
 
@@ -124,6 +167,17 @@ fn ncdump(path: &str) -> Option<NcDump> {
         dimensions,
         variables,
     })
+}
+
+/// Every dimension at or below a group, keyed the way `ncdump` names it.
+fn dimensions_recursive(group: &NcGroup, out: &mut BTreeMap<String, u64>) {
+    for d in &group.dimensions {
+        let path = format!("{}/{}", group.path.trim_end_matches('/'), d.name);
+        out.insert(path.trim_start_matches('/').to_string(), d.len);
+    }
+    for child in &group.groups {
+        dimensions_recursive(child, out);
+    }
 }
 
 #[test]
@@ -169,12 +223,8 @@ fn dimension_lists_match_ncdump() {
         };
         let file = NetcdfFile::open(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
 
-        let found: BTreeMap<String, u64> = file
-            .root()
-            .dimensions
-            .iter()
-            .map(|d| (d.name.clone(), d.len))
-            .collect();
+        let mut found = BTreeMap::new();
+        dimensions_recursive(file.root(), &mut found);
 
         assert_eq!(
             found.keys().collect::<Vec<_>>(),
@@ -194,7 +244,8 @@ fn dimension_lists_match_ncdump() {
 }
 
 /// The hardest part of the layer: following `DIMENSION_LIST` through the global
-/// heap to name each axis of each variable.
+/// heap to name each axis of each variable, and inventing a dimension for each
+/// axis the file leaves unnamed.
 #[test]
 fn each_variable_declares_the_same_axes_as_ncdump() {
     if !have_ncdump() {
@@ -260,6 +311,10 @@ fn reads_real_values_through_the_netcdf_layer() {
         let mut read_any = false;
         for variable in file.variables() {
             if !variable.is_readable() || variable.shape.is_empty() {
+                continue;
+            }
+            // An empty axis has nothing to read.
+            if variable.shape.contains(&0) {
                 continue;
             }
             // Read a small corner so the test stays quick on large variables.
