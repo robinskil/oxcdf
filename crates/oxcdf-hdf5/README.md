@@ -13,7 +13,7 @@ conventions on top of this crate and re-exports it.
 
 ```toml
 [dependencies]
-oxcdf-hdf5 = { version = "0.3", features = ["async", "object-store"] }
+oxcdf-hdf5 = { version = "0.4", features = ["async", "object-store"] }
 ```
 
 | Feature | Purpose |
