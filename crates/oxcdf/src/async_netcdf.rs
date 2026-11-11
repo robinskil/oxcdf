@@ -28,7 +28,7 @@ use oxcdf_hdf5::async_source::AsyncByteSource;
 use oxcdf_hdf5::context::Ctx;
 use oxcdf_hdf5::error::{Error, Result};
 use oxcdf_hdf5::index::{DatasetIndex, OpenOptions};
-use oxcdf_hdf5::read::Hyperslab;
+use oxcdf_hdf5::read::{pad_to_selection, Hyperslab, StoredPart};
 
 /// A netCDF file opened over an asynchronous byte source.
 ///
@@ -419,18 +419,30 @@ impl<'a> AsyncVariable<'a> {
             .netcdf
             .hdf5()
             .ok_or_else(|| Error::malformed("an HDF5 variable without an HDF5 file"))?;
+        slab.validate(&self.info.shape)?;
         self.resolve_index().await?;
 
-        let raw = oxcdf_hdf5::read::read_hyperslab_async_with(
-            self.file.source.as_ref(),
-            hdf5.superblock(),
-            hdf5.cache(),
-            hdf5.io_cache(),
-            hdf5.io(),
-            dataset,
-            slab,
-        )
-        .await?;
+        // A short variable on an unlimited dimension reads as fill past its last record.
+        let read = |part: Hyperslab| async move {
+            oxcdf_hdf5::read::read_hyperslab_async_with(
+                self.file.source.as_ref(),
+                hdf5.superblock(),
+                hdf5.cache(),
+                hdf5.io_cache(),
+                hdf5.io(),
+                dataset,
+                &part,
+            )
+            .await
+        };
+        let raw = match oxcdf_hdf5::read::stored_part(dataset, slab)? {
+            StoredPart::All => read(slab.clone()).await?,
+            StoredPart::Some(part) => {
+                let raw = read(part.clone()).await?;
+                pad_to_selection(dataset, slab, Some((&part, raw)))?
+            }
+            StoredPart::None => pad_to_selection(dataset, slab, None)?,
+        };
 
         // A variable-length value stores a pointer into a heap. Follow it.
         //
