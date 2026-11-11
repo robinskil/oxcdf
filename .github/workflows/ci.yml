@@ -143,8 +143,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install netcdf-c
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libnetcdf-dev netcdf-bin
+          # The Azure mirror of the runner is at times unreachable. Use the main archive.
+          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt || true
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y libnetcdf-dev netcdf-bin
       # This is the strongest correctness signal the crate has. It compares
       # every value against the C library the crate replaces.
       - name: compare every value
