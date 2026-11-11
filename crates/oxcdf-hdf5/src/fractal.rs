@@ -5,18 +5,16 @@
 //! *indirect* blocks form a tree over those, with block sizes doubling row by
 //! row after the first two.
 //!
-//! # Why this walks the heap instead of the B-tree
+//! # Why the B-tree comes first
 //!
 //! Dense storage pairs the heap with a version 2 B-tree that maps a name to a
-//! heap ID. That index exists to answer "find the record called X". This reader
-//! wants every record, so it walks the heap directly and skips the B-tree
-//! entirely, which is both simpler and fewer reads.
+//! heap ID. The B-tree lists exactly the live records, so [`crate::dense`]
+//! reads through it when the object has one.
 //!
-//! The cost is that records must be self-delimiting, and a heap with internal
-//! free space would desynchronise the walk. The heap header records how many
-//! managed objects it holds, so the walk is checked against that count and
-//! fails loudly if it disagrees. Under-reporting a group's children silently
-//! would be far worse than an error.
+//! A walk of the heap alone is the fallback. It needs self-delimiting records,
+//! and it is wrong for a heap that lost a record: the freed bytes stay in the
+//! block and still parse as a record. It also cannot reach a huge object, which
+//! the file stores outside the blocks.
 
 use crate::checksum;
 use crate::context::Ctx;
@@ -33,6 +31,16 @@ pub const FHIB_SIGNATURE: &[u8; 4] = b"FHIB";
 /// Heap flag: direct blocks carry a checksum.
 const FLAG_CHECKSUM_DIRECT_BLOCKS: u8 = 0x02;
 
+/// B-tree record type for a huge object that is stored unfiltered and found
+/// through the index.
+const HUGE_INDIRECT_RECORD: u8 = 1;
+
+/// The length of a huge object as a buffer size.
+fn huge_len(length: u64) -> Result<usize> {
+    usize::try_from(length)
+        .map_err(|_| Error::malformed("a huge heap object is larger than this reader can hold"))
+}
+
 /// Guard against a cyclic or absurd block tree.
 const MAX_BLOCKS: usize = 1 << 20;
 
@@ -47,6 +55,8 @@ pub struct FractalHeap {
     heap_id_len: u16,
     /// Width of the offset field inside a heap ID.
     offset_size: usize,
+    /// The version 2 B-tree that locates each huge object, when the heap has one.
+    huge_btree_address: Option<u64>,
 }
 
 impl FractalHeap {
@@ -76,6 +86,7 @@ impl FractalHeap {
             managed_object_count: header.managed_object_count,
             heap_id_len: header.heap_id_len,
             offset_size: header.block_offset_size,
+            huge_btree_address: header.huge_btree_address,
         })
     }
 
@@ -128,6 +139,66 @@ impl FractalHeap {
         )))
     }
 
+    /// Resolve any heap ID to its bytes.
+    ///
+    /// A managed object comes from the loaded blocks. A huge object is too
+    /// large for a block, so the file stores it on its own and this reads it.
+    pub fn object(&self, ctx: Ctx<'_>, heap_id: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+        if heap_id.len() < self.heap_id_len as usize {
+            return Err(Error::malformed(format!(
+                "heap ID is {} bytes but this heap uses {}",
+                heap_id.len(),
+                self.heap_id_len
+            )));
+        }
+        match (heap_id[0] >> 4) & 0x03 {
+            0 => self.get(heap_id).map(std::borrow::Cow::Borrowed),
+            1 => self.huge_object(ctx, heap_id).map(std::borrow::Cow::Owned),
+            kind => Err(Error::unsupported(format!(
+                "fractal heap object of class {kind}"
+            ))),
+        }
+    }
+
+    /// Read a huge object, which the heap ID names directly or through the
+    /// huge-object B-tree.
+    fn huge_object(&self, ctx: Ctx<'_>, heap_id: &[u8]) -> Result<Vec<u8>> {
+        let sizes = ctx.sizes();
+        let (o, l) = (sizes.offset as usize, sizes.length as usize);
+        let body = self.heap_id_len as usize - 1;
+        let mut cur = Cursor::at(heap_id, 1);
+
+        // An ID wide enough holds the address and the length itself.
+        if body >= o + l {
+            let address = cur.uint(sizes.offset)?;
+            let length = cur.uint(sizes.length)?;
+            return ctx.read(address, huge_len(length)?);
+        }
+
+        let id = cur.uint(body.min(l) as u8)?;
+        let btree_address = self.huge_btree_address.ok_or_else(|| {
+            Error::malformed("a heap ID names a huge object but the heap has no huge-object index")
+        })?;
+        let btree = crate::btree2::BtreeV2::read(ctx, btree_address)?;
+        if btree.record_type != HUGE_INDIRECT_RECORD {
+            return Err(Error::unsupported(format!(
+                "huge-object index of record type {}",
+                btree.record_type
+            )));
+        }
+        for record in &btree.records {
+            let mut cur = Cursor::new(record);
+            let address = cur.uint(sizes.offset)?;
+            let length = cur.uint(sizes.length)?;
+            if cur.uint(sizes.length)? == id {
+                return ctx.read(address, huge_len(length)?);
+            }
+        }
+        Err(Error::malformed(format!(
+            "huge object {id} is absent from the huge-object index"
+        )))
+    }
+
     /// Parse every record named by a version 2 B-tree index.
     ///
     /// This is the reliable path for a heap with internal free space, which a
@@ -135,6 +206,7 @@ impl FractalHeap {
     /// a B-tree record, whose layout depends on the record type.
     pub fn walk_indexed<T, F, G>(
         &self,
+        ctx: Ctx<'_>,
         btree: &crate::btree2::BtreeV2,
         mut heap_id_of: G,
         mut parse: F,
@@ -145,8 +217,8 @@ impl FractalHeap {
     {
         let mut out = Vec::with_capacity(btree.records.len());
         for record in &btree.records {
-            let bytes = self.get(heap_id_of(record))?;
-            let mut cur = Cursor::new(bytes);
+            let bytes = self.object(ctx, heap_id_of(record))?;
+            let mut cur = Cursor::new(&bytes);
             out.push(parse(&mut cur)?);
         }
         Ok(out)
@@ -234,6 +306,7 @@ impl FractalHeap {
 struct Header {
     heap_header_address: u64,
     heap_id_len: u16,
+    huge_btree_address: Option<u64>,
     flags: u8,
     io_filter_encoded_len: u16,
     managed_object_count: u64,
@@ -278,7 +351,7 @@ impl Header {
         let _max_managed_object_size = cur.u32()?;
 
         let _next_huge_id = cur.length(sizes)?;
-        let _huge_btree_address = cur.address(sizes)?;
+        let huge_btree_address = cur.address(sizes)?;
         let _free_space = cur.length(sizes)?;
         let _free_space_manager = cur.address(sizes)?;
         let _managed_space = cur.length(sizes)?;
@@ -324,6 +397,7 @@ impl Header {
         Ok(Self {
             heap_header_address: address,
             heap_id_len,
+            huge_btree_address,
             flags,
             io_filter_encoded_len,
             managed_object_count,
@@ -566,6 +640,7 @@ mod tests {
         let h = Header {
             heap_header_address: 0,
             heap_id_len: 8,
+            huge_btree_address: None,
             flags: 0,
             io_filter_encoded_len: 0,
             managed_object_count: 0,
