@@ -523,8 +523,13 @@ impl Header {
         let mut cur = Cursor::new(buf);
         cur.skip(4)?; // magic
 
-        // Classic headers are big-endian throughout.
-        let record_count = be_u32(&mut cur)? as u64;
+        // Classic headers are big-endian throughout. CDF-5 widens the record
+        // count to 64 bits.
+        let record_count = if container == Container::Cdf5 {
+            be_u64(&mut cur)?
+        } else {
+            be_u32(&mut cur)? as u64
+        };
 
         let is_cdf5 = container == Container::Cdf5;
         let read_size = |cur: &mut Cursor<'_>| -> Result<u64> {

@@ -49,6 +49,31 @@ use oxcdf_hdf5::read::{pad_to_selection, read_hyperslab, Hyperslab, RawData, Sto
 /// variable. netcdf-c writes the dimension length after it.
 const PHANTOM_DIMENSION_PREFIX: &str = "This is a netCDF dimension but not a netCDF variable";
 
+/// Prefix netcdf-c puts on the HDF5 name of a variable that has the name of a
+/// dimension but is not its coordinate variable. The netCDF name is without it.
+const NON_COORDINATE_PREFIX: &str = "_nc4_non_coord_";
+
+/// The netCDF name and path of a variable, from its HDF5 name and path.
+fn netcdf_name(name: &str, path: &str) -> (String, String) {
+    match name.strip_prefix(NON_COORDINATE_PREFIX) {
+        Some(bare) if !bare.is_empty() => {
+            let parent = &path[..path.len() - name.len()];
+            (bare.to_string(), format!("{parent}{bare}"))
+        }
+        _ => (name.to_string(), path.to_string()),
+    }
+}
+
+/// The HDF5 dataset behind a variable.
+///
+/// The prefixed name goes first. The bare name can be the dataset of the
+/// dimension that has the same name.
+fn hdf5_dataset<'a>(hdf5: &'a Hdf5File, info: &NcVariable) -> Option<&'a DatasetIndex> {
+    let parent = &info.path[..info.path.len() - info.name.len()];
+    hdf5.dataset(&format!("{parent}{NON_COORDINATE_PREFIX}{}", info.name))
+        .or_else(|| hdf5.dataset(&info.path))
+}
+
 /// Attributes that belong to the netCDF-4 encoding rather than to the data.
 ///
 /// netCDF hides these, so this reader hides them too. Surfacing them would make
@@ -518,7 +543,7 @@ impl NetcdfFile {
     /// The HDF5 dataset behind a variable, for the storage this layer does not
     /// model. `None` for a classic file.
     pub fn dataset(&self, variable: &NcVariable) -> Option<&DatasetIndex> {
-        self.hdf5()?.dataset(&variable.path)
+        hdf5_dataset(self.hdf5()?, variable)
     }
 
     pub(crate) fn variable_info(&self, path: &str) -> Option<&NcVariable> {
@@ -794,9 +819,10 @@ fn build_variable(
         phony,
     )?;
 
+    let (name, path) = netcdf_name(&dataset.name, &dataset.path);
     Ok(NcVariable {
-        name: dataset.name.clone(),
-        path: dataset.path.clone(),
+        name,
+        path,
         dimensions,
         shape: dataset.shape.clone(),
         attributes: visible_attributes(hdf5, &dataset.path, &dataset.attributes),
@@ -2007,7 +2033,7 @@ impl NetcdfFile {
 
     pub(crate) fn store_for(&self, info: &NcVariable) -> Option<VarStore<'_>> {
         match &self.backend {
-            Backend::Hdf5(h) => h.dataset(&info.path).map(VarStore::Hdf5),
+            Backend::Hdf5(h) => hdf5_dataset(h, info).map(VarStore::Hdf5),
             Backend::Classic(c) => c
                 .variables
                 .iter()

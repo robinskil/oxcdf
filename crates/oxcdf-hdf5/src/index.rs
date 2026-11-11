@@ -419,14 +419,18 @@ impl Hdf5File {
             let ctx = Ctx::new(source.as_ref(), &superblock).with_io_cache(io_cache.as_ref());
             let address = superblock.root_object_header_address()?;
             let mut visited = HashSet::new();
-            build_group(
+            let mut soft_links = Vec::new();
+            let mut root = build_group(
                 ctx,
                 address,
                 String::new(),
                 "/".to_string(),
                 &mut visited,
+                &mut soft_links,
                 0,
-            )?
+            )?;
+            resolve_soft_links(&mut root, soft_links);
+            root
         };
         Ok(Self {
             source,
@@ -546,6 +550,96 @@ struct Child {
     address: u64,
 }
 
+/// A soft link: a name in one group that stands for a path.
+struct SoftLink {
+    /// Path of the group that holds the link.
+    group: String,
+    name: String,
+    /// The path the link names. A relative path starts at `group`.
+    target: String,
+    /// The links of `group` that come before this one.
+    preceding: Vec<String>,
+}
+
+/// How many soft links one path may pass through.
+const MAX_SOFT_LINK_HOPS: usize = 8;
+
+/// The parts of the path a soft link names, from the root group.
+fn soft_link_parts(link: &SoftLink) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !link.target.starts_with('/') {
+        parts.extend(
+            link.group
+                .split('/')
+                .filter(|p| !p.is_empty())
+                .map(String::from),
+        );
+    }
+    // HDF5 has no `..`: the path only goes down.
+    for part in link.target.split('/') {
+        if !part.is_empty() && part != "." {
+            parts.push(part.to_string());
+        }
+    }
+    parts
+}
+
+fn group_at_mut<'a>(root: &'a mut GroupIndex, parts: &[&str]) -> Option<&'a mut GroupIndex> {
+    let mut group = root;
+    for part in parts {
+        group = group.groups.iter_mut().find(|g| g.name == *part)?;
+    }
+    Some(group)
+}
+
+/// Show each soft link to a dataset as a dataset of the group that holds the
+/// link, as the HDF5 library does.
+///
+/// A link to a group, to nothing, or to another file is left out.
+fn resolve_soft_links(root: &mut GroupIndex, mut pending: Vec<SoftLink>) {
+    // A link can name another link, so resolve in rounds.
+    for _ in 0..MAX_SOFT_LINK_HOPS {
+        let mut unresolved = Vec::new();
+        let mut progress = false;
+        for link in pending {
+            let parts = soft_link_parts(&link);
+            let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+            let target = parts.split_last().and_then(|(name, groups)| {
+                let group = group_at_mut(root, groups)?;
+                group.datasets.iter().find(|d| d.name == *name).cloned()
+            });
+            let Some(mut dataset) = target else {
+                unresolved.push(link);
+                continue;
+            };
+            let holder: Vec<&str> = link.group.split('/').filter(|p| !p.is_empty()).collect();
+            let Some(group) = group_at_mut(root, &holder) else {
+                continue;
+            };
+            if group.datasets.iter().all(|d| d.name != link.name) {
+                dataset.path = if link.group == "/" {
+                    format!("/{}", link.name)
+                } else {
+                    format!("{}/{}", link.group, link.name)
+                };
+                dataset.name = link.name;
+                // Keep the place the link has among the links of its group.
+                let at = group
+                    .datasets
+                    .iter()
+                    .filter(|d| link.preceding.contains(&d.name))
+                    .count();
+                group.datasets.insert(at, dataset);
+                progress = true;
+            }
+        }
+        pending = unresolved;
+        if !progress || pending.is_empty() {
+            break;
+        }
+    }
+}
+
 /// Build the index for the group whose object header is at `address`.
 fn build_group(
     ctx: Ctx<'_>,
@@ -553,6 +647,7 @@ fn build_group(
     name: String,
     path: String,
     visited: &mut HashSet<u64>,
+    soft_links: &mut Vec<SoftLink>,
     depth: usize,
 ) -> Result<GroupIndex> {
     if depth > MAX_DEPTH {
@@ -568,7 +663,7 @@ fn build_group(
 
     let header = ObjectHeader::read(ctx, address)?;
     let (attributes, attributes_complete) = read_attributes(ctx, &header)?;
-    let children = resolve_children(ctx, &header)?;
+    let children = resolve_children(ctx, &header, &path, soft_links)?;
 
     let mut groups = Vec::new();
     let mut datasets = Vec::new();
@@ -601,6 +696,7 @@ fn build_group(
                 child.name,
                 child_path,
                 visited,
+                soft_links,
                 depth + 1,
             )?);
         }
@@ -644,8 +740,24 @@ fn read_attributes(ctx: Ctx<'_>, header: &ObjectHeader) -> Result<(Vec<Attribute
 }
 
 /// List a group's children, whichever storage style it uses.
-fn resolve_children(ctx: Ctx<'_>, header: &ObjectHeader) -> Result<Vec<Child>> {
+fn resolve_children(
+    ctx: Ctx<'_>,
+    header: &ObjectHeader,
+    group: &str,
+    soft_links: &mut Vec<SoftLink>,
+) -> Result<Vec<Child>> {
     let sizes = ctx.sizes();
+    // Every link name so far, in link order.
+    let mut names: Vec<String> = Vec::new();
+    let mut soft = |name: String, target: String, names: &mut Vec<String>| {
+        soft_links.push(SoftLink {
+            group: group.to_string(),
+            name: name.clone(),
+            target,
+            preceding: names.clone(),
+        });
+        names.push(name);
+    };
 
     // Old style: a version 1 B-tree over symbol table nodes, plus a local heap
     // of names.
@@ -662,11 +774,17 @@ fn resolve_children(ctx: Ctx<'_>, header: &ObjectHeader) -> Result<Vec<Child>> {
             let node = SymbolTableNode::parse(&raw, sizes)?;
 
             for entry in node.entries {
+                let name = heap.name_at(entry.link_name_offset)?;
                 if let Some(addr) = entry.object_header_address {
+                    names.push(name.clone());
                     out.push(Child {
-                        name: heap.name_at(entry.link_name_offset)?,
+                        name,
                         address: addr,
                     });
+                } else if let crate::symbol_table::CachedInfo::SymbolicLink { link_value_offset } =
+                    entry.cached
+                {
+                    soft(name, heap.name_at(link_value_offset as u64)?, &mut names);
                 }
             }
         }
@@ -675,28 +793,37 @@ fn resolve_children(ctx: Ctx<'_>, header: &ObjectHeader) -> Result<Vec<Child>> {
 
     // New style: link messages inline, or a fractal heap when there are many.
     let mut out = Vec::new();
-    for link in header.compact_links(sizes)? {
-        if let LinkTarget::Hard { address } = link.target {
-            out.push(Child {
-                name: link.name,
-                address,
-            });
-        }
-        // Soft and external links are not followed. netCDF does not create
-        // them, and resolving them would change what "this file" means.
-    }
-
+    let mut links = header.compact_links(sizes)?;
     if let Some(info) = header.link_info(sizes)? {
         if let Some(heap_address) = info.fractal_heap_address {
-            let links = crate::dense::read_dense_links(ctx, heap_address, info.name_btree_address)?;
-            for link in links {
-                if let LinkTarget::Hard { address } = link.target {
-                    out.push(Child {
-                        name: link.name,
-                        address,
-                    });
-                }
+            links.extend(crate::dense::read_dense_links(
+                ctx,
+                heap_address,
+                info.name_btree_address,
+            )?);
+        }
+    }
+
+    // The HDF5 library lists links in creation order where the group tracks
+    // it, and in name order otherwise.
+    if links.iter().all(|link| link.creation_order.is_some()) {
+        links.sort_by_key(|link| link.creation_order);
+    } else {
+        links.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    for link in links {
+        match link.target {
+            LinkTarget::Hard { address } => {
+                names.push(link.name.clone());
+                out.push(Child {
+                    name: link.name,
+                    address,
+                });
             }
+            LinkTarget::Soft { path } => soft(link.name, path, &mut names),
+            // An external link names another file. It is not followed.
+            _ => {}
         }
     }
 
