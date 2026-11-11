@@ -30,6 +30,13 @@ fn corpus() -> Vec<(&'static str, String)> {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_files");
     [
         ("test_file.nc", "test_file.nc"),
+        // One case each where this reader differed from netcdf-c.
+        ("cdf5_records.nc", "cdf5_records.nc"),
+        ("non_coord_names.nc", "non_coord_names.nc"),
+        ("renamed_variable.nc", "renamed_variable.nc"),
+        ("huge_attribute.nc", "huge_attribute.nc"),
+        ("soft_link.h5", "soft_link.h5"),
+        ("soft_link_latest.h5", "soft_link_latest.h5"),
         ("gridded-example.nc", "gridded-example.nc"),
         ("wod_ctd_1964.nc", "wod_ctd_1964.nc"),
         // Declares a compound type, so its variables reach the committed
