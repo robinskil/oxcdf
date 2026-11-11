@@ -43,7 +43,7 @@ use crate::extent::Extents;
 // `Chunk` describes an HDF5 storage chunk, so the lower crate owns it. It is
 // re-exported here because a caller reaches it through a netCDF variable.
 pub use oxcdf_hdf5::read::Chunk;
-use oxcdf_hdf5::read::{read_hyperslab, Hyperslab, RawData};
+use oxcdf_hdf5::read::{pad_to_selection, read_hyperslab, Hyperslab, RawData, StoredPart};
 
 /// Prefix of the `NAME` attribute on a dimension that has no coordinate
 /// variable. netcdf-c writes the dimension length after it.
@@ -418,7 +418,8 @@ impl NetcdfFile {
         let (scales, first_free_id) = collect_dimension_scales(&hdf5)?;
         let mut heaps = HeapCache::default();
         let mut phony = PhonyDims::new(first_free_id);
-        let root = build_group(&hdf5, hdf5.root(), &scales, &mut heaps, &mut phony)?;
+        let mut root = build_group(&hdf5, hdf5.root(), &scales, &mut heaps, &mut phony)?;
+        extend_unlimited_dimensions(&mut root);
         Ok(Self {
             backend: Backend::Hdf5(hdf5),
             root,
@@ -802,6 +803,99 @@ fn build_variable(
         attributes_complete: dataset.attributes_complete,
         is_coordinate,
     })
+}
+
+/// The dimensions each group on the path from the root defines, innermost last.
+type DimensionScope = Vec<(String, Vec<(String, bool)>)>;
+
+/// The group that defines `name` for a variable in the innermost scope, when
+/// that dimension is unlimited.
+///
+/// netCDF looks a dimension name up in the variable's own group first, then in
+/// each parent group.
+fn unlimited_owner<'a>(scope: &'a DimensionScope, name: &str) -> Option<&'a str> {
+    scope.iter().rev().find_map(|(path, dims)| {
+        dims.iter()
+            .find(|(dim, _)| dim == name)
+            .map(|&(_, unlimited)| unlimited.then_some(path.as_str()))
+    })?
+}
+
+/// Give each unlimited dimension the length of its longest variable, and every
+/// variable on it that length.
+///
+/// HDF5 stores only the records a variable holds, so two variables on one
+/// unlimited dimension can store different lengths. netCDF reports the longest
+/// for all of them, and a read past a shorter one returns its fill value.
+fn extend_unlimited_dimensions(root: &mut NcGroup) {
+    let mut longest: HashMap<(String, String), u64> = HashMap::new();
+    collect_unlimited_lengths(root, &mut Vec::new(), &mut longest);
+    if !longest.is_empty() {
+        apply_unlimited_lengths(root, &mut Vec::new(), &longest);
+    }
+}
+
+fn group_scope(group: &NcGroup) -> (String, Vec<(String, bool)>) {
+    let dims = group
+        .dimensions
+        .iter()
+        .map(|d| (d.name.clone(), d.is_unlimited))
+        .collect();
+    (group.path.clone(), dims)
+}
+
+fn collect_unlimited_lengths(
+    group: &NcGroup,
+    scope: &mut DimensionScope,
+    longest: &mut HashMap<(String, String), u64>,
+) {
+    scope.push(group_scope(group));
+    for dim in group.dimensions.iter().filter(|d| d.is_unlimited) {
+        let len = longest
+            .entry((group.path.clone(), dim.name.clone()))
+            .or_default();
+        *len = (*len).max(dim.len);
+    }
+    for variable in &group.variables {
+        for (name, &len) in variable.dimensions.iter().zip(&variable.shape) {
+            if let Some(owner) = unlimited_owner(scope, name) {
+                let held = longest
+                    .entry((owner.to_string(), name.clone()))
+                    .or_default();
+                *held = (*held).max(len);
+            }
+        }
+    }
+    for child in &group.groups {
+        collect_unlimited_lengths(child, scope, longest);
+    }
+    scope.pop();
+}
+
+fn apply_unlimited_lengths(
+    group: &mut NcGroup,
+    scope: &mut DimensionScope,
+    longest: &HashMap<(String, String), u64>,
+) {
+    scope.push(group_scope(group));
+    for dim in group.dimensions.iter_mut() {
+        if let Some(&len) = longest.get(&(group.path.clone(), dim.name.clone())) {
+            dim.len = len;
+        }
+    }
+    for variable in &mut group.variables {
+        for (name, len) in variable.dimensions.iter().zip(variable.shape.iter_mut()) {
+            if let Some(owner) = unlimited_owner(scope, name) {
+                if let Some(&longest) = longest.get(&(owner.to_string(), name.clone())) {
+                    *len = longest;
+                }
+            }
+        }
+    }
+    for child in &mut group.groups {
+        apply_unlimited_lengths(child, scope, longest);
+    }
+    scope.pop();
 }
 
 /// Work out the dimension name for each axis of a variable.
@@ -1748,7 +1842,16 @@ impl<'a> Variable<'a> {
                     .hdf5()
                     .ok_or_else(|| Error::malformed("an HDF5 variable without an HDF5 file"))?
                     .ctx();
-                let raw = read_hyperslab(ctx, dataset, slab)?;
+                slab.validate(&self.info.shape)?;
+                // A short variable on an unlimited dimension reads as fill past its last record.
+                let raw = match oxcdf_hdf5::read::stored_part(dataset, slab)? {
+                    StoredPart::All => read_hyperslab(ctx, dataset, slab)?,
+                    StoredPart::Some(part) => {
+                        let raw = read_hyperslab(ctx, dataset, &part)?;
+                        pad_to_selection(dataset, slab, Some((&part, raw)))?
+                    }
+                    StoredPart::None => pad_to_selection(dataset, slab, None)?,
+                };
                 values_from_raw(ctx, dataset, raw)
             }
             VarStore::Classic(variable) => {

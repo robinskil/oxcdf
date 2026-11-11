@@ -717,6 +717,115 @@ pub fn read_hyperslab(ctx: Ctx<'_>, dataset: &DatasetIndex, slab: &Hyperslab) ->
     })
 }
 
+/// The part of a selection that the dataset stores.
+///
+/// netCDF makes an unlimited dimension as long as its longest variable, so a
+/// selection can run past the records that one dataset holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredPart {
+    /// The dataset stores the whole selection.
+    All,
+    /// The dataset stores this leading block of the selection.
+    Some(Hyperslab),
+    /// The dataset stores none of the selection.
+    None,
+}
+
+/// Split a selection at the stored extent of each unlimited axis.
+///
+/// Only an unlimited axis may run past the stored extent. Any other overrun is
+/// a bad request, as [`Hyperslab::validate`] reports it.
+pub fn stored_part(dataset: &DatasetIndex, slab: &Hyperslab) -> Result<StoredPart> {
+    let rank = dataset.shape.len();
+    if slab.start.len() != rank || slab.count.len() != rank {
+        // Let `validate` word the rank error.
+        slab.validate(&dataset.shape)?;
+    }
+    let mut count = Vec::with_capacity(rank);
+    let mut clipped = false;
+    for axis in 0..rank {
+        let (start, len, stored) = (slab.start[axis], slab.count[axis], dataset.shape[axis]);
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| Error::bad_request(format!("selection on axis {axis} overflows")))?;
+        if end <= stored {
+            count.push(len);
+            continue;
+        }
+        let unlimited = dataset
+            .max_shape
+            .as_ref()
+            .and_then(|m| m.get(axis))
+            .is_some_and(|&m| m == u64::MAX);
+        if !unlimited {
+            slab.validate(&dataset.shape)?;
+        }
+        clipped = true;
+        count.push(stored.saturating_sub(start));
+    }
+    if !clipped {
+        return Ok(StoredPart::All);
+    }
+    if count.contains(&0) {
+        return Ok(StoredPart::None);
+    }
+    Ok(StoredPart::Some(Hyperslab {
+        start: slab.start.clone(),
+        count,
+    }))
+}
+
+/// Grow a read of the stored part into the whole selection.
+///
+/// Cells past the stored extent get the dataset fill value, as netcdf-c gives
+/// them. `stored` is `None` when the dataset stores none of the selection.
+pub fn pad_to_selection(
+    dataset: &DatasetIndex,
+    slab: &Hyperslab,
+    stored: Option<(&Hyperslab, RawData)>,
+) -> Result<RawData> {
+    let element_size = dataset.element_size();
+    let total = slab
+        .element_count()
+        .checked_mul(element_size as u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| Error::bad_request("selection is too large to hold in memory"))?;
+
+    // The fill bytes are in file order. A read returns native order, so swap
+    // them the way the read swaps its data.
+    let mut out = vec![0u8; total];
+    dataset.fill_value.fill(&mut out, element_size);
+    let is_vlen = matches!(dataset.datatype.class, DatatypeClass::VariableLength { .. });
+    if !is_vlen {
+        if let Some(ByteOrder::Big) = dataset.datatype.byte_order() {
+            swap_bytes_in_place(&mut out, element_size);
+        }
+    }
+
+    if let Some((part, raw)) = stored {
+        // The stored block is the leading corner of the selection.
+        let corner = Hyperslab {
+            start: vec![0; part.count.len()],
+            count: part.count.clone(),
+        };
+        for_each_run(&slab.count, &corner, |dst, src, len| {
+            let (dst, src, len) = (
+                dst as usize * element_size,
+                src as usize * element_size,
+                len as usize * element_size,
+            );
+            out[dst..dst + len].copy_from_slice(&raw.bytes[src..src + len]);
+            Ok(())
+        })?;
+    }
+
+    Ok(RawData {
+        bytes: out,
+        element_size,
+        shape: slab.count.clone(),
+    })
+}
+
 /// Byte-swap every element in place, turning big-endian values into native.
 fn swap_bytes_in_place(buf: &mut [u8], element_size: usize) {
     if element_size <= 1 {

@@ -35,6 +35,8 @@ fn corpus() -> Vec<(&'static str, String)> {
         // Declares a compound type, so its variables reach the committed
         // datatype path.
         ("wod_osd_1930.nc", "wod_osd_1930.nc"),
+        // Variables on one unlimited dimension hold different record counts.
+        ("unlimited_uneven.nc", "unlimited_uneven.nc"),
     ]
     .iter()
     .map(|(name, p)| (*name, format!("{root}/{p}")))
