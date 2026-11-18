@@ -2,6 +2,7 @@
 //! netcdf-c reads a file from the HDF5 writer.
 //!
 //! The root holds more than eight compact attributes and more than eight links.
+//! The group `wide` holds 2000 links.
 //!
 //! Run with:
 //!
@@ -41,6 +42,10 @@ fn netcdf_c_reads_a_file_from_the_writer() {
         .unwrap();
     w.write(d, &Hyperslab::all(&[5]), &[1i32, -2, 3, -4, 5])
         .unwrap();
+    let wide = w.add_group(root, "wide").unwrap();
+    for i in 0..2000 {
+        w.add_group(wide, &format!("g{i:04}")).unwrap();
+    }
     w.close().unwrap();
 
     let file = netcdf::open(&path).unwrap();
@@ -57,6 +62,10 @@ fn netcdf_c_reads_a_file_from_the_writer() {
     }
     let title = file.attribute("title").unwrap().value().unwrap();
     assert!(matches!(title, netcdf::AttributeValue::Str(ref s) if s == "writer test"));
+    let attr_19 = file.attribute("attr_19").unwrap().value().unwrap();
+    assert!(matches!(attr_19, netcdf::AttributeValue::Int(19)));
+    let wide = file.group("wide").unwrap().unwrap();
+    assert_eq!(wide.groups().count(), 2000);
     let sub = file.group("sub").unwrap().unwrap();
     assert_eq!(
         sub.variable("big_endian")

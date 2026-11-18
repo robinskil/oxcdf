@@ -583,6 +583,25 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_root_header_is_larger_than_the_metadata_block() {
+        let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+        let root = w.root();
+        for i in 0..2000 {
+            w.add_group(root, &format!("group_{i:04}")).unwrap();
+        }
+        for i in 0..100i32 {
+            w.put_numeric_attribute(root, &format!("attr_{i:03}"), &[i])
+                .unwrap();
+        }
+        let source = MemorySource::new(w.close().unwrap().into_inner());
+        let superblock = Superblock::read(&source).unwrap();
+        let address = superblock.root_object_header_address().unwrap();
+        let header = ObjectHeader::read(Ctx::new(&source, &superblock), address).unwrap();
+        let area: usize = header.messages.iter().map(|m| 6 + m.data.len()).sum();
+        assert!(area > 65536, "{area}");
+    }
+
+    #[test]
     fn a_duplicate_is_rejected_after_many_inserts() {
         let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
         let root = w.root();

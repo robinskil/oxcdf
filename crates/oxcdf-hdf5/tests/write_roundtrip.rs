@@ -182,7 +182,7 @@ fn an_oversize_attribute_fails_and_the_writer_stays_usable() {
 fn large_headers_read_back() {
     let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
     let root = w.root();
-    for i in 0..1000 {
+    for i in 0..2000 {
         w.add_group(root, &format!("group_{i:04}")).unwrap();
     }
     for i in 0..100i32 {
@@ -190,7 +190,7 @@ fn large_headers_read_back() {
             .unwrap();
     }
     let file = reopen(w.close().unwrap().into_inner());
-    assert_eq!(file.root().groups.len(), 1000);
+    assert_eq!(file.root().groups.len(), 2000);
     assert_eq!(file.root().attributes.len(), 100);
     assert_eq!(
         file.root().attribute("attr_099").unwrap().data,
