@@ -5,13 +5,11 @@ pub mod encode;
 pub mod header;
 pub mod message;
 pub mod sink;
+pub mod writer;
 
-#[allow(unused_imports)]
 pub use alloc::*;
 pub use encode::*;
-#[allow(unused_imports)]
 pub use header::*;
-#[allow(unused_imports)]
 pub use message::*;
-#[allow(unused_imports)]
 pub use sink::*;
+pub use writer::*;
