@@ -193,7 +193,10 @@ impl Dataset {
         let mut done = 0u64;
         while done < self.extent_bytes {
             let len = (self.extent_bytes - done).min(to_u64(block.len())?);
-            let block = block.get(..to_usize(len)?).unwrap_or_default();
+            let block = block
+                .get(..to_usize(len)?)
+                .filter(|b| !b.is_empty())
+                .ok_or_else(|| Error::bad_request("a fill block is empty or too short"))?;
             sink.write_all_at(offset(address, done)?, block)?;
             done += len;
         }

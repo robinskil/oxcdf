@@ -193,8 +193,9 @@ impl<S: ByteSink> Hdf5Writer<S> {
 
     /// Write `values` to the elements of `slab`.
     ///
-    /// A `T` that is not the stored type is [`Error::TypeMismatch`]. The
-    /// other errors are those of [`Self::write_raw`].
+    /// The dataset datatype must equal the numeric datatype of `T` in the
+    /// dataset byte order. Any other datatype is [`Error::TypeMismatch`].
+    /// The other errors are those of [`Self::write_raw`].
     pub fn write<T: Element>(
         &mut self,
         dataset: DatasetId,
@@ -209,15 +210,21 @@ impl<S: ByteSink> Hdf5Writer<S> {
         else {
             return Err(no_dataset(dataset));
         };
-        let stored = DType::of(d.datatype());
-        if stored != T::DTYPE {
+        let datatype = d.datatype();
+        let order = datatype.byte_order();
+        let exact = order.and_then(|o| numeric_datatype(T::DTYPE, o).ok());
+        if exact.as_ref() != Some(datatype) {
+            let mut stored = DType::of(datatype).name();
+            if stored == T::NAME {
+                // Same class and size byte, but another size, precision or layout.
+                stored = format!("a nonstandard {}-byte datatype", datatype.size);
+            }
             return Err(Error::TypeMismatch {
-                stored: stored.name(),
+                stored,
                 asked: T::NAME,
                 what: name.clone(),
             });
         }
-        let order = d.datatype().byte_order();
         let mut bytes = T::to_ne_vec(values);
         to_order(&mut bytes, std::mem::size_of::<T>(), order);
         self.write_raw(dataset, slab, &bytes)

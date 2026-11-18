@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use oxcdf_hdf5::message::{ByteOrder, DataspaceKind};
+use oxcdf_hdf5::message::{ByteOrder, DataspaceKind, Datatype, DatatypeClass};
 use oxcdf_hdf5::read::read_hyperslab;
 use oxcdf_hdf5::write::{DatasetSpec, FileSink, Hdf5Writer, MemorySink, WriteOptions};
 use oxcdf_hdf5::{DType, Element, Error, Hdf5File, Hyperslab, MemorySource};
@@ -403,4 +403,42 @@ fn a_wrong_fill_value_length_is_a_bad_request() {
         w.add_dataset(root, "v", spec),
         Err(Error::BadRequest(_))
     ));
+}
+
+#[test]
+fn a_typed_write_needs_the_exact_datatype() {
+    let mut w = new_writer();
+    let root = w.root();
+    let mut spec = DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[2]).unwrap();
+    if let DatatypeClass::FixedPoint { bit_precision, .. } = &mut spec.datatype.class {
+        *bit_precision = 16;
+    }
+    let narrow = w.add_dataset(root, "narrow", spec).unwrap();
+    let all = Hyperslab::all(&[2]);
+    assert!(matches!(
+        w.write(narrow, &all, &[1i32, 2]),
+        Err(Error::TypeMismatch { .. })
+    ));
+    w.write_raw(narrow, &all, &[0; 8]).unwrap();
+
+    let wide = DatasetSpec {
+        datatype: Datatype {
+            version: 1,
+            size: 260,
+            class: DatatypeClass::FixedPoint {
+                order: ByteOrder::Little,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 2080,
+            },
+        },
+        shape: vec![2],
+        fill_value: None,
+    };
+    let wide = w.add_dataset(root, "wide", wide).unwrap();
+    assert!(matches!(
+        w.write(wide, &all, &[1i32; 130]),
+        Err(Error::TypeMismatch { .. })
+    ));
+    reopen(w.close().unwrap().into_inner());
 }
