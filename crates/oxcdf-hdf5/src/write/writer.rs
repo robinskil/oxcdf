@@ -213,31 +213,24 @@ impl<S: ByteSink> Hdf5Writer<S> {
 
     /// Put a little-endian numeric attribute on `object`.
     ///
-    /// One value gives a scalar dataspace. Several values give a simple
-    /// dataspace of rank 1. No values is [`Error::BadRequest`]. The other
-    /// errors are those of [`Self::put_attribute`].
+    /// The dataspace is simple with rank 1, also for one value, as in
+    /// netcdf-c. No values is [`Error::BadRequest`]. The other errors are
+    /// those of [`Self::put_attribute`].
     pub fn put_numeric_attribute<T: Element>(
         &mut self,
         object: impl Into<ObjectId>,
         name: &str,
         values: &[T],
     ) -> Result<()> {
-        let dataspace = match values.len() {
-            0 => {
-                return Err(Error::bad_request(format!(
-                    "attribute {name:?} has no values"
-                )))
-            }
-            1 => Dataspace {
-                kind: DataspaceKind::Scalar,
-                dims: Vec::new(),
-                max_dims: None,
-            },
-            n => Dataspace {
-                kind: DataspaceKind::Simple,
-                dims: vec![to_u64(n)?],
-                max_dims: None,
-            },
+        if values.is_empty() {
+            return Err(Error::bad_request(format!(
+                "attribute {name:?} has no values"
+            )));
+        }
+        let dataspace = Dataspace {
+            kind: DataspaceKind::Simple,
+            dims: vec![to_u64(values.len())?],
+            max_dims: None,
         };
         let mut data = T::to_ne_vec(values);
         if cfg!(target_endian = "big") {
@@ -254,9 +247,12 @@ impl<S: ByteSink> Hdf5Writer<S> {
         self.put_attribute(object, attribute)
     }
 
-    /// Put a text attribute on `object` as one null-terminated fixed string.
+    /// Put a text attribute on `object` as one fixed string, as in netcdf-c.
     ///
-    /// ASCII text gets the ASCII character set, other text UTF-8. The errors
+    /// The string size is the UTF-8 byte length of `text`, and no NUL byte
+    /// is stored. The pad is `NullTerminate` and the dataspace is scalar.
+    /// ASCII text gets the ASCII character set, other text UTF-8. Empty text
+    /// or text with a NUL byte is [`Error::BadRequest`]. The other errors
     /// are those of [`Self::put_attribute`].
     pub fn put_text_attribute(
         &mut self,
@@ -264,9 +260,17 @@ impl<S: ByteSink> Hdf5Writer<S> {
         name: &str,
         text: &str,
     ) -> Result<()> {
-        let mut data = Vec::with_capacity(text.len().saturating_add(1));
-        data.extend_from_slice(text.as_bytes());
-        data.push(0);
+        if text.is_empty() {
+            return Err(Error::bad_request(format!(
+                "text attribute {name:?} is empty"
+            )));
+        }
+        if text.contains('\0') {
+            return Err(Error::bad_request(format!(
+                "text attribute {name:?} holds a NUL byte"
+            )));
+        }
+        let data = text.as_bytes().to_vec();
         let size = u32::try_from(data.len()).map_err(|_| {
             Error::unsupported(format!(
                 "text attribute {name:?} of {} bytes is above the 4-byte size limit",

@@ -85,9 +85,12 @@ fn group_attributes_read_back() {
     let root = file.root();
 
     let title = root.attribute("title").unwrap();
-    assert_eq!(title.data, b"Sea surface temperature\0");
+    assert_eq!(title.data, b"Sea surface temperature");
+    assert_eq!(title.datatype.size, 23);
+    assert_eq!(title.dataspace.kind, DataspaceKind::Scalar);
     let version = root.attribute("version").unwrap();
-    assert_eq!(version.dataspace.kind, DataspaceKind::Scalar);
+    assert_eq!(version.dataspace.kind, DataspaceKind::Simple);
+    assert_eq!(version.dataspace.dims, vec![1]);
     assert_eq!(version.data, 3i32.to_le_bytes());
     let range = root.attribute("range").unwrap();
     assert_eq!(range.dataspace.dims, vec![2]);
@@ -126,8 +129,25 @@ fn utf8_names_read_back() {
     let g = file.root().group("zee\u{00eb}n").unwrap();
     assert_eq!(
         g.attribute("omschr\u{00ef}jving").unwrap().data,
-        "co\u{00f6}rdinaat\0".as_bytes()
+        "co\u{00f6}rdinaat".as_bytes()
     );
+}
+
+#[test]
+fn wrong_text_attributes_are_bad_requests() {
+    let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+    let root = w.root();
+    assert!(matches!(
+        w.put_text_attribute(root, "empty", ""),
+        Err(Error::BadRequest(_))
+    ));
+    assert!(matches!(
+        w.put_text_attribute(root, "nul", "a\0b"),
+        Err(Error::BadRequest(_))
+    ));
+    let file = reopen(w.close().unwrap().into_inner());
+    assert!(file.root().attribute("empty").is_none());
+    assert!(file.root().attribute("nul").is_none());
 }
 
 #[test]
