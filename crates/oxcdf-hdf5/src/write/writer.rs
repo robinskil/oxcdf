@@ -1,6 +1,7 @@
 //! The writer: a tree of objects in memory, written to a sink at close.
 
 use super::alloc::Allocator;
+use super::dataset::{to_order, Dataset, DatasetSpec};
 use super::encode::UNDEFINED_ADDRESS;
 use super::header::{encode_header, encode_superblock, header_len, SUPERBLOCK_BYTES};
 use super::message::{
@@ -8,12 +9,13 @@ use super::message::{
     numeric_datatype,
 };
 use super::sink::ByteSink;
-use crate::dtype::Element;
+use crate::dtype::{DType, Element};
 use crate::error::{Error, Result};
 use crate::message::{
     Attribute, ByteOrder, CharSet, Dataspace, DataspaceKind, Datatype, DatatypeClass, StringPad,
 };
 use crate::objheader::{HeaderMessage, MessageType};
+use crate::read::Hyperslab;
 
 /// Default size of one metadata block in bytes.
 const DEFAULT_METADATA_BLOCK_BYTES: u64 = 65536;
@@ -106,6 +108,8 @@ struct StoredAttribute {
 enum NodeKind {
     /// A group with its children in insert order.
     Group { children: Vec<usize> },
+    /// A dataset. It has no children.
+    Dataset(Box<Dataset>),
 }
 
 /// Builds a new HDF5 file in memory and writes it to a sink at close.
@@ -147,12 +151,82 @@ impl<S: ByteSink> Hdf5Writer<S> {
     /// [`Error::BadRequest`]. A name too long for a link message is
     /// [`Error::Unsupported`]. An error changes nothing.
     pub fn add_group(&mut self, parent: GroupId, name: &str) -> Result<GroupId> {
+        self.check_link(parent, name)?;
+        let kind = NodeKind::Group {
+            children: Vec::new(),
+        };
+        Ok(GroupId(self.push_child(parent, name, kind)))
+    }
+
+    /// Add a dataset `name` with contiguous storage to `parent` and return its id.
+    ///
+    /// The name rules and errors are those of [`Self::add_group`]. A fill
+    /// value that is not one element, a wrong shape, or an extent above
+    /// `u64::MAX` bytes is [`Error::BadRequest`]. A datatype that the writer
+    /// cannot encode is [`Error::Unsupported`]. An error changes nothing.
+    pub fn add_dataset(
+        &mut self,
+        parent: GroupId,
+        name: &str,
+        spec: DatasetSpec,
+    ) -> Result<DatasetId> {
+        self.check_link(parent, name)?;
+        let kind = NodeKind::Dataset(Box::new(Dataset::new(spec)?));
+        Ok(DatasetId(self.push_child(parent, name, kind)))
+    }
+
+    /// Write `bytes` in the dataset byte order to the elements of `slab`.
+    ///
+    /// The first write with bytes reserves the full extent. If it does not
+    /// cover the dataset, the fill value, or zeros, goes to the full extent
+    /// first. An unknown dataset, a slab outside the shape or a wrong byte
+    /// count is [`Error::BadRequest`].
+    pub fn write_raw(&mut self, dataset: DatasetId, slab: &Hyperslab, bytes: &[u8]) -> Result<()> {
+        let Self {
+            sink, alloc, nodes, ..
+        } = self;
+        match nodes.get_mut(dataset.0).map(|n| &mut n.kind) {
+            Some(NodeKind::Dataset(d)) => d.write_raw(sink, alloc, slab, bytes),
+            _ => Err(no_dataset(dataset)),
+        }
+    }
+
+    /// Write `values` to the elements of `slab`.
+    ///
+    /// A `T` that is not the stored type is [`Error::TypeMismatch`]. The
+    /// other errors are those of [`Self::write_raw`].
+    pub fn write<T: Element>(
+        &mut self,
+        dataset: DatasetId,
+        slab: &Hyperslab,
+        values: &[T],
+    ) -> Result<()> {
+        let Some(Node {
+            name,
+            kind: NodeKind::Dataset(d),
+            ..
+        }) = self.nodes.get(dataset.0)
+        else {
+            return Err(no_dataset(dataset));
+        };
+        let stored = DType::of(d.datatype());
+        if stored != T::DTYPE {
+            return Err(Error::TypeMismatch {
+                stored: stored.name(),
+                asked: T::NAME,
+                what: name.clone(),
+            });
+        }
+        let order = d.datatype().byte_order();
+        let mut bytes = T::to_ne_vec(values);
+        to_order(&mut bytes, std::mem::size_of::<T>(), order);
+        self.write_raw(dataset, slab, &bytes)
+    }
+
+    /// Check that `parent` is a group that can take a new link `name`.
+    fn check_link(&self, parent: GroupId, name: &str) -> Result<()> {
         check_name(name)?;
-        let NodeKind::Group { children } = &self
-            .nodes
-            .get(parent.0)
-            .ok_or_else(|| Error::bad_request(format!("no group with id {}", parent.0)))?
-            .kind;
+        let children = self.children(parent)?;
         if children.iter().any(|&c| self.nodes[c].name == name) {
             return Err(Error::bad_request(format!(
                 "the group already holds a link {name:?}"
@@ -160,18 +234,29 @@ impl<S: ByteSink> Hdf5Writer<S> {
         }
         // The same check as at close, so that close cannot fail on this name.
         encode_hard_link(name, UNDEFINED_ADDRESS, to_u64(children.len())?)?;
+        Ok(())
+    }
 
+    /// Add a node of `kind` as the last child of the checked group `parent`.
+    fn push_child(&mut self, parent: GroupId, name: &str, kind: NodeKind) -> usize {
         let id = self.nodes.len();
         self.nodes.push(Node {
             name: name.to_owned(),
-            kind: NodeKind::Group {
-                children: Vec::new(),
-            },
+            kind,
             attributes: Vec::new(),
         });
-        let NodeKind::Group { children } = &mut self.nodes[parent.0].kind;
-        children.push(id);
-        Ok(GroupId(id))
+        if let NodeKind::Group { children } = &mut self.nodes[parent.0].kind {
+            children.push(id);
+        }
+        id
+    }
+
+    /// The children of group `id`, or [`Error::BadRequest`] when `id` is no group.
+    fn children(&self, id: GroupId) -> Result<&[usize]> {
+        match self.nodes.get(id.0).map(|n| &n.kind) {
+            Some(NodeKind::Group { children }) => Ok(children),
+            _ => Err(Error::bad_request(format!("no group with id {}", id.0))),
+        }
     }
 
     /// Put `attribute` on `object`.
@@ -233,11 +318,7 @@ impl<S: ByteSink> Hdf5Writer<S> {
             max_dims: None,
         };
         let mut data = T::to_ne_vec(values);
-        if cfg!(target_endian = "big") {
-            for value in data.chunks_exact_mut(std::mem::size_of::<T>()) {
-                value.reverse();
-            }
-        }
+        to_order(&mut data, std::mem::size_of::<T>(), Some(ByteOrder::Little));
         let attribute = Attribute {
             name: name.to_owned(),
             datatype: numeric_datatype(T::DTYPE, ByteOrder::Little)?,
@@ -305,11 +386,11 @@ impl<S: ByteSink> Hdf5Writer<S> {
     /// The node index of `object`, or [`Error::BadRequest`] for an unknown object.
     fn node_index(&self, object: ObjectId) -> Result<usize> {
         match object {
-            ObjectId::Group(id) if id.0 < self.nodes.len() => Ok(id.0),
-            ObjectId::Group(id) => Err(Error::bad_request(format!("no group with id {}", id.0))),
-            ObjectId::Dataset(id) => {
-                Err(Error::bad_request(format!("no dataset with id {}", id.0)))
-            }
+            ObjectId::Group(id) => self.children(id).map(|_| id.0),
+            ObjectId::Dataset(id) => match self.nodes.get(id.0).map(|n| &n.kind) {
+                Some(NodeKind::Dataset(_)) => Ok(id.0),
+                _ => Err(no_dataset(id)),
+            },
         }
     }
 
@@ -342,8 +423,9 @@ impl<S: ByteSink> Hdf5Writer<S> {
         let mut stack = vec![ROOT];
         while let Some(node) = stack.pop() {
             order.push(node);
-            let NodeKind::Group { children } = &self.nodes[node].kind;
-            stack.extend(children.iter().rev());
+            if let NodeKind::Group { children } = &self.nodes[node].kind {
+                stack.extend(children.iter().rev());
+            }
         }
         order
     }
@@ -351,25 +433,38 @@ impl<S: ByteSink> Hdf5Writer<S> {
     /// The header messages of `node`, with its children at `addresses`.
     fn messages(&self, node: usize, addresses: &[u64]) -> Result<Vec<HeaderMessage>> {
         let Node {
-            kind: NodeKind::Group { children },
-            attributes,
-            ..
+            kind, attributes, ..
         } = &self.nodes[node];
-        let mut messages = Vec::with_capacity(children.len() + attributes.len() + 3);
-        messages.push(message(
-            MessageType::LinkInfo,
-            encode_link_info(to_u64(children.len())?),
-        ));
-        messages.push(message(MessageType::GroupInfo, encode_group_info()));
-        messages.push(message(
+        let attribute_info = message(
             MessageType::AttributeInfo,
             encode_attribute_info(to_u16(attributes.len())?),
-        ));
-        for (position, &child) in children.iter().enumerate() {
-            let body =
-                encode_hard_link(&self.nodes[child].name, addresses[child], to_u64(position)?)?;
-            messages.push(message(MessageType::Link, body));
-        }
+        );
+        let mut messages = match kind {
+            NodeKind::Group { children } => {
+                let mut messages = Vec::with_capacity(children.len() + attributes.len() + 3);
+                messages.push(message(
+                    MessageType::LinkInfo,
+                    encode_link_info(to_u64(children.len())?),
+                ));
+                messages.push(message(MessageType::GroupInfo, encode_group_info()));
+                messages.push(attribute_info);
+                for (position, &child) in children.iter().enumerate() {
+                    let body = encode_hard_link(
+                        &self.nodes[child].name,
+                        addresses[child],
+                        to_u64(position)?,
+                    )?;
+                    messages.push(message(MessageType::Link, body));
+                }
+                messages
+            }
+            NodeKind::Dataset(d) => {
+                let mut messages = Vec::with_capacity(attributes.len() + 5);
+                messages.extend(d.messages());
+                messages.push(attribute_info);
+                messages
+            }
+        };
         for (index, attribute) in attributes.iter().enumerate() {
             messages.push(HeaderMessage {
                 creation_order: Some(to_u16(index)?),
@@ -390,8 +485,13 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The error for a dataset id that names no dataset.
+fn no_dataset(id: DatasetId) -> Error {
+    Error::bad_request(format!("no dataset with id {}", id.0))
+}
+
 /// A header message with no flags and no creation order.
-fn message(kind: MessageType, data: Vec<u8>) -> HeaderMessage {
+pub(super) fn message(kind: MessageType, data: Vec<u8>) -> HeaderMessage {
     HeaderMessage {
         kind,
         flags: 0,
@@ -508,5 +608,79 @@ mod tests {
         ));
         let file = reopen(w.close().unwrap().into_inner());
         assert!(file.root().attributes.is_empty());
+    }
+
+    #[test]
+    fn ids_of_the_wrong_kind_are_bad_requests() {
+        let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+        let root = w.root();
+        let spec = DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[2]).unwrap();
+        let d = w.add_dataset(root, "d", spec.clone()).unwrap();
+        let as_group = GroupId(d.0);
+        let as_dataset = DatasetId(root.0);
+        let all = Hyperslab::all(&[2]);
+        fn bad<T>(r: Result<T>) -> bool {
+            matches!(r, Err(Error::BadRequest(_)))
+        }
+        assert!(bad(w.add_group(as_group, "g")));
+        assert!(bad(w.add_dataset(as_group, "e", spec)));
+        assert!(bad(w.put_text_attribute(as_group, "a", "x")));
+        assert!(bad(w.put_text_attribute(as_dataset, "a", "x")));
+        assert!(bad(w.write(as_dataset, &all, &[1i32, 2])));
+        assert!(bad(w.write_raw(as_dataset, &all, &[0; 8])));
+        assert!(bad(w.write_raw(DatasetId(99), &all, &[0; 8])));
+        let file = reopen(w.close().unwrap().into_inner());
+        assert!(file.root().attributes.is_empty());
+        assert!(file.dataset("/d").unwrap().attributes.is_empty());
+    }
+
+    #[test]
+    fn a_wrong_dataset_spec_changes_nothing() {
+        let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+        let root = w.root();
+        let int4 = |shape: &[u64]| DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, shape);
+        assert!(matches!(
+            w.add_dataset(root, "d", int4(&[u64::MAX, 2]).unwrap()),
+            Err(Error::BadRequest(_))
+        ));
+        assert!(matches!(
+            w.add_dataset(root, "d", int4(&[1; 33]).unwrap()),
+            Err(Error::BadRequest(_))
+        ));
+        assert!(matches!(
+            w.add_dataset(root, "a/b", int4(&[1]).unwrap()),
+            Err(Error::BadRequest(_))
+        ));
+        w.add_dataset(root, "d", int4(&[1]).unwrap()).unwrap();
+        let file = reopen(w.close().unwrap().into_inner());
+        assert_eq!(file.datasets().len(), 1);
+    }
+
+    #[test]
+    fn a_dataset_header_holds_the_messages_in_order() {
+        let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+        let root = w.root();
+        let spec = DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[2]).unwrap();
+        let d = w.add_dataset(root, "d", spec).unwrap();
+        w.put_text_attribute(d, "a", "x").unwrap();
+        w.put_text_attribute(d, "b", "y").unwrap();
+        let file = reopen(w.close().unwrap().into_inner());
+        let address = file.dataset("/d").unwrap().address;
+        let header = ObjectHeader::read(file.ctx(), address).unwrap();
+        let kinds: Vec<_> = header.messages.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                MessageType::Dataspace,
+                MessageType::Datatype,
+                MessageType::FillValue,
+                MessageType::DataLayout,
+                MessageType::AttributeInfo,
+                MessageType::Attribute,
+                MessageType::Attribute,
+            ]
+        );
+        assert_eq!(header.messages[6].creation_order, Some(1));
+        assert_eq!(encode_attribute_info(2), header.messages[4].data);
     }
 }

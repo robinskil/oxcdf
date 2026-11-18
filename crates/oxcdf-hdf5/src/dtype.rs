@@ -211,7 +211,11 @@ macro_rules! element {
                     .collect()
             }
             fn to_ne_vec(values: &[Self]) -> Vec<u8> {
-                values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+                let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+                for v in values {
+                    bytes.extend_from_slice(&v.to_ne_bytes());
+                }
+                bytes
             }
             #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
             #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]

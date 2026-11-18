@@ -3,12 +3,26 @@
 
 use std::sync::Arc;
 
-use oxcdf_hdf5::message::DataspaceKind;
-use oxcdf_hdf5::write::{FileSink, Hdf5Writer, MemorySink, WriteOptions};
-use oxcdf_hdf5::{Error, Hdf5File, MemorySource};
+use oxcdf_hdf5::message::{ByteOrder, DataspaceKind};
+use oxcdf_hdf5::read::read_hyperslab;
+use oxcdf_hdf5::write::{DatasetSpec, FileSink, Hdf5Writer, MemorySink, WriteOptions};
+use oxcdf_hdf5::{DType, Element, Error, Hdf5File, Hyperslab, MemorySource};
 
 fn reopen(bytes: Vec<u8>) -> Hdf5File {
     Hdf5File::from_source(Arc::new(MemorySource::new(bytes))).expect("the file should open")
+}
+
+fn read_all<T: Element>(file: &Hdf5File, path: &str) -> Vec<T> {
+    let d = file.dataset(path).unwrap();
+    d.prepare(file.ctx()).unwrap();
+    read_hyperslab(file.ctx(), d, &Hyperslab::all(&d.shape))
+        .unwrap()
+        .get::<T>(d)
+        .unwrap()
+}
+
+fn new_writer() -> Hdf5Writer<MemorySink> {
+    Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap()
 }
 
 #[test]
@@ -190,6 +204,203 @@ fn an_empty_numeric_attribute_is_a_bad_request() {
     let root = w.root();
     assert!(matches!(
         w.put_numeric_attribute::<f32>(root, "none", &[]),
+        Err(Error::BadRequest(_))
+    ));
+}
+
+#[test]
+fn every_numeric_type_round_trips_in_both_byte_orders() {
+    macro_rules! check {
+        ($t:ty, $dtype:expr) => {
+            for order in [ByteOrder::Little, ByteOrder::Big] {
+                let mut w = new_writer();
+                let root = w.root();
+                let spec = DatasetSpec::numeric($dtype, order, &[2, 3]).unwrap();
+                let d = w.add_dataset(root, "v", spec).unwrap();
+                let values: Vec<$t> = (0..6).map(|i| (i * 7 + 1) as $t).collect();
+                w.write(d, &Hyperslab::all(&[2, 3]), &values).unwrap();
+                let file = reopen(w.close().unwrap().into_inner());
+                assert_eq!(read_all::<$t>(&file, "/v"), values);
+                assert_eq!(
+                    file.dataset("/v").unwrap().datatype.byte_order(),
+                    Some(order)
+                );
+            }
+        };
+    }
+    check!(i8, DType::Int(1));
+    check!(i16, DType::Int(2));
+    check!(i32, DType::Int(4));
+    check!(i64, DType::Int(8));
+    check!(u8, DType::Uint(1));
+    check!(u16, DType::Uint(2));
+    check!(u32, DType::Uint(4));
+    check!(u64, DType::Uint(8));
+    check!(f32, DType::Float(4));
+    check!(f64, DType::Float(8));
+}
+
+#[test]
+fn a_partial_write_leaves_the_fill_value_elsewhere() {
+    let mut w = new_writer();
+    let root = w.root();
+    let spec = DatasetSpec::numeric(DType::Float(4), ByteOrder::Little, &[3, 4])
+        .unwrap()
+        .fill_value((-999.0f32).to_le_bytes().to_vec());
+    let d = w.add_dataset(root, "t", spec).unwrap();
+    let slab = Hyperslab::new(vec![1, 1], vec![2, 2], &[3, 4]).unwrap();
+    w.write(d, &slab, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+    let file = reopen(w.close().unwrap().into_inner());
+    let f = -999.0f32;
+    assert_eq!(
+        read_all::<f32>(&file, "/t"),
+        [f, f, f, f, f, 1.0, 2.0, f, f, 3.0, 4.0, f]
+    );
+}
+
+#[test]
+fn two_partial_writes_add_up() {
+    let mut w = new_writer();
+    let root = w.root();
+    let spec = DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[2, 3]).unwrap();
+    let d = w.add_dataset(root, "v", spec).unwrap();
+    w.write(
+        d,
+        &Hyperslab::new(vec![1, 0], vec![1, 3], &[2, 3]).unwrap(),
+        &[4i32, 5, 6],
+    )
+    .unwrap();
+    w.write(
+        d,
+        &Hyperslab::new(vec![0, 0], vec![1, 3], &[2, 3]).unwrap(),
+        &[1i32, 2, 3],
+    )
+    .unwrap();
+    let file = reopen(w.close().unwrap().into_inner());
+    assert_eq!(read_all::<i32>(&file, "/v"), [1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn a_dataset_with_no_write_reads_as_fill() {
+    let mut w = new_writer();
+    let root = w.root();
+    let spec = DatasetSpec::numeric(DType::Int(2), ByteOrder::Little, &[4])
+        .unwrap()
+        .fill_value(7i16.to_le_bytes().to_vec());
+    w.add_dataset(root, "v", spec).unwrap();
+    let file = reopen(w.close().unwrap().into_inner());
+    assert_eq!(read_all::<i16>(&file, "/v"), [7, 7, 7, 7]);
+}
+
+#[test]
+fn a_scalar_dataset_round_trips() {
+    let mut w = new_writer();
+    let root = w.root();
+    let d = w
+        .add_dataset(
+            root,
+            "s",
+            DatasetSpec::numeric(DType::Float(8), ByteOrder::Little, &[]).unwrap(),
+        )
+        .unwrap();
+    w.write(d, &Hyperslab::all(&[]), &[2.5f64]).unwrap();
+    let file = reopen(w.close().unwrap().into_inner());
+    assert_eq!(read_all::<f64>(&file, "/s"), [2.5]);
+}
+
+#[test]
+fn a_zero_length_dimension_gives_an_empty_dataset() {
+    let mut w = new_writer();
+    let root = w.root();
+    let d = w
+        .add_dataset(
+            root,
+            "e",
+            DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[0, 5]).unwrap(),
+        )
+        .unwrap();
+    w.write::<i32>(d, &Hyperslab::all(&[0, 5]), &[]).unwrap();
+    let file = reopen(w.close().unwrap().into_inner());
+    assert_eq!(file.dataset("/e").unwrap().shape, [0, 5]);
+    assert!(read_all::<i32>(&file, "/e").is_empty());
+}
+
+#[test]
+fn datasets_in_groups_carry_attributes() {
+    let mut w = new_writer();
+    let root = w.root();
+    let g = w.add_group(root, "ocean").unwrap();
+    let d = w
+        .add_dataset(
+            g,
+            "temp",
+            DatasetSpec::numeric(DType::Float(4), ByteOrder::Little, &[2]).unwrap(),
+        )
+        .unwrap();
+    w.put_text_attribute(d, "units", "degC").unwrap();
+    w.write(d, &Hyperslab::all(&[2]), &[1.5f32, 2.5]).unwrap();
+    let file = reopen(w.close().unwrap().into_inner());
+    assert_eq!(read_all::<f32>(&file, "/ocean/temp"), [1.5, 2.5]);
+    assert_eq!(
+        file.dataset("/ocean/temp")
+            .unwrap()
+            .attribute("units")
+            .unwrap()
+            .data,
+        b"degC"
+    );
+}
+
+#[test]
+fn wrong_writes_are_rejected_and_change_nothing() {
+    let mut w = new_writer();
+    let root = w.root();
+    let d = w
+        .add_dataset(
+            root,
+            "v",
+            DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[2, 2]).unwrap(),
+        )
+        .unwrap();
+    let all = Hyperslab::all(&[2, 2]);
+    assert!(matches!(
+        w.write(d, &all, &[1i32, 2, 3]),
+        Err(Error::BadRequest(_))
+    ));
+    assert!(matches!(
+        w.write(d, &all, &[1.0f32; 4]),
+        Err(Error::TypeMismatch { .. })
+    ));
+    let outside = Hyperslab {
+        start: vec![1, 1],
+        count: vec![2, 2],
+    };
+    assert!(matches!(
+        w.write(d, &outside, &[1i32; 4]),
+        Err(Error::BadRequest(_))
+    ));
+    assert!(matches!(
+        w.add_dataset(
+            root,
+            "v",
+            DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[1]).unwrap()
+        ),
+        Err(Error::BadRequest(_))
+    ));
+    w.write(d, &all, &[1i32, 2, 3, 4]).unwrap();
+    let file = reopen(w.close().unwrap().into_inner());
+    assert_eq!(read_all::<i32>(&file, "/v"), [1, 2, 3, 4]);
+}
+
+#[test]
+fn a_wrong_fill_value_length_is_a_bad_request() {
+    let mut w = new_writer();
+    let root = w.root();
+    let spec = DatasetSpec::numeric(DType::Float(8), ByteOrder::Little, &[2])
+        .unwrap()
+        .fill_value(vec![0; 4]);
+    assert!(matches!(
+        w.add_dataset(root, "v", spec),
         Err(Error::BadRequest(_))
     ));
 }
