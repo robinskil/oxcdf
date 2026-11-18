@@ -8,7 +8,7 @@ use super::encode::UNDEFINED_ADDRESS;
 use super::header::{encode_header, encode_superblock, header_len, SUPERBLOCK_BYTES};
 use super::message::{
     encode_attribute, encode_attribute_info, encode_group_info, encode_hard_link, encode_link_info,
-    numeric_datatype,
+    numeric_datatype, MAX_MESSAGE_BYTES,
 };
 use super::sink::ByteSink;
 use crate::dtype::{DType, Element};
@@ -52,6 +52,8 @@ impl WriteOptions {
     }
 
     /// Set the body size of the `Nil` message at the end of each object header.
+    ///
+    /// The limit is 65535 bytes. [`Hdf5Writer::create`] rejects a larger size.
     pub fn header_slack_bytes(mut self, bytes: usize) -> Self {
         self.header_slack_bytes = bytes;
         self
@@ -134,7 +136,15 @@ pub struct Hdf5Writer<S: ByteSink> {
 
 impl<S: ByteSink> Hdf5Writer<S> {
     /// Start a file with an empty root group. Nothing is written until [`Self::close`].
+    ///
+    /// A header slack above 65535 bytes is [`Error::BadRequest`].
     pub fn create(sink: S, options: WriteOptions) -> Result<Self> {
+        if options.header_slack_bytes > MAX_MESSAGE_BYTES {
+            return Err(Error::bad_request(format!(
+                "a header slack of {} bytes is above the {MAX_MESSAGE_BYTES}-byte message limit",
+                options.header_slack_bytes
+            )));
+        }
         let alloc = Allocator::new(SUPERBLOCK_BYTES, options.metadata_block_bytes);
         let root = Node {
             name: String::new(),
@@ -555,6 +565,21 @@ mod tests {
         w.add_group(root, "a").unwrap();
         let file = reopen(w.close().unwrap().into_inner());
         assert_eq!(file.root().groups.len(), 1);
+    }
+
+    #[test]
+    fn a_slack_above_the_body_limit_is_rejected_at_create() {
+        let above = WriteOptions::default().header_slack_bytes(65536);
+        assert!(matches!(
+            Hdf5Writer::create(MemorySink::new(), above),
+            Err(Error::BadRequest(_))
+        ));
+        let at = WriteOptions::default().header_slack_bytes(65535);
+        let mut w = Hdf5Writer::create(MemorySink::new(), at).unwrap();
+        let root = w.root();
+        w.add_group(root, "a").unwrap();
+        let file = reopen(w.close().unwrap().into_inner());
+        assert!(file.root().group("a").is_some());
     }
 
     #[test]
