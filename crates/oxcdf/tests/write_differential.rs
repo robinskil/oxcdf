@@ -2,7 +2,7 @@
 //! netcdf-c reads a file from the HDF5 writer.
 //!
 //! The root holds more than eight compact attributes and more than eight links.
-//! The group `wide` holds 2000 links.
+//! The header of the group `wide` is larger than the metadata block.
 //!
 //! Run with:
 //!
@@ -44,7 +44,7 @@ fn netcdf_c_reads_a_file_from_the_writer() {
         .unwrap();
     let wide = w.add_group(root, "wide").unwrap();
     for i in 0..2000 {
-        w.add_group(wide, &format!("g{i:04}")).unwrap();
+        w.add_group(wide, &format!("group_{i:04}")).unwrap();
     }
     w.close().unwrap();
 
