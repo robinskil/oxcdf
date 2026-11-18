@@ -81,7 +81,8 @@ impl ByteSink for MemorySink {
 /// A byte sink backed by an open file handle.
 ///
 /// Writes go through positional I/O (`pwrite` on Unix, `seek_write` on Windows),
-/// as [`crate::source::FileSource`] does for reads.
+/// as [`crate::source::FileSource`] does for reads. On another platform each
+/// write is [`Error::Unsupported`].
 #[derive(Debug)]
 pub struct FileSink {
     file: File,
@@ -99,27 +100,7 @@ impl FileSink {
 impl ByteSink for FileSink {
     fn write_all_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
         range_end(offset, data.len())?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            self.file.write_all_at(data, offset)?;
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::FileExt;
-            let mut done = 0usize;
-            while done < data.len() {
-                let n = self.file.seek_write(&data[done..], offset + done as u64)?;
-                if n == 0 {
-                    return Err(Error::Io(std::io::ErrorKind::WriteZero.into()));
-                }
-                done += n;
-            }
-        }
-
-        Ok(())
+        write_at(&self.file, offset, data)
     }
 
     fn set_len(&mut self, len: u64) -> Result<()> {
@@ -131,6 +112,37 @@ impl ByteSink for FileSink {
         self.file.sync_all()?;
         Ok(())
     }
+}
+
+/// Write all of `data` to `file` at `offset` with `pwrite`.
+#[cfg(unix)]
+fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(data, offset)?;
+    Ok(())
+}
+
+/// Write all of `data` to `file` at `offset` with `seek_write`.
+#[cfg(windows)]
+fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < data.len() {
+        let n = file.seek_write(&data[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(Error::Io(std::io::ErrorKind::WriteZero.into()));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// Return [`Error::Unsupported`]: this platform has no positional file write.
+#[cfg(not(any(unix, windows)))]
+fn write_at(_file: &File, _offset: u64, _data: &[u8]) -> Result<()> {
+    Err(Error::unsupported(
+        "positional file writes on this platform",
+    ))
 }
 
 #[cfg(test)]
