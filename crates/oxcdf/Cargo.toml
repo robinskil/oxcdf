@@ -18,6 +18,8 @@ ndarray = ["dep:ndarray"]
 object-store = ["oxcdf-hdf5/object-store", "dep:object_store", "dep:tokio"]
 # The asynchronous engine. It shares every pure part with the synchronous one.
 async = ["oxcdf-hdf5/async", "dep:async-trait", "dep:tokio"]
+# The HDF5 writer of `oxcdf::hdf5`. The netCDF writer does not exist yet.
+write = ["oxcdf-hdf5/write"]
 # Compare this reader against netcdf-c, value by value. Off by default: the
 # crate exists to avoid that library.
 diff-tests = ["dep:netcdf"]

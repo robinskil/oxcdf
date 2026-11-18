@@ -52,6 +52,7 @@
 //! * [`superblock`], [`objheader`] and [`message`] parse the container.
 //! * [`btree1`], [`btree2`], [`fractal`], [`heap`] and [`chunk_index`] parse
 //!   the structures those messages point at.
+//! * `write` builds a new file, behind the `write` feature.
 //!
 //! # Scope
 //!
@@ -61,7 +62,8 @@
 //! [`Error::is_fallback_worthy`] to send one dataset to another library. Every
 //! other error marks a damaged file or a defect here.
 //!
-//! The crate does not write files.
+//! The `write` feature creates files. It supports groups, attributes and
+//! contiguous numeric datasets.
 
 // docs.rs builds with `--cfg docsrs` on nightly, so every feature-gated item
 // carries a badge that names the feature. A stable build ignores this.

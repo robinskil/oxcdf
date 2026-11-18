@@ -55,9 +55,12 @@ jobs:
           - name: object-store
             oxcdf: "object-store"
             hdf5: "object-store"
+          - name: write
+            oxcdf: "write"
+            hdf5: "write"
           - name: every feature
-            oxcdf: "async,object-store,ndarray"
-            hdf5: "async,object-store"
+            oxcdf: "async,object-store,ndarray,write"
+            hdf5: "async,object-store,write"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -97,7 +100,7 @@ jobs:
       - name: test with default features
         run: cargo test --workspace
       - name: test with every feature a user can select
-        run: cargo test --workspace --features oxcdf/async,oxcdf/object-store,oxcdf/ndarray
+        run: cargo test --workspace --features oxcdf/async,oxcdf/object-store,oxcdf/ndarray,oxcdf/write
 
   docs:
     name: docs
@@ -116,9 +119,9 @@ jobs:
       - name: docs, default features
         run: cargo doc --workspace --no-deps
       - name: docs, every feature
-        run: cargo doc --workspace --no-deps --features oxcdf/async,oxcdf/object-store,oxcdf/ndarray
+        run: cargo doc --workspace --no-deps --features oxcdf/async,oxcdf/object-store,oxcdf/ndarray,oxcdf/write
       - name: docs, lower crate alone
-        run: cargo doc -p oxcdf-hdf5 --no-deps --features async,object-store
+        run: cargo doc -p oxcdf-hdf5 --no-deps --features async,object-store,write
 
   msrv:
     name: msrv 1.91
@@ -130,7 +133,7 @@ jobs:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
       # `rust-version` in the manifest is a promise. Hold it.
-      - run: cargo check --workspace --all-targets --features oxcdf/async,oxcdf/object-store,oxcdf/ndarray
+      - run: cargo check --workspace --all-targets --features oxcdf/async,oxcdf/object-store,oxcdf/ndarray,oxcdf/write
 
   differential:
     name: differential against netcdf-c
@@ -150,7 +153,7 @@ jobs:
       # This is the strongest correctness signal the crate has. It compares
       # every value against the C library the crate replaces.
       - name: compare every value
-        run: cargo test --workspace --features oxcdf/diff-tests,oxcdf/object-store,oxcdf/ndarray,oxcdf/async
+        run: cargo test --workspace --features oxcdf/diff-tests,oxcdf/object-store,oxcdf/ndarray,oxcdf/async,oxcdf/write
 
   miri:
     name: miri
