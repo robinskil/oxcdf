@@ -56,7 +56,8 @@ pub fn numeric_datatype(dtype: DType, order: ByteOrder) -> Result<Datatype> {
 
 /// Encode a version 1 datatype message body.
 ///
-/// Integer, float and fixed string classes only. Each other class is
+/// It always writes version 1 and ignores [`Datatype::version`]. Integer,
+/// float and fixed string classes only. Each other class is
 /// [`Error::Unsupported`].
 pub fn encode_datatype(datatype: &Datatype) -> Result<Vec<u8>> {
     let (class, bits, properties) = match &datatype.class {
@@ -132,11 +133,36 @@ fn order_bit(order: ByteOrder) -> u8 {
     }
 }
 
+/// The highest dataspace rank the HDF5 library accepts.
+pub const MAX_RANK: usize = 32;
+
 /// Encode a version 2 dataspace message body.
 ///
-/// HDF5 limits the rank to one byte. Dimensions past rank 255 are dropped.
-pub fn encode_dataspace(space: &Dataspace) -> Vec<u8> {
-    let rank = u8::try_from(space.dims.len()).unwrap_or(u8::MAX);
+/// A rank above [`MAX_RANK`], a `max_dims` of another length, or a scalar or
+/// null space with dimensions is [`Error::BadRequest`].
+pub fn encode_dataspace(space: &Dataspace) -> Result<Vec<u8>> {
+    let len = space.dims.len();
+    if len > MAX_RANK {
+        return Err(Error::bad_request(format!(
+            "dataspace rank {len} is above the HDF5 limit of {MAX_RANK}"
+        )));
+    }
+    if let Some(max) = &space.max_dims {
+        if max.len() != len {
+            return Err(Error::bad_request(format!(
+                "dataspace has {len} dimensions but {} maximum dimensions",
+                max.len()
+            )));
+        }
+    }
+    if space.kind != DataspaceKind::Simple && len != 0 {
+        return Err(Error::bad_request(format!(
+            "a {:?} dataspace has no dimensions, but this one has {len}",
+            space.kind
+        )));
+    }
+    // The rank is at most MAX_RANK, so it fits in one byte.
+    let rank = u8::try_from(len).unwrap_or(u8::MAX);
     let mut e = Encoder::new();
     e.u8(2);
     e.u8(rank);
@@ -146,31 +172,38 @@ pub fn encode_dataspace(space: &Dataspace) -> Vec<u8> {
         DataspaceKind::Simple => 1,
         DataspaceKind::Null => 2,
     });
-    for &dim in space.dims.iter().take(usize::from(rank)) {
+    for &dim in &space.dims {
         e.u64(dim);
     }
-    if let Some(max) = &space.max_dims {
-        for &dim in max.iter().take(usize::from(rank)) {
-            e.u64(dim);
-        }
+    for &dim in space.max_dims.iter().flatten() {
+        e.u64(dim);
     }
-    e.into_bytes()
+    Ok(e.into_bytes())
 }
 
 /// Encode a version 3 fill value message body.
-pub fn encode_fill_value(fill: &FillValue) -> Vec<u8> {
+///
+/// An empty value encodes as no fill value. A body above
+/// [`MAX_MESSAGE_BYTES`] is [`Error::Unsupported`].
+pub fn encode_fill_value(fill: &FillValue) -> Result<Vec<u8>> {
     let mut e = Encoder::new();
     e.u8(3);
-    match &fill.bytes {
-        Some(bytes) => {
+    match fill.bytes.as_deref() {
+        Some(bytes) if !bytes.is_empty() => {
+            let total = bytes.len().saturating_add(6);
+            if total > MAX_MESSAGE_BYTES {
+                return Err(Error::unsupported(format!(
+                    "fill value needs {total} bytes, above the {MAX_MESSAGE_BYTES}-byte message limit"
+                )));
+            }
             // Late allocation, write if set, and a value follows.
             e.u8(0x2A);
             e.u32(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
             e.bytes(bytes);
         }
-        None => e.u8(0x0A),
+        _ => e.u8(0x0A),
     }
-    e.into_bytes()
+    Ok(e.into_bytes())
 }
 
 /// Encode a version 3 contiguous layout message body.
@@ -207,16 +240,23 @@ pub fn encode_group_info() -> Vec<u8> {
 }
 
 /// Encode a version 1 hard link message body with a UTF-8 name.
-pub fn encode_hard_link(name: &str, address: u64, creation_order: u64) -> Vec<u8> {
+///
+/// An empty name is [`Error::BadRequest`]. A body above
+/// [`MAX_MESSAGE_BYTES`] is [`Error::Unsupported`].
+pub fn encode_hard_link(name: &str, address: u64, creation_order: u64) -> Result<Vec<u8>> {
     let len = name.len();
-    // Width code: 0 is one byte, 1 is two bytes, 2 is four bytes.
-    let width_code: u8 = if len < 256 {
-        0
-    } else if len <= usize::from(u16::MAX) {
-        1
-    } else {
-        2
-    };
+    if len == 0 {
+        return Err(Error::bad_request("a link name is empty"));
+    }
+    // Width code 0 is a one-byte length, 1 is a two-byte length.
+    let width_code: u8 = if len < 256 { 0 } else { 1 };
+    // Fixed fields are 19 bytes, plus the length field and the name.
+    let total = len.saturating_add(19 + (1usize << width_code));
+    if total > MAX_MESSAGE_BYTES {
+        return Err(Error::unsupported(format!(
+            "link needs {total} bytes, above the {MAX_MESSAGE_BYTES}-byte message limit"
+        )));
+    }
     let mut e = Encoder::new();
     e.u8(1);
     e.u8(0x14 | width_code);
@@ -225,7 +265,7 @@ pub fn encode_hard_link(name: &str, address: u64, creation_order: u64) -> Vec<u8
     e.uint(len as u64, 1 << width_code);
     e.bytes(name.as_bytes());
     e.u64(address);
-    e.into_bytes()
+    Ok(e.into_bytes())
 }
 
 /// Encode a version 0 attribute info message body for compact storage.
@@ -243,8 +283,9 @@ pub fn encode_attribute_info(max_creation_index: u16) -> Vec<u8> {
 
 /// Encode a version 3 attribute message body with a UTF-8 name.
 ///
-/// A wrong data length or a NUL in the name is [`Error::BadRequest`]. A body
-/// above [`MAX_MESSAGE_BYTES`] is [`Error::Unsupported`].
+/// A wrong dataspace, a wrong data length or a NUL in the name is
+/// [`Error::BadRequest`]. A body above [`MAX_MESSAGE_BYTES`] is
+/// [`Error::Unsupported`].
 pub fn encode_attribute(attribute: &Attribute) -> Result<Vec<u8>> {
     if attribute.name.as_bytes().contains(&0) {
         return Err(Error::bad_request(format!(
@@ -252,6 +293,7 @@ pub fn encode_attribute(attribute: &Attribute) -> Result<Vec<u8>> {
             attribute.name
         )));
     }
+    let dataspace = encode_dataspace(&attribute.dataspace)?;
     let expected = attribute
         .dataspace
         .element_count()
@@ -266,7 +308,6 @@ pub fn encode_attribute(attribute: &Attribute) -> Result<Vec<u8>> {
     }
 
     let datatype = encode_datatype(&attribute.datatype)?;
-    let dataspace = encode_dataspace(&attribute.dataspace);
     let name_size = attribute.name.len().saturating_add(1);
     let total = [
         name_size,
@@ -385,7 +426,7 @@ mod tests {
                 dims,
                 max_dims: max,
             };
-            let back = Dataspace::parse(&encode_dataspace(&space), Sizes::EIGHT).unwrap();
+            let back = Dataspace::parse(&encode_dataspace(&space).unwrap(), Sizes::EIGHT).unwrap();
             assert_eq!(back.kind, space.kind);
             assert_eq!(back.dims, space.dims);
             assert_eq!(back.max_dims, space.max_dims);
@@ -393,13 +434,57 @@ mod tests {
     }
 
     #[test]
+    fn a_dataspace_with_a_wrong_shape_is_a_bad_request() {
+        for (kind, dims, max_dims) in [
+            (DataspaceKind::Simple, vec![1; 33], None),
+            (DataspaceKind::Simple, vec![2, 3], Some(vec![2])),
+            (DataspaceKind::Simple, vec![2], Some(vec![2, 3])),
+            (DataspaceKind::Scalar, vec![2], None),
+            (DataspaceKind::Null, vec![2], None),
+        ] {
+            let space = Dataspace {
+                kind,
+                dims,
+                max_dims,
+            };
+            assert!(matches!(
+                encode_dataspace(&space),
+                Err(Error::BadRequest(_))
+            ));
+        }
+        let rank32 = Dataspace {
+            kind: DataspaceKind::Simple,
+            dims: vec![1; 32],
+            max_dims: None,
+        };
+        assert!(encode_dataspace(&rank32).is_ok());
+    }
+
+    #[test]
     fn fill_values_round_trip() {
         let some = FillValue {
             bytes: Some(vec![1, 2, 3, 4]),
         };
-        assert_eq!(FillValue::parse(&encode_fill_value(&some)).unwrap(), some);
+        assert_eq!(
+            FillValue::parse(&encode_fill_value(&some).unwrap()).unwrap(),
+            some
+        );
         let none = FillValue { bytes: None };
-        assert_eq!(FillValue::parse(&encode_fill_value(&none)).unwrap(), none);
+        assert_eq!(
+            FillValue::parse(&encode_fill_value(&none).unwrap()).unwrap(),
+            none
+        );
+    }
+
+    #[test]
+    fn an_empty_fill_value_encodes_as_no_fill_value() {
+        assert_eq!(
+            encode_fill_value(&FillValue {
+                bytes: Some(vec![])
+            })
+            .unwrap(),
+            encode_fill_value(&FillValue { bytes: None }).unwrap()
+        );
     }
 
     #[test]
@@ -414,11 +499,25 @@ mod tests {
     #[test]
     fn a_hard_link_round_trips() {
         for name in ["temp", "zee\u{00eb}n", &"n".repeat(300)] {
-            let link = Link::parse(&encode_hard_link(name, 4096, 7), Sizes::EIGHT).unwrap();
+            let link =
+                Link::parse(&encode_hard_link(name, 4096, 7).unwrap(), Sizes::EIGHT).unwrap();
             assert_eq!(link.name, name);
             assert_eq!(link.hard_address(), Some(4096));
             assert_eq!(link.creation_order, Some(7));
         }
+    }
+
+    #[test]
+    fn wrong_link_names_are_rejected() {
+        assert!(matches!(
+            encode_hard_link("", 48, 0),
+            Err(Error::BadRequest(_))
+        ));
+        assert!(matches!(
+            encode_hard_link(&"n".repeat(70000), 48, 0),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(encode_hard_link(&"n".repeat(300), 48, 0).is_ok());
     }
 
     #[test]
@@ -456,6 +555,33 @@ mod tests {
         assert_eq!(back.datatype, attribute.datatype);
         assert_eq!(back.dataspace.dims, vec![2]);
         assert_eq!(back.data, attribute.data);
+    }
+
+    #[test]
+    fn an_attribute_with_a_wrong_dataspace_is_a_bad_request() {
+        for dataspace in [
+            Dataspace {
+                kind: DataspaceKind::Scalar,
+                dims: vec![1],
+                max_dims: None,
+            },
+            Dataspace {
+                kind: DataspaceKind::Simple,
+                dims: vec![1],
+                max_dims: Some(vec![1, 1]),
+            },
+        ] {
+            let attribute = Attribute {
+                name: "n".into(),
+                datatype: numeric_datatype(DType::Int(4), ByteOrder::Little).unwrap(),
+                dataspace,
+                data: vec![0; 4],
+            };
+            assert!(matches!(
+                encode_attribute(&attribute),
+                Err(Error::BadRequest(_))
+            ));
+        }
     }
 
     #[test]
