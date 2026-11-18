@@ -15,16 +15,6 @@ impl Encoder {
         Self::default()
     }
 
-    /// Number of bytes written so far.
-    pub fn len(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// Whether no byte is written yet.
-    pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
-    }
-
     /// Append one byte.
     pub fn u8(&mut self, v: u8) {
         self.buf.push(v);

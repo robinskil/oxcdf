@@ -18,6 +18,7 @@ const FILL_BLOCK_BYTES: usize = 1 << 20;
 
 /// The datatype, shape and fill value of a new dataset.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DatasetSpec {
     /// Type of one element.
     pub datatype: Datatype,
@@ -28,19 +29,24 @@ pub struct DatasetSpec {
 }
 
 impl DatasetSpec {
+    /// A dataset of `datatype` and `shape` with no fill value.
+    pub fn new(datatype: Datatype, shape: &[u64]) -> Self {
+        Self {
+            datatype,
+            shape: shape.to_vec(),
+            fill_value: None,
+        }
+    }
+
     /// A numeric dataset with no fill value.
     ///
     /// A type with no numeric HDF5 datatype is [`Error::Unsupported`].
     pub fn numeric(dtype: DType, order: ByteOrder, shape: &[u64]) -> Result<Self> {
-        Ok(Self {
-            datatype: numeric_datatype(dtype, order)?,
-            shape: shape.to_vec(),
-            fill_value: None,
-        })
+        Ok(Self::new(numeric_datatype(dtype, order)?, shape))
     }
 
     /// Set the fill value: one element in the dataset byte order.
-    pub fn fill_value(mut self, bytes: Vec<u8>) -> Self {
+    pub fn with_fill_value(mut self, bytes: Vec<u8>) -> Self {
         self.fill_value = Some(bytes);
         self
     }
@@ -357,7 +363,7 @@ mod tests {
     fn the_fill_goes_in_blocks_of_one_mebibyte_at_most() {
         let spec = DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[600_000])
             .unwrap()
-            .fill_value(vec![1, 2, 3, 4]);
+            .with_fill_value(vec![1, 2, 3, 4]);
         let mut d = Dataset::new(spec).unwrap();
         let mut sink = Recorder::default();
         let mut alloc = Allocator::new(0, 0);
@@ -396,15 +402,14 @@ mod tests {
             DatasetSpec::numeric(DType::Char, ByteOrder::Little, &[1]),
             Err(Error::Unsupported(_))
         ));
-        let compound = DatasetSpec {
-            datatype: Datatype {
+        let compound = DatasetSpec::new(
+            Datatype {
                 version: 1,
                 size: 8,
                 class: crate::message::DatatypeClass::Compound { members: vec![] },
             },
-            shape: vec![1],
-            fill_value: None,
-        };
+            &[1],
+        );
         assert!(matches!(Dataset::new(compound), Err(Error::Unsupported(_))));
         // A zero axis gives an empty extent before the product overflows.
         assert_eq!(

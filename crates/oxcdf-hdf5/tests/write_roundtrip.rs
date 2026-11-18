@@ -246,7 +246,7 @@ fn a_partial_write_leaves_the_fill_value_elsewhere() {
     let root = w.root();
     let spec = DatasetSpec::numeric(DType::Float(4), ByteOrder::Little, &[3, 4])
         .unwrap()
-        .fill_value((-999.0f32).to_le_bytes().to_vec());
+        .with_fill_value((-999.0f32).to_le_bytes().to_vec());
     let d = w.add_dataset(root, "t", spec).unwrap();
     let slab = Hyperslab::new(vec![1, 1], vec![2, 2], &[3, 4]).unwrap();
     w.write(d, &slab, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
@@ -286,7 +286,7 @@ fn a_dataset_with_no_write_reads_as_fill() {
     let root = w.root();
     let spec = DatasetSpec::numeric(DType::Int(2), ByteOrder::Little, &[4])
         .unwrap()
-        .fill_value(7i16.to_le_bytes().to_vec());
+        .with_fill_value(7i16.to_le_bytes().to_vec());
     w.add_dataset(root, "v", spec).unwrap();
     let file = reopen(w.close().unwrap().into_inner());
     assert_eq!(read_all::<i16>(&file, "/v"), [7, 7, 7, 7]);
@@ -398,7 +398,7 @@ fn a_wrong_fill_value_length_is_a_bad_request() {
     let root = w.root();
     let spec = DatasetSpec::numeric(DType::Float(8), ByteOrder::Little, &[2])
         .unwrap()
-        .fill_value(vec![0; 4]);
+        .with_fill_value(vec![0; 4]);
     assert!(matches!(
         w.add_dataset(root, "v", spec),
         Err(Error::BadRequest(_))
@@ -421,8 +421,8 @@ fn a_typed_write_needs_the_exact_datatype() {
     ));
     w.write_raw(narrow, &all, &[0; 8]).unwrap();
 
-    let wide = DatasetSpec {
-        datatype: Datatype {
+    let wide = DatasetSpec::new(
+        Datatype {
             version: 1,
             size: 260,
             class: DatatypeClass::FixedPoint {
@@ -432,9 +432,8 @@ fn a_typed_write_needs_the_exact_datatype() {
                 bit_precision: 2080,
             },
         },
-        shape: vec![2],
-        fill_value: None,
-    };
+        &[2],
+    );
     let wide = w.add_dataset(root, "wide", wide).unwrap();
     assert!(matches!(
         w.write(wide, &all, &[1i32; 130]),

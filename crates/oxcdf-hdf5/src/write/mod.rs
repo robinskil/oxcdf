@@ -34,18 +34,15 @@
 //! It does not apply the netCDF conventions. It does not change an existing
 //! file.
 
-pub mod alloc;
-pub mod dataset;
-pub mod encode;
-pub mod header;
-pub mod message;
-pub mod sink;
-pub mod writer;
+pub(crate) mod alloc;
+mod dataset;
+pub(crate) mod encode;
+pub(crate) mod header;
+pub(crate) mod message;
+mod sink;
+mod writer;
 
-pub use alloc::*;
-pub use dataset::*;
-pub use encode::*;
-pub use header::*;
-pub use message::*;
-pub use sink::*;
-pub use writer::*;
+pub use dataset::DatasetSpec;
+pub use message::numeric_datatype;
+pub use sink::{ByteSink, FileSink, MemorySink};
+pub use writer::{DatasetId, GroupId, Hdf5Writer, ObjectId, WriteOptions};
