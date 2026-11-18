@@ -50,7 +50,7 @@ impl MemorySink {
             .map_err(|_| Error::bad_request(format!("length {len} exceeds the address space")))?;
         if let Some(extra) = len.checked_sub(self.data.len()) {
             self.data
-                .try_reserve_exact(extra)
+                .try_reserve(extra)
                 .map_err(|_| Error::Io(std::io::ErrorKind::OutOfMemory.into()))?;
         }
         self.data.resize(len, 0);

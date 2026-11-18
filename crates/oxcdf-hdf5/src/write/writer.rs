@@ -1,5 +1,7 @@
 //! The writer: a tree of objects in memory, written to a sink at close.
 
+use std::collections::HashSet;
+
 use super::alloc::Allocator;
 use super::dataset::{to_order, Dataset, DatasetSpec};
 use super::encode::UNDEFINED_ADDRESS;
@@ -103,11 +105,20 @@ struct StoredAttribute {
     body: Vec<u8>,
 }
 
+/// The links of one group.
+#[derive(Debug, Default)]
+struct Links {
+    /// Child node indices in insert order. This order gives the output.
+    children: Vec<usize>,
+    /// Child names, for the duplicate check only.
+    names: HashSet<String>,
+}
+
 /// The kinds of object the writer holds.
 #[derive(Debug)]
 enum NodeKind {
-    /// A group with its children in insert order.
-    Group { children: Vec<usize> },
+    /// A group with its links.
+    Group(Links),
     /// A dataset. It has no children.
     Dataset(Box<Dataset>),
 }
@@ -127,9 +138,7 @@ impl<S: ByteSink> Hdf5Writer<S> {
         let alloc = Allocator::new(SUPERBLOCK_BYTES, options.metadata_block_bytes);
         let root = Node {
             name: String::new(),
-            kind: NodeKind::Group {
-                children: Vec::new(),
-            },
+            kind: NodeKind::Group(Links::default()),
             attributes: Vec::new(),
         };
         Ok(Self {
@@ -152,9 +161,7 @@ impl<S: ByteSink> Hdf5Writer<S> {
     /// [`Error::Unsupported`]. An error changes nothing.
     pub fn add_group(&mut self, parent: GroupId, name: &str) -> Result<GroupId> {
         self.check_link(parent, name)?;
-        let kind = NodeKind::Group {
-            children: Vec::new(),
-        };
+        let kind = NodeKind::Group(Links::default());
         Ok(GroupId(self.push_child(parent, name, kind)))
     }
 
@@ -233,14 +240,14 @@ impl<S: ByteSink> Hdf5Writer<S> {
     /// Check that `parent` is a group that can take a new link `name`.
     fn check_link(&self, parent: GroupId, name: &str) -> Result<()> {
         check_name(name)?;
-        let children = self.children(parent)?;
-        if children.iter().any(|&c| self.nodes[c].name == name) {
+        let links = self.links(parent)?;
+        if links.names.contains(name) {
             return Err(Error::bad_request(format!(
                 "the group already holds a link {name:?}"
             )));
         }
         // The same check as at close, so that close cannot fail on this name.
-        encode_hard_link(name, UNDEFINED_ADDRESS, to_u64(children.len())?)?;
+        encode_hard_link(name, UNDEFINED_ADDRESS, to_u64(links.children.len())?)?;
         Ok(())
     }
 
@@ -252,16 +259,17 @@ impl<S: ByteSink> Hdf5Writer<S> {
             kind,
             attributes: Vec::new(),
         });
-        if let NodeKind::Group { children } = &mut self.nodes[parent.0].kind {
-            children.push(id);
+        if let NodeKind::Group(links) = &mut self.nodes[parent.0].kind {
+            links.children.push(id);
+            links.names.insert(name.to_owned());
         }
         id
     }
 
-    /// The children of group `id`, or [`Error::BadRequest`] when `id` is no group.
-    fn children(&self, id: GroupId) -> Result<&[usize]> {
+    /// The links of group `id`, or [`Error::BadRequest`] when `id` is no group.
+    fn links(&self, id: GroupId) -> Result<&Links> {
         match self.nodes.get(id.0).map(|n| &n.kind) {
-            Some(NodeKind::Group { children }) => Ok(children),
+            Some(NodeKind::Group(links)) => Ok(links),
             _ => Err(Error::bad_request(format!("no group with id {}", id.0))),
         }
     }
@@ -393,7 +401,7 @@ impl<S: ByteSink> Hdf5Writer<S> {
     /// The node index of `object`, or [`Error::BadRequest`] for an unknown object.
     fn node_index(&self, object: ObjectId) -> Result<usize> {
         match object {
-            ObjectId::Group(id) => self.children(id).map(|_| id.0),
+            ObjectId::Group(id) => self.links(id).map(|_| id.0),
             ObjectId::Dataset(id) => match self.nodes.get(id.0).map(|n| &n.kind) {
                 Some(NodeKind::Dataset(_)) => Ok(id.0),
                 _ => Err(no_dataset(id)),
@@ -430,8 +438,8 @@ impl<S: ByteSink> Hdf5Writer<S> {
         let mut stack = vec![ROOT];
         while let Some(node) = stack.pop() {
             order.push(node);
-            if let NodeKind::Group { children } = &self.nodes[node].kind {
-                stack.extend(children.iter().rev());
+            if let NodeKind::Group(links) = &self.nodes[node].kind {
+                stack.extend(links.children.iter().rev());
             }
         }
         order
@@ -447,7 +455,7 @@ impl<S: ByteSink> Hdf5Writer<S> {
             encode_attribute_info(to_u16(attributes.len())?),
         );
         let mut messages = match kind {
-            NodeKind::Group { children } => {
+            NodeKind::Group(Links { children, .. }) => {
                 let mut messages = Vec::with_capacity(children.len() + attributes.len() + 3);
                 messages.push(message(
                     MessageType::LinkInfo,
@@ -547,6 +555,25 @@ mod tests {
         w.add_group(root, "a").unwrap();
         let file = reopen(w.close().unwrap().into_inner());
         assert_eq!(file.root().groups.len(), 1);
+    }
+
+    #[test]
+    fn a_duplicate_is_rejected_after_many_inserts() {
+        let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+        let root = w.root();
+        for i in 0..1000 {
+            w.add_group(root, &format!("g{i}")).unwrap();
+        }
+        let spec = DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[1]).unwrap();
+        assert!(matches!(
+            w.add_dataset(root, "g500", spec.clone()),
+            Err(Error::BadRequest(_))
+        ));
+        w.add_dataset(root, "d", spec).unwrap();
+        assert!(matches!(w.add_group(root, "d"), Err(Error::BadRequest(_))));
+        let file = reopen(w.close().unwrap().into_inner());
+        assert_eq!(file.root().groups.len(), 1000);
+        assert_eq!(file.datasets().len(), 1);
     }
 
     #[test]
