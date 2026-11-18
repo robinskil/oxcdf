@@ -5,7 +5,8 @@
 use super::encode::Encoder;
 use crate::error::{Error, Result};
 use crate::message::{
-    ByteOrder, CharSet, Dataspace, DataspaceKind, Datatype, DatatypeClass, FillValue, StringPad,
+    Attribute, ByteOrder, CharSet, Dataspace, DataspaceKind, Datatype, DatatypeClass, FillValue,
+    StringPad,
 };
 use crate::DType;
 
@@ -184,11 +185,126 @@ pub fn encode_contiguous_layout(address: Option<u64>, size: u64) -> Vec<u8> {
     e.into_bytes()
 }
 
+/// The largest message body the writer emits, in bytes.
+pub const MAX_MESSAGE_BYTES: usize = 65535;
+
+/// Encode a version 0 link info message body for compact storage.
+///
+/// It tracks creation order and has no fractal heap or name B-tree.
+pub fn encode_link_info(max_creation_index: u64) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.u8(0);
+    e.u8(0x01);
+    e.u64(max_creation_index);
+    e.address(None);
+    e.address(None);
+    e.into_bytes()
+}
+
+/// Encode a version 0 group info message body with default values.
+pub fn encode_group_info() -> Vec<u8> {
+    vec![0, 0]
+}
+
+/// Encode a version 1 hard link message body with a UTF-8 name.
+pub fn encode_hard_link(name: &str, address: u64, creation_order: u64) -> Vec<u8> {
+    let len = name.len();
+    // Width code: 0 is one byte, 1 is two bytes, 2 is four bytes.
+    let width_code: u8 = if len < 256 {
+        0
+    } else if len <= usize::from(u16::MAX) {
+        1
+    } else {
+        2
+    };
+    let mut e = Encoder::new();
+    e.u8(1);
+    e.u8(0x14 | width_code);
+    e.u64(creation_order);
+    e.u8(1);
+    e.uint(len as u64, 1 << width_code);
+    e.bytes(name.as_bytes());
+    e.u64(address);
+    e.into_bytes()
+}
+
+/// Encode a version 0 attribute info message body for compact storage.
+///
+/// It records the maximum creation index and has no fractal heap.
+pub fn encode_attribute_info(max_creation_index: u16) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.u8(0);
+    e.u8(0x01);
+    e.u16(max_creation_index);
+    e.address(None);
+    e.address(None);
+    e.into_bytes()
+}
+
+/// Encode a version 3 attribute message body with a UTF-8 name.
+///
+/// A wrong data length or a NUL in the name is [`Error::BadRequest`]. A body
+/// above [`MAX_MESSAGE_BYTES`] is [`Error::Unsupported`].
+pub fn encode_attribute(attribute: &Attribute) -> Result<Vec<u8>> {
+    if attribute.name.as_bytes().contains(&0) {
+        return Err(Error::bad_request(format!(
+            "attribute name {:?} holds a NUL byte",
+            attribute.name
+        )));
+    }
+    let expected = attribute
+        .dataspace
+        .element_count()
+        .checked_mul(u64::from(attribute.datatype.size));
+    if expected != u64::try_from(attribute.data.len()).ok() {
+        return Err(Error::bad_request(format!(
+            "attribute {:?} has {} data bytes, but its shape and type need {}",
+            attribute.name,
+            attribute.data.len(),
+            expected.map_or_else(|| "more than u64::MAX".to_string(), |n| n.to_string())
+        )));
+    }
+
+    let datatype = encode_datatype(&attribute.datatype)?;
+    let dataspace = encode_dataspace(&attribute.dataspace);
+    let name_size = attribute.name.len().saturating_add(1);
+    let total = [
+        name_size,
+        datatype.len(),
+        dataspace.len(),
+        attribute.data.len(),
+    ]
+    .iter()
+    .fold(9usize, |sum, &n| sum.saturating_add(n));
+    if total > MAX_MESSAGE_BYTES {
+        return Err(Error::unsupported(format!(
+            "attribute {:?} needs {total} bytes, above the {MAX_MESSAGE_BYTES}-byte message limit",
+            attribute.name
+        )));
+    }
+    // Each part is below the total, so each size fits in a u16.
+    let size16 = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+
+    let mut e = Encoder::new();
+    e.u8(3);
+    e.u8(0);
+    e.u16(size16(name_size));
+    e.u16(size16(datatype.len()));
+    e.u16(size16(dataspace.len()));
+    e.u8(1);
+    e.bytes(attribute.name.as_bytes());
+    e.u8(0);
+    e.bytes(&datatype);
+    e.bytes(&dataspace);
+    e.bytes(&attribute.data);
+    Ok(e.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cursor::Sizes;
-    use crate::message::Layout;
+    use crate::message::{AttributeInfo, Layout, Link, LinkInfo};
 
     #[test]
     fn an_f32_little_endian_datatype_has_the_library_bytes() {
@@ -293,5 +409,88 @@ mod tests {
                 Layout::parse(&encode_contiguous_layout(address, 960), Sizes::EIGHT).unwrap();
             assert_eq!(back, Layout::Contiguous { address, size: 960 });
         }
+    }
+
+    #[test]
+    fn a_hard_link_round_trips() {
+        for name in ["temp", "zee\u{00eb}n", &"n".repeat(300)] {
+            let link = Link::parse(&encode_hard_link(name, 4096, 7), Sizes::EIGHT).unwrap();
+            assert_eq!(link.name, name);
+            assert_eq!(link.hard_address(), Some(4096));
+            assert_eq!(link.creation_order, Some(7));
+        }
+    }
+
+    #[test]
+    fn link_info_is_compact_and_tracks_creation_order() {
+        let body = encode_link_info(12);
+        assert_eq!(body.len(), 26);
+        let info = LinkInfo::parse(&body, Sizes::EIGHT).unwrap();
+        assert_eq!(info.max_creation_index, Some(12));
+        assert!(!info.is_dense());
+    }
+
+    #[test]
+    fn attribute_info_is_compact() {
+        let body = encode_attribute_info(3);
+        assert_eq!(body.len(), 20);
+        assert!(!AttributeInfo::parse(&body, Sizes::EIGHT)
+            .unwrap()
+            .is_dense());
+    }
+
+    #[test]
+    fn an_attribute_round_trips() {
+        let attribute = Attribute {
+            name: "scale_factor".into(),
+            datatype: numeric_datatype(DType::Float(8), ByteOrder::Little).unwrap(),
+            dataspace: Dataspace {
+                kind: DataspaceKind::Simple,
+                dims: vec![2],
+                max_dims: None,
+            },
+            data: [0.5f64.to_le_bytes(), 2.0f64.to_le_bytes()].concat(),
+        };
+        let back = Attribute::parse(&encode_attribute(&attribute).unwrap(), Sizes::EIGHT).unwrap();
+        assert_eq!(back.name, attribute.name);
+        assert_eq!(back.datatype, attribute.datatype);
+        assert_eq!(back.dataspace.dims, vec![2]);
+        assert_eq!(back.data, attribute.data);
+    }
+
+    #[test]
+    fn an_oversize_attribute_is_unsupported() {
+        let attribute = Attribute {
+            name: "big".into(),
+            datatype: numeric_datatype(DType::Uint(1), ByteOrder::Little).unwrap(),
+            dataspace: Dataspace {
+                kind: DataspaceKind::Simple,
+                dims: vec![70000],
+                max_dims: None,
+            },
+            data: vec![0; 70000],
+        };
+        assert!(matches!(
+            encode_attribute(&attribute),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn an_attribute_with_a_wrong_data_length_is_a_bad_request() {
+        let attribute = Attribute {
+            name: "n".into(),
+            datatype: numeric_datatype(DType::Int(4), ByteOrder::Little).unwrap(),
+            dataspace: Dataspace {
+                kind: DataspaceKind::Scalar,
+                dims: vec![],
+                max_dims: None,
+            },
+            data: vec![0; 3],
+        };
+        assert!(matches!(
+            encode_attribute(&attribute),
+            Err(Error::BadRequest(_))
+        ));
     }
 }
