@@ -4,10 +4,15 @@ use super::alloc::Allocator;
 use super::encode::UNDEFINED_ADDRESS;
 use super::header::{encode_header, encode_superblock, header_len, SUPERBLOCK_BYTES};
 use super::message::{
-    encode_attribute_info, encode_group_info, encode_hard_link, encode_link_info,
+    encode_attribute, encode_attribute_info, encode_group_info, encode_hard_link, encode_link_info,
+    numeric_datatype,
 };
 use super::sink::ByteSink;
+use crate::dtype::Element;
 use crate::error::{Error, Result};
+use crate::message::{
+    Attribute, ByteOrder, CharSet, Dataspace, DataspaceKind, Datatype, DatatypeClass, StringPad,
+};
 use crate::objheader::{HeaderMessage, MessageType};
 
 /// Default size of one metadata block in bytes.
@@ -53,6 +58,31 @@ impl WriteOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GroupId(usize);
 
+/// A handle to a dataset in one [`Hdf5Writer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DatasetId(usize);
+
+/// A handle to a group or a dataset in one [`Hdf5Writer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectId {
+    /// A group.
+    Group(GroupId),
+    /// A dataset.
+    Dataset(DatasetId),
+}
+
+impl From<GroupId> for ObjectId {
+    fn from(id: GroupId) -> Self {
+        Self::Group(id)
+    }
+}
+
+impl From<DatasetId> for ObjectId {
+    fn from(id: DatasetId) -> Self {
+        Self::Dataset(id)
+    }
+}
+
 /// One object in the tree.
 #[derive(Debug)]
 struct Node {
@@ -60,6 +90,15 @@ struct Node {
     name: String,
     /// What the object is.
     kind: NodeKind,
+    /// Attributes in creation order. The position is the creation index.
+    attributes: Vec<StoredAttribute>,
+}
+
+/// An attribute with its message body encoded at put time.
+#[derive(Debug)]
+struct StoredAttribute {
+    name: String,
+    body: Vec<u8>,
 }
 
 /// The kinds of object the writer holds.
@@ -87,6 +126,7 @@ impl<S: ByteSink> Hdf5Writer<S> {
             kind: NodeKind::Group {
                 children: Vec::new(),
             },
+            attributes: Vec::new(),
         };
         Ok(Self {
             sink,
@@ -127,10 +167,146 @@ impl<S: ByteSink> Hdf5Writer<S> {
             kind: NodeKind::Group {
                 children: Vec::new(),
             },
+            attributes: Vec::new(),
         });
         let NodeKind::Group { children } = &mut self.nodes[parent.0].kind;
         children.push(id);
         Ok(GroupId(id))
+    }
+
+    /// Put `attribute` on `object`.
+    ///
+    /// An attribute with the same name gets the new value and keeps its
+    /// creation order. An unknown object, an empty name or a wrong attribute
+    /// is [`Error::BadRequest`]. A body above the message limit or too many
+    /// attributes is [`Error::Unsupported`]. An error changes nothing.
+    pub fn put_attribute(
+        &mut self,
+        object: impl Into<ObjectId>,
+        attribute: Attribute,
+    ) -> Result<()> {
+        let node = self.node_index(object.into())?;
+        if attribute.name.is_empty() {
+            return Err(Error::bad_request("an attribute name is empty"));
+        }
+        // The same check as at close, so that close cannot fail on this attribute.
+        let body = encode_attribute(&attribute)?;
+        let attributes = &mut self.nodes[node].attributes;
+        if let Some(existing) = attributes.iter_mut().find(|a| a.name == attribute.name) {
+            existing.body = body;
+            return Ok(());
+        }
+        // The new count is the attribute info maximum creation index.
+        let count = attributes.len().saturating_add(1);
+        if u16::try_from(count).is_err() {
+            return Err(Error::unsupported(format!(
+                "an object holds at most {} attributes",
+                u16::MAX
+            )));
+        }
+        attributes.push(StoredAttribute {
+            name: attribute.name,
+            body,
+        });
+        Ok(())
+    }
+
+    /// Put a little-endian numeric attribute on `object`.
+    ///
+    /// One value gives a scalar dataspace. Several values give a simple
+    /// dataspace of rank 1. No values is [`Error::BadRequest`]. The other
+    /// errors are those of [`Self::put_attribute`].
+    pub fn put_numeric_attribute<T: Element>(
+        &mut self,
+        object: impl Into<ObjectId>,
+        name: &str,
+        values: &[T],
+    ) -> Result<()> {
+        let dataspace = match values.len() {
+            0 => {
+                return Err(Error::bad_request(format!(
+                    "attribute {name:?} has no values"
+                )))
+            }
+            1 => Dataspace {
+                kind: DataspaceKind::Scalar,
+                dims: Vec::new(),
+                max_dims: None,
+            },
+            n => Dataspace {
+                kind: DataspaceKind::Simple,
+                dims: vec![to_u64(n)?],
+                max_dims: None,
+            },
+        };
+        let mut data = T::to_ne_vec(values);
+        if cfg!(target_endian = "big") {
+            for value in data.chunks_exact_mut(std::mem::size_of::<T>()) {
+                value.reverse();
+            }
+        }
+        let attribute = Attribute {
+            name: name.to_owned(),
+            datatype: numeric_datatype(T::DTYPE, ByteOrder::Little)?,
+            dataspace,
+            data,
+        };
+        self.put_attribute(object, attribute)
+    }
+
+    /// Put a text attribute on `object` as one null-terminated fixed string.
+    ///
+    /// ASCII text gets the ASCII character set, other text UTF-8. The errors
+    /// are those of [`Self::put_attribute`].
+    pub fn put_text_attribute(
+        &mut self,
+        object: impl Into<ObjectId>,
+        name: &str,
+        text: &str,
+    ) -> Result<()> {
+        let mut data = Vec::with_capacity(text.len().saturating_add(1));
+        data.extend_from_slice(text.as_bytes());
+        data.push(0);
+        let size = u32::try_from(data.len()).map_err(|_| {
+            Error::unsupported(format!(
+                "text attribute {name:?} of {} bytes is above the 4-byte size limit",
+                data.len()
+            ))
+        })?;
+        let charset = if text.is_ascii() {
+            CharSet::Ascii
+        } else {
+            CharSet::Utf8
+        };
+        let attribute = Attribute {
+            name: name.to_owned(),
+            datatype: Datatype {
+                version: 1,
+                size,
+                class: DatatypeClass::String {
+                    pad: StringPad::NullTerminate,
+                    charset,
+                },
+            },
+            dataspace: Dataspace {
+                kind: DataspaceKind::Scalar,
+                dims: Vec::new(),
+                max_dims: None,
+            },
+            data,
+        };
+        self.put_attribute(object, attribute)
+    }
+
+    /// The node index of `object`, or [`Error::BadRequest`] for an unknown object.
+    fn node_index(&self, object: ObjectId) -> Result<usize> {
+        match object {
+            ObjectId::Group(id) if id.0 < self.nodes.len() => Ok(id.0),
+            ObjectId::Group(id) => Err(Error::bad_request(format!("no group with id {}", id.0))),
+            ObjectId::Dataset(id) => {
+                Err(Error::bad_request(format!("no dataset with id {}", id.0)))
+            }
+        }
     }
 
     /// Write the file and return the sink.
@@ -170,8 +346,12 @@ impl<S: ByteSink> Hdf5Writer<S> {
 
     /// The header messages of `node`, with its children at `addresses`.
     fn messages(&self, node: usize, addresses: &[u64]) -> Result<Vec<HeaderMessage>> {
-        let NodeKind::Group { children } = &self.nodes[node].kind;
-        let mut messages = Vec::with_capacity(children.len() + 3);
+        let Node {
+            kind: NodeKind::Group { children },
+            attributes,
+            ..
+        } = &self.nodes[node];
+        let mut messages = Vec::with_capacity(children.len() + attributes.len() + 3);
         messages.push(message(
             MessageType::LinkInfo,
             encode_link_info(to_u64(children.len())?),
@@ -179,12 +359,18 @@ impl<S: ByteSink> Hdf5Writer<S> {
         messages.push(message(MessageType::GroupInfo, encode_group_info()));
         messages.push(message(
             MessageType::AttributeInfo,
-            encode_attribute_info(0),
+            encode_attribute_info(to_u16(attributes.len())?),
         ));
         for (position, &child) in children.iter().enumerate() {
             let body =
                 encode_hard_link(&self.nodes[child].name, addresses[child], to_u64(position)?)?;
             messages.push(message(MessageType::Link, body));
+        }
+        for (index, attribute) in attributes.iter().enumerate() {
+            messages.push(HeaderMessage {
+                creation_order: Some(to_u16(index)?),
+                ..message(MessageType::Attribute, attribute.body.clone())
+            });
         }
         Ok(messages)
     }
@@ -215,11 +401,19 @@ fn to_u64(n: usize) -> Result<u64> {
     u64::try_from(n).map_err(|_| Error::unsupported(format!("{n} does not fit in 64 bits")))
 }
 
+/// Convert a count or index to `u16`, or return an error when it does not fit.
+fn to_u16(n: usize) -> Result<u16> {
+    u16::try_from(n).map_err(|_| Error::unsupported(format!("{n} does not fit in 16 bits")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::Ctx;
     use crate::index::Hdf5File;
+    use crate::objheader::ObjectHeader;
     use crate::source::MemorySource;
+    use crate::superblock::Superblock;
     use crate::write::MemorySink;
     use std::sync::Arc;
 
@@ -260,5 +454,55 @@ mod tests {
         let file = reopen(bytes);
         assert_eq!(file.root().address, 48);
         assert!(file.root().group("a").is_some());
+    }
+
+    #[test]
+    fn attribute_frames_hold_the_creation_index() {
+        let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+        let root = w.root();
+        w.add_group(root, "g").unwrap();
+        w.put_numeric_attribute(root, "a", &[1u8]).unwrap();
+        w.put_numeric_attribute(root, "b", &[2u8]).unwrap();
+        w.put_text_attribute(root, "c", "x").unwrap();
+        w.put_numeric_attribute(root, "a", &[3u8]).unwrap();
+        let source = MemorySource::new(w.close().unwrap().into_inner());
+        let superblock = Superblock::read(&source).unwrap();
+        let address = superblock.root_object_header_address().unwrap();
+        let header = ObjectHeader::read(Ctx::new(&source, &superblock), address).unwrap();
+
+        let mut next = 0;
+        for m in &header.messages {
+            if m.kind == MessageType::Attribute {
+                assert_eq!(m.creation_order, Some(next));
+                next += 1;
+            } else {
+                assert_eq!(m.creation_order, Some(0), "{:?}", m.kind);
+            }
+        }
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn wrong_attribute_targets_and_names_are_bad_requests() {
+        let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+        let root = w.root();
+        assert!(matches!(
+            w.put_numeric_attribute(GroupId(99), "a", &[1u8]),
+            Err(Error::BadRequest(_))
+        ));
+        assert!(matches!(
+            w.put_numeric_attribute(DatasetId(0), "a", &[1u8]),
+            Err(Error::BadRequest(_))
+        ));
+        assert!(matches!(
+            w.put_numeric_attribute(root, "", &[1u8]),
+            Err(Error::BadRequest(_))
+        ));
+        assert!(matches!(
+            w.put_text_attribute(root, "nul\0", "x"),
+            Err(Error::BadRequest(_))
+        ));
+        let file = reopen(w.close().unwrap().into_inner());
+        assert!(file.root().attributes.is_empty());
     }
 }

@@ -174,6 +174,8 @@ pub trait Element: Copy + Sized + sealed::Sealed {
     /// `bytes` must be native-order values of this exact type. A trailing
     /// partial element is dropped.
     fn from_ne_slice(bytes: &[u8]) -> Vec<Self>;
+    /// Encode a block of elements as native-order bytes.
+    fn to_ne_vec(values: &[Self]) -> Vec<u8>;
     /// Convert from a stored signed integer.
     fn from_i64(value: i64) -> Self;
     /// Convert from a stored unsigned integer.
@@ -207,6 +209,9 @@ macro_rules! element {
                     .chunks_exact(std::mem::size_of::<$rust>())
                     .map(|b| <$rust>::from_ne_bytes(b.try_into().expect("width checked")))
                     .collect()
+            }
+            fn to_ne_vec(values: &[Self]) -> Vec<u8> {
+                values.iter().flat_map(|v| v.to_ne_bytes()).collect()
             }
             #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
             #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
