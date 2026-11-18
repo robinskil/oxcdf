@@ -11,6 +11,8 @@ use crate::error::{Error, Result};
 /// A destination for bytes addressed by absolute file offset.
 pub trait ByteSink: Send + std::fmt::Debug {
     /// Write all of `data` at `offset`. A write past the end grows the sink.
+    ///
+    /// An empty write changes nothing.
     fn write_all_at(&mut self, offset: u64, data: &[u8]) -> Result<()>;
 
     /// Set the size of the sink to `len` bytes. New bytes hold zeros.
@@ -60,6 +62,9 @@ impl MemorySink {
 
 impl ByteSink for MemorySink {
     fn write_all_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let end = range_end(offset, data.len())?;
         if end > self.data.len() as u64 {
             self.resize(end)?;
@@ -155,6 +160,14 @@ mod tests {
         s.write_all_at(4, b"ab").unwrap();
         s.write_all_at(0, b"x").unwrap();
         assert_eq!(s.into_inner(), b"x\0\0\0ab");
+    }
+
+    #[test]
+    fn an_empty_write_changes_nothing() {
+        let mut s = MemorySink::new();
+        s.write_all_at(0, b"ab").unwrap();
+        s.write_all_at(10, b"").unwrap();
+        assert_eq!(s.into_inner(), b"ab");
     }
 
     #[test]

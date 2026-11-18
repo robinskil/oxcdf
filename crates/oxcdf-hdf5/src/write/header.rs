@@ -1,4 +1,4 @@
-//! Object header encoding for the writer.
+//! Object header and superblock encoding for the writer.
 
 use super::encode::{Encoder, UNDEFINED_ADDRESS};
 use crate::error::{Error, Result};
@@ -22,6 +22,16 @@ const MAX_BODY_BYTES: usize = u16::MAX as usize;
 
 /// Object header flags: 4-byte chunk size and creation order tracked.
 const OHDR_FLAGS: u8 = 0x06;
+
+/// A header message with no flags and no creation order.
+pub fn message(kind: MessageType, data: Vec<u8>) -> HeaderMessage {
+    HeaderMessage {
+        kind,
+        flags: 0,
+        creation_order: None,
+        data,
+    }
+}
 
 /// Encode a version 2 superblock with 8-byte offsets and lengths.
 pub fn encode_superblock(root_address: u64, end_of_file: u64) -> Vec<u8> {

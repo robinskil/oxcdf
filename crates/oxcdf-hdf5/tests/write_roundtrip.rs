@@ -54,7 +54,13 @@ fn the_same_calls_give_the_same_bytes() {
     let build = || {
         let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
         let root = w.root();
-        w.add_group(root, "a").unwrap();
+        let a = w.add_group(root, "a").unwrap();
+        w.put_text_attribute(a, "title", "same").unwrap();
+        w.put_numeric_attribute(root, "count", &[1i32, 2]).unwrap();
+        let spec = DatasetSpec::numeric(DType::Float(8), ByteOrder::Little, &[3]).unwrap();
+        let d = w.add_dataset(a, "v", spec).unwrap();
+        w.write(d, &Hyperslab::all(&[3]), &[1.0f64, 2.0, 3.0])
+            .unwrap();
         w.close().unwrap().into_inner()
     };
     assert_eq!(build(), build());
@@ -139,7 +145,14 @@ fn utf8_names_read_back() {
     let g = w.add_group(root, "zee\u{00eb}n").unwrap();
     w.put_text_attribute(g, "omschr\u{00ef}jving", "co\u{00f6}rdinaat")
         .unwrap();
+    let spec = DatasetSpec::numeric(DType::Float(4), ByteOrder::Little, &[2]).unwrap();
+    let d = w.add_dataset(g, "temp\u{00e9}rature", spec).unwrap();
+    w.write(d, &Hyperslab::all(&[2]), &[12.5f32, 13.0]).unwrap();
     let file = reopen(w.close().unwrap().into_inner());
+    assert_eq!(
+        read_all::<f32>(&file, "/zee\u{00eb}n/temp\u{00e9}rature"),
+        [12.5, 13.0]
+    );
     let g = file.root().group("zee\u{00eb}n").unwrap();
     assert_eq!(
         g.attribute("omschr\u{00ef}jving").unwrap().data,
@@ -420,6 +433,11 @@ fn a_typed_write_needs_the_exact_datatype() {
         Err(Error::TypeMismatch { .. })
     ));
     w.write_raw(narrow, &all, &[0; 8]).unwrap();
+
+    let mut v3 = DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[2]).unwrap();
+    v3.datatype.version = 3;
+    let v3 = w.add_dataset(root, "v3", v3).unwrap();
+    w.write(v3, &all, &[1i32, 2]).unwrap();
 
     let wide = DatasetSpec::new(
         Datatype {

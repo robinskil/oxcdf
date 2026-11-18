@@ -1,12 +1,12 @@
 //! Datasets with contiguous storage for the writer.
 
 use super::alloc::Allocator;
+use super::header::message;
 use super::message::{
     encode_contiguous_layout, encode_dataspace, encode_datatype, encode_fill_value,
     numeric_datatype,
 };
 use super::sink::ByteSink;
-use super::writer::message;
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::message::{ByteOrder, Dataspace, DataspaceKind, Datatype, FillValue};

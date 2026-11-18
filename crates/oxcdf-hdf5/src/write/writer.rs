@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use super::alloc::Allocator;
 use super::dataset::{to_order, Dataset, DatasetSpec};
 use super::encode::UNDEFINED_ADDRESS;
-use super::header::{encode_header, encode_superblock, header_len, SUPERBLOCK_BYTES};
+use super::header::{encode_header, encode_superblock, header_len, message, SUPERBLOCK_BYTES};
 use super::message::{
     encode_attribute, encode_attribute_info, encode_group_info, encode_hard_link, encode_link_info,
     numeric_datatype, MAX_MESSAGE_BYTES,
@@ -126,6 +126,9 @@ enum NodeKind {
 }
 
 /// Builds a new HDF5 file in memory and writes it to a sink at close.
+///
+/// A writer that is dropped with no [`Self::close`] leaves a file with no
+/// superblock. No reader opens that file.
 #[derive(Debug)]
 pub struct Hdf5Writer<S: ByteSink> {
     sink: S,
@@ -135,9 +138,11 @@ pub struct Hdf5Writer<S: ByteSink> {
 }
 
 impl<S: ByteSink> Hdf5Writer<S> {
-    /// Start a file with an empty root group. Nothing is written until [`Self::close`].
+    /// Start a file with an empty root group.
     ///
-    /// A header slack above 65535 bytes is [`Error::BadRequest`].
+    /// The sink gets dataset values at each write. It gets the object headers
+    /// and the superblock at [`Self::close`]. A header slack above 65535
+    /// bytes is [`Error::BadRequest`].
     pub fn create(sink: S, options: WriteOptions) -> Result<Self> {
         if options.header_slack_bytes > MAX_MESSAGE_BYTES {
             return Err(Error::bad_request(format!(
@@ -210,9 +215,11 @@ impl<S: ByteSink> Hdf5Writer<S> {
 
     /// Write `values` to the elements of `slab`.
     ///
-    /// The dataset datatype must equal the numeric datatype of `T` in the
-    /// dataset byte order. Any other datatype is [`Error::TypeMismatch`].
-    /// The other errors are those of [`Self::write_raw`].
+    /// The dataset datatype must have the size and the class of the numeric
+    /// datatype of `T` in the dataset byte order. The datatype version is not
+    /// compared, because the writer always encodes version 1. Any other
+    /// datatype is [`Error::TypeMismatch`]. The other errors are those of
+    /// [`Self::write_raw`].
     pub fn write<T: Element>(
         &mut self,
         dataset: DatasetId,
@@ -229,8 +236,10 @@ impl<S: ByteSink> Hdf5Writer<S> {
         };
         let datatype = d.datatype();
         let order = datatype.byte_order();
-        let exact = order.and_then(|o| numeric_datatype(T::DTYPE, o).ok());
-        if exact.as_ref() != Some(datatype) {
+        let exact = order
+            .and_then(|o| numeric_datatype(T::DTYPE, o).ok())
+            .is_some_and(|e| e.size == datatype.size && e.class == datatype.class);
+        if !exact {
             let mut stored = DType::of(datatype).name();
             if stored == T::NAME {
                 // Same class and size byte, but another size, precision or layout.
@@ -420,18 +429,29 @@ impl<S: ByteSink> Hdf5Writer<S> {
     }
 
     /// Write the file and return the sink.
+    ///
+    /// When `close` returns an error, the sink is lost and the file is not valid.
     pub fn close(mut self) -> Result<S> {
         let order = self.parents_first();
         let mut addresses = vec![UNDEFINED_ADDRESS; self.nodes.len()];
+        let mut lens = vec![0u64; self.nodes.len()];
         for &node in &order {
             // Message sizes do not depend on addresses, so placeholders give the length.
             let messages = self.messages(node, &addresses)?;
-            let len = to_u64(header_len(&messages, self.options.header_slack_bytes))?;
-            addresses[node] = self.alloc.alloc_metadata(len)?;
+            lens[node] = to_u64(header_len(&messages, self.options.header_slack_bytes))?;
+            addresses[node] = self.alloc.alloc_metadata(lens[node])?;
         }
         for &node in &order {
             let messages = self.messages(node, &addresses)?;
             let header = encode_header(&messages, self.options.header_slack_bytes)?;
+            // A longer header would overwrite the next allocation.
+            if to_u64(header.len())? != lens[node] {
+                return Err(Error::malformed(format!(
+                    "an object header has {} bytes, but {} bytes are allocated",
+                    header.len(),
+                    lens[node]
+                )));
+            }
             self.sink.write_all_at(addresses[node], &header)?;
         }
         let end_of_file = self.alloc.end_of_file();
@@ -513,16 +533,6 @@ fn check_name(name: &str) -> Result<()> {
 /// The error for a dataset id that names no dataset.
 fn no_dataset(id: DatasetId) -> Error {
     Error::bad_request(format!("no dataset with id {}", id.0))
-}
-
-/// A header message with no flags and no creation order.
-pub(super) fn message(kind: MessageType, data: Vec<u8>) -> HeaderMessage {
-    HeaderMessage {
-        kind,
-        flags: 0,
-        creation_order: None,
-        data,
-    }
 }
 
 /// Convert a count or length to `u64`, or return an error when it does not fit.
