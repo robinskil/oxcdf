@@ -112,6 +112,12 @@ pub mod object_store_source;
 #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub mod replay;
 
+// ─── the writer ────────────────────────────────────────────────────────────
+
+#[cfg(feature = "write")]
+#[cfg_attr(docsrs, doc(cfg(feature = "write")))]
+pub mod write;
+
 // ─── the names most callers need ───────────────────────────────────────────
 
 pub use container::{detect_container, Container, CDF_SIGNATURES, HDF5_SIGNATURE};

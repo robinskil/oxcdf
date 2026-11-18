@@ -16,6 +16,8 @@ default = []
 object-store = ["dep:object_store", "dep:tokio"]
 # The asynchronous engine. It shares every pure part with the synchronous one.
 async = ["dep:async-trait", "dep:tokio"]
+# The writer. It builds a new HDF5 file.
+write = []
 
 [package.metadata.docs.rs]
 # Document the asynchronous engine and object storage.
