@@ -9,9 +9,10 @@
 
 use std::sync::Arc;
 
+use futures::stream::BoxStream;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload};
 use oxcdf::{FileMut, MemorySource, NetcdfFile};
 
 /// Add `count` doubles to `file`. They are larger than one upload part for a high count.
@@ -74,4 +75,103 @@ fn the_upload_can_move_to_another_thread() {
     let location = Path::from("data/send.nc");
     let file = oxcdf::create_in_memory().unwrap();
     send(&file.close_to_store(&store, &location));
+}
+
+/// A store that refuses each write and passes each other call to a memory store.
+#[derive(Debug)]
+struct ReadOnly(InMemory);
+
+impl std::fmt::Display for ReadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadOnly")
+    }
+}
+
+fn refused(operation: &str) -> object_store::Error {
+    object_store::Error::NotImplemented {
+        operation: operation.to_owned(),
+        implementer: "ReadOnly".to_owned(),
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ReadOnly {
+    async fn put_opts(
+        &self,
+        _location: &Path,
+        _payload: PutPayload,
+        _opts: PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        Err(refused("put"))
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _location: &Path,
+        _opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        Err(refused("put_multipart"))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.0.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.0.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.0.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(from, to, options).await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_upload_returns_the_error_and_leaves_no_local_file() {
+    let dir = std::env::temp_dir().join(format!("oxcdf-store-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = ReadOnly(InMemory::new());
+    let location = Path::from("data/refused.nc");
+
+    // A small file takes the one put, a large file the upload in parts.
+    for count in [10, 20 << 17] {
+        let mut file = oxcdf::create(dir.join("spool.nc")).unwrap();
+        fill(&mut file, count);
+        let result = file.close_to_store(&store, &location).await;
+        assert!(matches!(result, Err(oxcdf::Error::Io(_))), "{count}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "{count}");
+
+        let mut file = oxcdf::create_in_memory().unwrap();
+        fill(&mut file, count);
+        let result = file.close_to_store(&store, &location).await;
+        assert!(matches!(result, Err(oxcdf::Error::Io(_))), "{count}");
+    }
+    assert!(store.0.get(&location).await.is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

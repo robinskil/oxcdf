@@ -20,7 +20,7 @@
 //!
 //! # Rules
 //!
-//! * Define a dimension before a variable that uses it or has its name.
+//! * Define a dimension before a variable that uses it.
 //! * Set the chunk shape, the filters, the fill value and the byte order of
 //!   a variable before its first write. A later change is
 //!   [`Error::BadRequest`].
@@ -303,17 +303,8 @@ impl FileMut {
         })
     }
 
-    fn state(&mut self) -> &mut State {
-        self.state
-            .as_mut()
-            .expect("the state is there until a close")
-    }
-
-    fn root(&mut self) -> GroupMut<'_> {
-        GroupMut {
-            state: self.state(),
-            group: ROOT,
-        }
+    fn state(&mut self) -> Result<&mut State> {
+        self.state.as_mut().ok_or_else(state_defect)
     }
 
     /// Add a dimension of `len` elements to the root group.
@@ -325,7 +316,8 @@ impl FileMut {
     /// Returns [`Error::BadRequest`] for a wrong name, a name that the group
     /// uses, or the name of a variable of the group.
     pub fn add_dimension(&mut self, name: &str, len: usize) -> Result<()> {
-        self.state().add_dimension(ROOT, name, len as u64, len == 0)
+        self.state()?
+            .add_dimension(ROOT, name, len as u64, len == 0)
     }
 
     /// Add an unlimited dimension to the root group.
@@ -334,7 +326,7 @@ impl FileMut {
     ///
     /// The errors of [`Self::add_dimension`].
     pub fn add_unlimited_dimension(&mut self, name: &str) -> Result<()> {
-        self.state().add_dimension(ROOT, name, 0, true)
+        self.state()?.add_dimension(ROOT, name, 0, true)
     }
 
     /// The current length of dimension `name` of the root group.
@@ -353,7 +345,9 @@ impl FileMut {
     /// Returns [`Error::BadRequest`] for a wrong name or a name that netCDF
     /// reserves. Returns [`Error::Unsupported`] for [`AttributeValue::Raw`].
     pub fn add_attribute<T: Into<AttributeValue>>(&mut self, name: &str, value: T) -> Result<()> {
-        self.root().add_attribute(name, value)
+        let state = self.state()?;
+        let object = state.groups[ROOT].id.into();
+        put_attribute(&mut state.writer, object, name, value.into())
     }
 
     /// Add a variable of type `T` on the dimensions `dimensions` to the root group.
@@ -386,7 +380,7 @@ impl FileMut {
         dimensions: &[&str],
         dtype: &DType,
     ) -> Result<VariableMut<'_>> {
-        let state = self.state();
+        let state = self.state()?;
         let variable = state.add_variable(ROOT, name, dimensions, dtype)?;
         Ok(VariableMut { state, variable })
     }
@@ -411,21 +405,21 @@ impl FileMut {
     /// Returns [`Error::BadRequest`] for a wrong name or a name that the
     /// group uses.
     pub fn add_group(&mut self, name: &str) -> Result<GroupMut<'_>> {
-        let state = self.state();
+        let state = self.state()?;
         let group = state.add_group(ROOT, name)?;
         Ok(GroupMut { state, group })
     }
 
     /// The variable `name` of the root group.
     pub fn variable_mut(&mut self, name: &str) -> Option<VariableMut<'_>> {
-        let state = self.state();
+        let state = self.state.as_mut()?;
         let variable = state.find_variable(ROOT, name)?;
         Some(VariableMut { state, variable })
     }
 
     /// The group `name` of the root group.
     pub fn group_mut(&mut self, name: &str) -> Option<GroupMut<'_>> {
-        let state = self.state();
+        let state = self.state.as_mut()?;
         let group = state.find_group(ROOT, name)?;
         Some(GroupMut { state, group })
     }
@@ -457,7 +451,7 @@ impl FileMut {
                 "the file is on disk: use close, then read the file",
             ));
         }
-        let state = self.state.take().expect("the state is there until a close");
+        let state = self.state.take().ok_or_else(state_defect)?;
         match state.finish()? {
             Sink::Memory(sink) => Ok(sink.into_inner()),
             Sink::File(_) => Err(sink_defect()),
@@ -487,7 +481,7 @@ impl FileMut {
         location: &object_store::path::Path,
     ) -> Result<()> {
         use object_store::ObjectStoreExt;
-        let state = self.state.take().expect("the state is there until a close");
+        let state = self.state.take().ok_or_else(state_defect)?;
         let finished = state.finish();
         let Target::File { temporary, .. } = &self.target else {
             let Sink::Memory(sink) = finished? else {
@@ -1009,6 +1003,8 @@ impl VariableMut<'_> {
         let ends = slab.start.iter().zip(&slab.count).map(|(s, c)| s + c);
         let needed: Vec<u64> = ends.zip(&variable.shape).map(|(e, &l)| e.max(l)).collect();
         if needed != variable.shape {
+            // The variable cannot shrink again, so a refused write must not grow it.
+            writer.check_write(variable.dataset, &slab)?;
             writer.resize(variable.dataset, &needed)?;
             for (&d, &len) in variable.dimensions.iter().zip(&needed) {
                 dimensions[d].len = dimensions[d].len.max(len);
@@ -1058,13 +1054,15 @@ impl State {
         if self.own_dimension(group, name).is_some() || self.find_group(group, name).is_some() {
             return Err(in_use(name));
         }
-        if self.find_variable(group, name).is_some() {
-            return Err(Error::bad_request(format!(
-                "define the dimension {name:?} before the variable of that name"
-            )));
-        }
         if i32::try_from(self.dimensions.len()).is_err() {
             return Err(Error::unsupported("more dimensions than netCDF can number"));
+        }
+        if let Some(variable) = self.find_variable(group, name) {
+            // The variable does not use the new dimension, so it is no coordinate.
+            let link = format!("{NON_COORDINATE_PREFIX}{name}");
+            let dataset = self.variables[variable].dataset;
+            self.writer
+                .rename_dataset(self.groups[group].id, dataset, &link)?;
         }
         self.groups[group].dimensions.push(self.dimensions.len());
         self.dimensions.push(Dimension {
@@ -1283,17 +1281,28 @@ impl State {
     }
 }
 
+/// The error for a file with no state. Only a defect in the writer causes it.
+fn state_defect() -> Error {
+    Error::Malformed("a defect in the writer: the file has no state".to_owned())
+}
+
 /// The error for a file in memory that has a file sink. Only a defect in the writer causes it.
 fn sink_defect() -> Error {
     Error::Malformed("a defect in the writer: a file in memory has a file sink".to_owned())
 }
 
-/// Reject a name that netCDF or the container cannot hold.
+/// Reject a name that netcdf-c does not accept.
+///
+/// The first character is a letter, a digit, an underscore or not ASCII.
+/// Each other character is printable or not ASCII, and is not a slash. The
+/// last character is not a space.
 fn check_name(name: &str) -> Result<()> {
-    let wrong = name.is_empty()
-        || name == "."
+    let first = |c: char| c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii();
+    let other = |c: char| (c == ' ' || c.is_ascii_graphic() || !c.is_ascii()) && c != '/';
+    let wrong = !name.starts_with(first)
+        || !name.chars().all(other)
+        || name.ends_with(' ')
         || name.len() > MAX_NAME_BYTES
-        || name.contains(['/', '\0'])
         || name.starts_with(NON_COORDINATE_PREFIX);
     if wrong {
         return Err(Error::bad_request(format!(
@@ -1471,7 +1480,7 @@ fn put_attribute(
     name: &str,
     value: AttributeValue,
 ) -> Result<()> {
-    if RESERVED_ATTRIBUTES.contains(&name) {
+    if RESERVED_ATTRIBUTES.contains(&name) || name == "_FillValue" {
         return Err(Error::bad_request(format!(
             "netCDF reserves the attribute name {name:?}"
         )));

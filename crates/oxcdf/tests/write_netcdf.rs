@@ -351,12 +351,12 @@ fn wrong_definitions_are_bad_requests() {
     assert!(bad(file.add_dimension("x", 3)));
     assert!(bad(file.add_variable::<i32>("v", &["none"]).map(|_| ())));
     assert!(bad(file.add_attribute("_NCProperties", "x")));
+    assert!(bad(file.add_attribute("_FillValue", 1i32)));
     assert!(bad(file.add_attribute("", 1i32)));
     file.add_variable::<i32>("v", &["x"]).unwrap();
     assert!(bad(file.add_variable::<i32>("v", &["x"]).map(|_| ())));
     assert!(bad(file.add_group("v").map(|_| ())));
     assert!(bad(file.add_group("x").map(|_| ())));
-    assert!(bad(file.add_dimension("v", 2)));
     assert!(bad(file
         .add_variable::<i32>("_nc4_non_coord_y", &["x"])
         .map(|_| ())));
@@ -622,4 +622,67 @@ fn a_coordinate_variable_with_two_dimensions_reads_back() {
     let square = file.variable("square").unwrap();
     assert_eq!(square.dimensions, ["len", "len"]);
     assert_eq!(dimensions(&file).len(), 2);
+}
+
+#[test]
+fn a_dimension_can_come_after_a_variable_of_its_name() {
+    let mut file = oxcdf::create_in_memory().unwrap();
+    file.add_dimension("y", 2).unwrap();
+    let mut x = file.add_variable::<i32>("x", &["y"]).unwrap();
+    x.put_values(&[4, 5], ..).unwrap();
+    file.add_dimension("x", 3).unwrap();
+    let mut x = file.variable_mut("x").unwrap();
+    x.put_attribute("units", "m").unwrap();
+    file.add_variable::<u8>("on_x", &["x"]).unwrap();
+
+    let file = reopen(file);
+    assert_eq!(
+        dimensions(&file),
+        [("y".to_owned(), 2, false), ("x".to_owned(), 3, false)]
+    );
+    assert!(!file.dimension("x").unwrap().has_coordinate_variable);
+    let x = file.variable("x").unwrap();
+    assert!(!x.is_coordinate);
+    assert_eq!(x.dimensions, ["y"]);
+    assert_eq!(x.get_values::<i32, _>(..).unwrap(), [4, 5]);
+    assert_eq!(x.attribute("units").unwrap().value.as_text(), Some("m"));
+    assert_eq!(file.variable("on_x").unwrap().dimensions, ["x"]);
+}
+
+#[test]
+fn names_follow_the_rules_of_netcdf_c() {
+    let mut file = oxcdf::create_in_memory().unwrap();
+    for name in ["", ".", "-a", " a", "a ", "a/b", "a\u{7}b", "a\u{7f}"] {
+        assert!(bad(file.add_dimension(name, 1)), "{name:?}");
+        assert!(bad(file.add_group(name).map(|_| ())), "{name:?}");
+        assert!(
+            bad(file.add_variable::<i32>(name, &[]).map(|_| ())),
+            "{name:?}"
+        );
+    }
+    for name in ["a b", "_x", "9x", "température", "a.b-c+d@e"] {
+        file.add_variable::<i32>(name, &[]).unwrap();
+    }
+    let file = reopen(file);
+    assert_eq!(file.variables().len(), 5);
+    assert!(file.variable("température").is_some());
+}
+
+#[test]
+fn a_refused_write_to_a_compressed_chunk_changes_nothing() {
+    let mut file = oxcdf::create_in_memory().unwrap();
+    file.add_unlimited_dimension("t").unwrap();
+    let mut v = file.add_variable::<i32>("v", &["t"]).unwrap();
+    v.set_chunking(&[2]).unwrap();
+    v.set_compression(1, false).unwrap();
+    v.put_values(&[1, 2], [0..2]).unwrap();
+    // The chunk at 0 is in the file with its filter, so a part of it takes no write.
+    let refused = v.put_values(&[7, 8, 9], [1..4]);
+    assert!(matches!(refused, Err(Error::Unsupported(_))));
+    assert_eq!(file.dimension_len("t"), Some(2));
+
+    let file = reopen(file);
+    let v = file.variable("v").unwrap();
+    assert_eq!(v.shape, [2]);
+    assert_eq!(v.get_values::<i32, _>(..).unwrap(), [1, 2]);
 }

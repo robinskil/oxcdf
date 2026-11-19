@@ -43,5 +43,8 @@ netcdf = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["full"] }
+# `write_store` has a store that refuses each write.
+async-trait.workspace = true
+futures = "0.3"
 # `new_features` compresses its own fixtures before it reads them back.
 zstd.workspace = true
