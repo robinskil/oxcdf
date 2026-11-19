@@ -1,4 +1,5 @@
 #![cfg(all(feature = "write", feature = "diff-tests"))]
+#![allow(clippy::single_range_in_vec_init)]
 //! netcdf-c reads a file from the HDF5 writer.
 //!
 //! The root holds more than eight compact attributes and more than eight links.
@@ -74,6 +75,107 @@ fn netcdf_c_reads_a_file_from_the_writer() {
             .unwrap(),
         [1, -2, 3, -4, 5]
     );
+    // Windows cannot remove a file that netcdf-c holds open.
+    drop(file);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn netcdf_c_reads_a_file_from_the_netcdf_writer() {
+    let path = std::env::temp_dir().join(format!("oxcdf-diff-nc-{}.nc", std::process::id()));
+    let mut file = oxcdf::create(&path).unwrap();
+    file.add_unlimited_dimension("time").unwrap();
+    file.add_dimension("lat", 3).unwrap();
+    file.add_dimension("nv", 2).unwrap();
+    file.add_attribute("title", "writer test").unwrap();
+    file.add_attribute("empty", "").unwrap();
+    file.add_attribute("range", vec![0.5f64, 1.5]).unwrap();
+    file.add_attribute("tags", vec!["a".to_owned(), "bc".to_owned()])
+        .unwrap();
+    let mut lat = file.add_variable::<f32>("lat", &["lat"]).unwrap();
+    lat.put_values(&[-10.0f32, 0.0, 10.0], ..).unwrap();
+    let mut temp = file.add_variable::<f32>("TEMP", &["time", "lat"]).unwrap();
+    temp.set_compression(4, true).unwrap();
+    temp.set_fill_value(-999.0f32).unwrap();
+    temp.put_attribute("units", "degC").unwrap();
+    temp.put_values(&[1.0f32, 2.0, 3.0], [0..1, 0..3]).unwrap();
+    temp.put_values(&[9.0f32], [2..3, 1..2]).unwrap();
+    file.add_variable::<i32>("count", &["time"]).unwrap();
+    let mut nv = file.add_variable::<i16>("nv", &["lat"]).unwrap();
+    nv.put_values(&[7i16, 8, 9], ..).unwrap();
+    let mut code = file
+        .add_variable_with_type("code", &["lat", "nv"], &DType::Char)
+        .unwrap();
+    code.put_values(b"abcdef".as_slice(), ..).unwrap();
+    let mut name = file.add_string_variable("name", &["lat"]).unwrap();
+    name.put_strings(&["south", "equator"], [0..2]).unwrap();
+    let mut sub = file.add_group("sub").unwrap();
+    sub.add_dimension("z", 2).unwrap();
+    let mut deep = sub.add_variable::<i32>("deep", &["z", "lat"]).unwrap();
+    deep.put_values(&[1, 2, 3, 4, 5, 6], ..).unwrap();
+    file.close().unwrap();
+
+    let file = netcdf::open(&path).unwrap();
+    let dims: Vec<(String, usize, bool)> = file
+        .dimensions()
+        .map(|d| (d.name(), d.len(), d.is_unlimited()))
+        .collect();
+    assert_eq!(
+        dims,
+        [
+            ("time".to_owned(), 3, true),
+            ("lat".to_owned(), 3, false),
+            ("nv".to_owned(), 2, false)
+        ]
+    );
+    let mut names: Vec<String> = file.variables().map(|v| v.name()).collect();
+    names.sort();
+    assert_eq!(names, ["TEMP", "code", "count", "lat", "name", "nv"]);
+    let dim_names = |name: &str| -> Vec<String> {
+        let var = file.variable(name).unwrap();
+        var.dimensions().iter().map(|d| d.name()).collect()
+    };
+    assert_eq!(dim_names("TEMP"), ["time", "lat"]);
+    assert_eq!(dim_names("lat"), ["lat"]);
+    assert_eq!(dim_names("nv"), ["lat"]);
+    assert_eq!(dim_names("code"), ["lat", "nv"]);
+
+    let lat = file.variable("lat").unwrap();
+    assert_eq!(lat.get_values::<f32, _>(..).unwrap(), [-10.0, 0.0, 10.0]);
+    let temp = file.variable("TEMP").unwrap();
+    assert_eq!(
+        temp.get_values::<f32, _>(..).unwrap(),
+        [1.0, 2.0, 3.0, -999.0, -999.0, -999.0, -999.0, 9.0, -999.0]
+    );
+    assert_eq!(temp.fill_value::<f32>().unwrap(), Some(-999.0));
+    let units = temp.attribute("units").unwrap().value().unwrap();
+    assert!(matches!(units, netcdf::AttributeValue::Str(ref s) if s == "degC"));
+    let count = file.variable("count").unwrap();
+    assert_eq!(count.get_values::<i32, _>(..).unwrap(), [-2147483647; 3]);
+    let nv = file.variable("nv").unwrap();
+    assert_eq!(nv.get_values::<i16, _>(..).unwrap(), [7, 8, 9]);
+    let name = file.variable("name").unwrap();
+    assert_eq!(name.get_string([0]).unwrap(), "south");
+    assert_eq!(name.get_string([1]).unwrap(), "equator");
+    assert_eq!(name.get_string([2]).unwrap(), "");
+    let code = file.variable("code").unwrap();
+    assert_eq!(code.get_raw_values(..).unwrap(), b"abcdef");
+
+    let title = file.attribute("title").unwrap().value().unwrap();
+    assert!(matches!(title, netcdf::AttributeValue::Str(ref s) if s == "writer test"));
+    let empty = file.attribute("empty").unwrap().value().unwrap();
+    assert!(matches!(empty, netcdf::AttributeValue::Str(ref s) if s.is_empty()));
+    let range = file.attribute("range").unwrap().value().unwrap();
+    assert!(matches!(range, netcdf::AttributeValue::Doubles(ref v) if v == &[0.5, 1.5]));
+    let tags = file.attribute("tags").unwrap().value().unwrap();
+    assert!(matches!(tags, netcdf::AttributeValue::Strs(ref v) if v == &["a", "bc"]));
+    assert_eq!(file.attributes().count(), 4);
+
+    let sub = file.group("sub").unwrap().unwrap();
+    let deep = sub.variable("deep").unwrap();
+    let deep_dims: Vec<String> = deep.dimensions().iter().map(|d| d.name()).collect();
+    assert_eq!(deep_dims, ["z", "lat"]);
+    assert_eq!(deep.get_values::<i32, _>(..).unwrap(), [1, 2, 3, 4, 5, 6]);
     // Windows cannot remove a file that netcdf-c holds open.
     drop(file);
     std::fs::remove_file(&path).unwrap();

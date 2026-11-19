@@ -140,6 +140,47 @@ impl Extents {
     }
 }
 
+#[cfg(feature = "write")]
+impl Extents {
+    /// Turn this into a [`Hyperslab`] for a write to a variable of `shape`.
+    ///
+    /// An axis with `true` in `grows` can end past its length.
+    pub(crate) fn to_write_hyperslab(
+        &self,
+        what: &str,
+        shape: &[u64],
+        grows: &[bool],
+    ) -> Result<Hyperslab> {
+        let extents = match self {
+            Extents::All => return Ok(Hyperslab::all(shape)),
+            Extents::Extent(e) => e,
+        };
+        if extents.len() != shape.len() {
+            return Err(Error::bad_request(format!(
+                "variable {what} has rank {} but the selection has rank {}",
+                shape.len(),
+                extents.len()
+            )));
+        }
+        let mut start = Vec::with_capacity(extents.len());
+        let mut count = Vec::with_capacity(extents.len());
+        for (axis, (extent, &len)) in extents.iter().zip(shape).enumerate() {
+            let (s, c) = extent.resolve(axis, len)?;
+            let inside = s
+                .checked_add(c)
+                .is_some_and(|end| end <= len || grows.get(axis).copied().unwrap_or(false));
+            if !inside {
+                return Err(Error::bad_request(format!(
+                    "the selection on axis {axis} of variable {what} ends past the length {len}"
+                )));
+            }
+            start.push(s);
+            count.push(c);
+        }
+        Ok(Hyperslab { start, count })
+    }
+}
+
 // ─── one axis ──────────────────────────────────────────────────────────────
 
 impl From<usize> for Extent {
