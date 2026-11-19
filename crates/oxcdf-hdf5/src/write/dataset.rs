@@ -13,13 +13,19 @@ use super::message::{
 };
 use super::sink::ByteSink;
 use super::{defect, to_u64};
+use crate::btree1::ChunkRecord;
 use crate::dtype::{DType, Element};
 use crate::error::{Error, Result};
+use crate::filters::decode_chunk;
+use crate::index::DatasetIndex;
+use crate::message::filter::{id, FilterPipeline};
 use crate::message::{
     ByteOrder, Dataspace, DataspaceKind, Datatype, DatatypeClass, FillValue, VlenKind,
 };
+use crate::message::{ChunkIndex, Layout};
 use crate::objheader::{HeaderMessage, MessageType};
 use crate::read::{swap_bytes_in_place, Hyperslab};
+use crate::superblock::{Superblock, DEFAULT_ISTORE_K};
 
 /// Largest block of fill bytes or converted values in one sink write.
 ///
@@ -318,8 +324,13 @@ struct Chunks {
     spaces: BTreeMap<Vec<u64>, ChunkSpace>,
     /// The chunks with filters that are in memory and not in the file.
     buffers: BTreeMap<Vec<u64>, Vec<u8>>,
-    /// Address of the root node of the chunk index, set at close.
+    /// Address of the root node of the chunk index.
+    ///
+    /// A dataset of a file can start with the index of the file. The close
+    /// sets it when `stale` is true.
     index: Option<u64>,
+    /// True when `index` does not give each chunk of `spaces` that is ready.
+    stale: bool,
 }
 
 /// The file space of one chunk.
@@ -339,7 +350,7 @@ impl Chunks {
     ///
     /// Returns [`Error::Unsupported`] when `slab` covers a part of a chunk
     /// that is in the file with its filters.
-    fn parts(&self, slab: &Hyperslab) -> Result<Vec<Part>> {
+    fn parts(&self, slab: &Hyperslab, readable: bool) -> Result<Vec<Part>> {
         let parts: Vec<Part> = chunk_origins(&self.dims, slab)
             .map(|origin| Part::new(origin, &self.dims, slab))
             .collect();
@@ -348,7 +359,7 @@ impl Chunks {
             let stored = !self.filters.is_empty()
                 && self.spaces.contains_key(&part.origin)
                 && !self.buffers.contains_key(&part.origin);
-            if stored && !part.full {
+            if stored && !part.full && !readable {
                 return Err(Error::unsupported(format!(
                     "a write to a part of the chunk at {:?}, which is in the file with its filters",
                     part.origin
@@ -397,6 +408,7 @@ impl Chunks {
                 spaces: BTreeMap::new(),
                 buffers: BTreeMap::new(),
                 index: None,
+                stale: false,
             }),
             _ => Err(Error::bad_request(
                 "a chunk needs 4 GiB or more, above the HDF5 limit",
@@ -420,7 +432,7 @@ impl Chunks {
             .map_err(|_| Error::unsupported("a chunk needs 4 GiB or more after its filters"))?;
         let address = alloc.alloc_data(u64::from(size))?;
         sink.write_all_at(address, &stored)?;
-        self.spaces.insert(
+        self.set_space(
             origin.to_vec(),
             ChunkSpace {
                 address,
@@ -429,6 +441,12 @@ impl Chunks {
             },
         );
         Ok(())
+    }
+
+    /// Set the file space of the chunk at `origin`. The chunk index must change.
+    fn set_space(&mut self, origin: Vec<u64>, space: ChunkSpace) {
+        self.spaces.insert(origin, space);
+        self.stale = true;
     }
 
     /// Write each chunk in memory to the file. A chunk stays in memory after an error.
@@ -592,6 +610,79 @@ impl Dataset {
         })
     }
 
+    /// Make the dataset of `index`, with its values where they are in the file.
+    ///
+    /// `records` holds each chunk of a chunked dataset. The dataset keeps
+    /// its definition, as a dataset with values does. A version 1 B-tree
+    /// stays the chunk index while no chunk gets new file space. The close
+    /// writes a new index for each other chunked dataset. `superblock` is
+    /// the superblock of the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] for compact storage, a filter that
+    /// the writer does not have, a chunk that skips a filter, or a datatype
+    /// that the writer cannot encode.
+    pub(super) fn existing(
+        index: &DatasetIndex,
+        records: &[ChunkRecord],
+        superblock: &Superblock,
+    ) -> Result<Self> {
+        let mut spec = DatasetSpec::new(index.datatype.clone(), &index.shape);
+        let address = match &index.layout {
+            Layout::Contiguous { address, .. } => *address,
+            Layout::Chunked { chunk_dims, .. } => {
+                let dims: Vec<u64> = chunk_dims.iter().map(|&dim| u64::from(dim)).collect();
+                spec = spec
+                    .chunked(&dims)
+                    .with_filters(&filters_of(&index.pipeline)?);
+                None
+            }
+            Layout::Compact { .. } => {
+                return Err(Error::unsupported(format!(
+                    "an edit of the dataset {} with compact storage",
+                    index.path
+                )))
+            }
+        };
+        if let Some(max) = &index.max_shape {
+            let unlimited = |&max: &u64| (max != u64::MAX).then_some(max);
+            spec = spec.with_max_shape(&max.iter().map(unlimited).collect::<Vec<_>>());
+        }
+        let vlen = matches!(index.datatype.class, DatatypeClass::VariableLength { .. });
+        let reference = match (&index.fill_value.bytes, vlen) {
+            (Some(bytes), true) => <[u8; 16]>::try_from(bytes.as_slice()).ok(),
+            (Some(bytes), false) => {
+                spec = spec.with_fill_value(bytes.clone());
+                None
+            }
+            (None, _) => None,
+        };
+        let mut dataset = Self::with_fill_reference(spec, reference)?;
+        dataset.touched = true;
+        dataset.address = address;
+        if let Some(chunks) = &mut dataset.chunks {
+            for record in records {
+                let origin = record.offset.get(..chunks.dims.len());
+                let (Some(origin), 0) = (origin, record.filter_mask) else {
+                    return Err(Error::unsupported(format!(
+                        "an edit of the dataset {} with a chunk that skips a filter",
+                        index.path
+                    )));
+                };
+                let space = ChunkSpace {
+                    address: record.address,
+                    size: record.size,
+                    ready: true,
+                };
+                chunks.spaces.insert(origin.to_vec(), space);
+            }
+            chunks.index = kept_index(&index.layout, superblock);
+            chunks.stale = chunks.index.is_none() && !records.is_empty();
+        }
+        Ok(dataset)
+    }
+
     /// The type of one element.
     pub(super) fn datatype(&self) -> &Datatype {
         &self.datatype
@@ -667,6 +758,9 @@ impl Dataset {
             return Ok(());
         };
         chunks.flush(sink, alloc, element_size)?;
+        if !chunks.stale {
+            return Ok(());
+        }
         // A chunk with no complete fill pass holds no values, so it reads as fill.
         let ready: Vec<(Vec<u64>, u64, u32)> = chunks
             .spaces
@@ -675,6 +769,7 @@ impl Dataset {
             .map(|(origin, space)| (origin.clone(), space.address, space.size))
             .collect();
         chunks.index = write_chunk_index(sink, alloc, &chunks.dims, &ready)?;
+        chunks.stale = false;
         Ok(())
     }
 
@@ -742,9 +837,11 @@ impl Dataset {
     ///
     /// Returns [`Error::Unsupported`] when `slab` covers a part of a chunk
     /// that is in the file with its filters.
-    pub(super) fn check_chunks(&self, slab: &Hyperslab) -> Result<()> {
+    pub(super) fn check_chunks(&self, slab: &Hyperslab, readable: bool) -> Result<()> {
         match &self.chunks {
-            Some(chunks) if slab.start.len() == chunks.dims.len() => chunks.parts(slab).map(drop),
+            Some(chunks) if slab.start.len() == chunks.dims.len() => {
+                chunks.parts(slab, readable).map(drop)
+            }
             _ => Ok(()),
         }
     }
@@ -816,7 +913,7 @@ impl Dataset {
             let new = if chunks.filters.is_empty() {
                 chunks.spaces.get(&origin).is_none_or(|space| !space.ready)
             } else {
-                !chunks.buffers.contains_key(&origin)
+                !chunks.buffers.contains_key(&origin) && !chunks.spaces.contains_key(&origin)
             };
             if new && !Part::new(origin, &chunks.dims, slab).full {
                 elements = elements.saturating_add(per_chunk);
@@ -950,6 +1047,7 @@ impl Dataset {
             .fill_value
             .as_deref()
             .filter(|fill| fill.iter().any(|&b| b != 0));
+        let pipeline_body = &self.pipeline_body;
         let Some(chunks) = &mut self.chunks else {
             return Ok(());
         };
@@ -964,7 +1062,7 @@ impl Dataset {
                 .ok_or_else(overflow)?;
             chunk_strides[axis] = chunk_strides[axis + 1] * chunks.dims[axis + 1];
         }
-        let parts = chunks.parts(slab)?;
+        let parts = chunks.parts(slab, sink.can_read())?;
 
         // Each row of a full chunk writes over its bytes, so the buffer needs no reset.
         let mut full_buffer = Vec::new();
@@ -988,6 +1086,17 @@ impl Dataset {
                     chunks.store(sink, alloc, &part.origin, &full_buffer, element_size)?;
                     continue;
                 }
+                if let Some(space) = chunks.spaces.get(&part.origin).copied() {
+                    // The chunk is in the file with its filters, so it comes back to memory.
+                    let mut stored = vec![0; to_usize(u64::from(space.size))?];
+                    sink.read_exact_at(space.address, &mut stored)?;
+                    let pipeline = FilterPipeline::parse(pipeline_body)?;
+                    let len = to_usize(u64::from(chunks.bytes))?;
+                    let mut buffer = decode_chunk(&pipeline, 0, stored, len)?;
+                    rows.emit(&mut BufferSink(&mut buffer), 0, &mut emit)?;
+                    chunks.buffers.insert(part.origin.clone(), buffer);
+                    continue;
+                }
                 let mut buffer = match (take_fresh(&mut fresh, u64::from(chunks.bytes))?, fill) {
                     (Some(block), _) => block.to_vec(),
                     (None, Some(fill)) => fill.repeat(to_usize(
@@ -1008,7 +1117,7 @@ impl Dataset {
                         size: chunks.bytes,
                         ready: false,
                     };
-                    chunks.spaces.insert(part.origin.clone(), space);
+                    chunks.set_space(part.origin.clone(), space);
                     space
                 }
             };
@@ -1025,6 +1134,7 @@ impl Dataset {
                 if let Some(space) = chunks.spaces.get_mut(&part.origin) {
                     space.ready = true;
                 }
+                chunks.stale = true;
             }
             rows.emit(&mut *sink, space.address, &mut emit)?;
         }
@@ -1090,6 +1200,43 @@ impl Dataset {
             }
         }
         Ok(())
+    }
+}
+
+/// The filters of the writer for the pipeline of a dataset in a file.
+fn filters_of(pipeline: &FilterPipeline) -> Result<Vec<Filter>> {
+    let filter = |filter: &crate::message::filter::Filter| {
+        let level = filter.client_data.first();
+        let level = level.and_then(|&level| u8::try_from(level).ok());
+        match (filter.id, level) {
+            (id::SHUFFLE, _) => Ok(Filter::Shuffle),
+            (id::FLETCHER32, _) => Ok(Filter::Fletcher32),
+            (id::DEFLATE, Some(level)) => Ok(Filter::Deflate(level)),
+            (id::ZSTD, Some(level)) => Ok(Filter::Zstd(level)),
+            _ => Err(Error::unsupported(format!(
+                "an edit of a dataset with the filter {}",
+                filter.id
+            ))),
+        }
+    };
+    pipeline.filters.iter().map(filter).collect()
+}
+
+/// The address of the chunk index in `layout` that the close can keep.
+///
+/// The writer encodes a version 1 B-tree address only. The new superblock
+/// gives no node size, so each reader uses the default node size. An index
+/// of another node size, or an unknown node size, gets no address.
+fn kept_index(layout: &Layout, superblock: &Superblock) -> Option<u64> {
+    let default_k = superblock.indexed_storage_internal_node_k == DEFAULT_ISTORE_K
+        && superblock.extension_address.is_none();
+    match layout {
+        Layout::Chunked {
+            address,
+            index: ChunkIndex::BtreeV1,
+            ..
+        } if default_k => *address,
+        _ => None,
     }
 }
 
@@ -1346,6 +1493,35 @@ mod tests {
         let data = sink.inner.into_inner();
         assert_eq!(data[..8], [9, 9, 9, 9, 1, 2, 3, 4]);
         assert_eq!(data[2_399_996..], [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn only_a_version_1_index_with_the_default_node_size_stays() {
+        let superblock = |k: u16, extension: Option<u64>| Superblock {
+            version: 1,
+            sizes: crate::cursor::Sizes::EIGHT,
+            superblock_offset: 0,
+            base_address: 0,
+            end_of_file_address: 0,
+            extension_address: extension,
+            root: crate::superblock::RootGroup::ObjectHeader(0),
+            group_internal_node_k: 16,
+            group_leaf_node_k: 4,
+            indexed_storage_internal_node_k: k,
+        };
+        let chunked = |index: ChunkIndex| Layout::Chunked {
+            address: Some(800),
+            chunk_dims: vec![2],
+            element_size: 4,
+            index,
+        };
+        let btree = chunked(ChunkIndex::BtreeV1);
+        assert_eq!(kept_index(&btree, &superblock(32, None)), Some(800));
+        assert_eq!(kept_index(&btree, &superblock(64, None)), None);
+        // An extension can hold another node size.
+        assert_eq!(kept_index(&btree, &superblock(32, Some(96))), None);
+        let fixed = chunked(ChunkIndex::FixedArray { page_bits: 10 });
+        assert_eq!(kept_index(&fixed, &superblock(32, None)), None);
     }
 
     #[test]

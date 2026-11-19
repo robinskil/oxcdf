@@ -207,9 +207,10 @@ pub struct DatasetIndex {
     /// Whether every attribute was found.
     ///
     /// False when the object's attribute heap has internal free space, which
-    /// hides records from a sequential walk. The values present are correct;
-    /// the list may be short. Fall back to netcdf-c for this object's
-    /// attributes when that matters.
+    /// hides records from a sequential walk. Also false when the reader
+    /// cannot parse an attribute message, and skips it. The values present
+    /// are correct; the list may be short. Fall back to netcdf-c for this
+    /// object's attributes when that matters.
     pub attributes_complete: bool,
 }
 
@@ -331,6 +332,11 @@ pub struct GroupIndex {
     pub groups: Vec<GroupIndex>,
     /// Child datasets.
     pub datasets: Vec<DatasetIndex>,
+    /// The names of the links of this group that the index does not show.
+    ///
+    /// These are links to committed datatypes, external links, links of an
+    /// unknown type, and soft links that do not name a dataset.
+    pub hidden_links: Vec<String>,
 }
 
 impl GroupIndex {
@@ -595,7 +601,8 @@ fn group_at_mut<'a>(root: &'a mut GroupIndex, parts: &[&str]) -> Option<&'a mut 
 /// Show each soft link to a dataset as a dataset of the group that holds the
 /// link, as the HDF5 library does.
 ///
-/// A link to a group, to nothing, or to another file is left out.
+/// A link to a group, to nothing, or to another file is left out. Its name
+/// goes to [`GroupIndex::hidden_links`] of the group that holds the link.
 fn resolve_soft_links(root: &mut GroupIndex, mut pending: Vec<SoftLink>) {
     // A link can name another link, so resolve in rounds.
     for _ in 0..MAX_SOFT_LINK_HOPS {
@@ -638,6 +645,12 @@ fn resolve_soft_links(root: &mut GroupIndex, mut pending: Vec<SoftLink>) {
             break;
         }
     }
+    for link in pending {
+        let holder: Vec<&str> = link.group.split('/').filter(|p| !p.is_empty()).collect();
+        if let Some(group) = group_at_mut(root, &holder) {
+            group.hidden_links.push(link.name);
+        }
+    }
 }
 
 /// Build the index for the group whose object header is at `address`.
@@ -663,7 +676,8 @@ fn build_group(
 
     let header = ObjectHeader::read(ctx, address)?;
     let (attributes, attributes_complete) = read_attributes(ctx, &header)?;
-    let children = resolve_children(ctx, &header, &path, soft_links)?;
+    let mut hidden_links = Vec::new();
+    let children = resolve_children(ctx, &header, &path, soft_links, &mut hidden_links)?;
 
     let mut groups = Vec::new();
     let mut datasets = Vec::new();
@@ -688,6 +702,7 @@ fn build_group(
             // A user-defined type, which netCDF-4 stores beside the variables
             // that use it. It holds no values, and reading it as a group would
             // invent one the file does not have.
+            hidden_links.push(child.name);
             continue;
         } else {
             groups.push(build_group(
@@ -710,6 +725,7 @@ fn build_group(
         attributes_complete,
         groups,
         datasets,
+        hidden_links,
     })
 }
 
@@ -720,8 +736,8 @@ fn build_group(
 /// threshold, so both go through here.
 fn read_attributes(ctx: Ctx<'_>, header: &ObjectHeader) -> Result<(Vec<Attribute>, bool)> {
     let sizes = ctx.sizes();
-    let mut attributes = header.compact_attributes(sizes).0;
-    let mut complete = true;
+    let (mut attributes, skipped) = header.compact_attributes(sizes);
+    let mut complete = skipped.is_empty();
 
     if let Some(info) = header.attribute_info(sizes)? {
         if let Some(heap_address) = info.fractal_heap_address {
@@ -732,7 +748,7 @@ fn read_attributes(ctx: Ctx<'_>, header: &ObjectHeader) -> Result<(Vec<Attribute
                 sizes,
             )?;
             attributes.extend(dense);
-            complete = all_found;
+            complete &= all_found;
         }
     }
 
@@ -740,11 +756,14 @@ fn read_attributes(ctx: Ctx<'_>, header: &ObjectHeader) -> Result<(Vec<Attribute
 }
 
 /// List a group's children, whichever storage style it uses.
+///
+/// The name of an external link, or of a link of an unknown type, goes to `hidden`.
 fn resolve_children(
     ctx: Ctx<'_>,
     header: &ObjectHeader,
     group: &str,
     soft_links: &mut Vec<SoftLink>,
+    hidden: &mut Vec<String>,
 ) -> Result<Vec<Child>> {
     let sizes = ctx.sizes();
     // Every link name so far, in link order.
@@ -785,6 +804,8 @@ fn resolve_children(
                     entry.cached
                 {
                     soft(name, heap.name_at(link_value_offset as u64)?, &mut names);
+                } else {
+                    hidden.push(name);
                 }
             }
         }
@@ -823,7 +844,7 @@ fn resolve_children(
             }
             LinkTarget::Soft { path } => soft(link.name, path, &mut names),
             // An external link names another file. It is not followed.
-            _ => {}
+            _ => hidden.push(link.name),
         }
     }
 

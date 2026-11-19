@@ -77,7 +77,8 @@ The `write` feature creates files. It supports groups, attributes and
 datasets of numbers, fixed strings and variable-length strings. A dataset is
 contiguous or chunked. A chunked dataset can have unlimited dimensions and
 shuffle, deflate, Zstandard and Fletcher-32 filters. A dataset can have
-dimension scales. The `oxcdf` crate adds the netCDF conventions.
+dimension scales. `Hdf5Writer::open` opens a file that exists for edits. The
+`oxcdf` crate adds the netCDF conventions.
 
 See the [repository] for the full state and the test matrix.
 

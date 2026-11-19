@@ -23,6 +23,8 @@ use crate::message::{
 use crate::objheader::{HeaderMessage, MessageType};
 use crate::read::{swap_bytes_in_place, Hyperslab};
 
+mod open;
+
 /// Default size of one metadata block in bytes.
 const DEFAULT_METADATA_BLOCK_BYTES: u64 = 65536;
 
@@ -472,7 +474,7 @@ impl<S: ByteSink> Hdf5Writer<S> {
     /// in the file with its filters.
     pub fn check_write(&self, dataset: DatasetId, slab: &Hyperslab) -> Result<()> {
         match self.nodes.get(dataset.0).map(|n| &n.kind) {
-            Some(NodeKind::Dataset(d)) => d.check_chunks(slab),
+            Some(NodeKind::Dataset(d)) => d.check_chunks(slab, self.sink.can_read()),
             _ => Err(no_dataset(dataset)),
         }
     }

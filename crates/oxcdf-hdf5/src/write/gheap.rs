@@ -12,7 +12,12 @@ use crate::heap::GCOL_SIGNATURE;
 /// Size of one element of a variable-length datatype: a heap reference.
 pub const DESCRIPTOR_BYTES: usize = 16;
 
-/// Default size of one collection in bytes.
+/// Size of the first collection in bytes, the minimum of the HDF5 library.
+///
+/// The library reads at least this size at the address of a collection.
+const MIN_COLLECTION_BYTES: usize = 4096;
+
+/// Largest default size of one collection in bytes.
 const COLLECTION_BYTES: usize = 65536;
 
 /// Size of the collection header, and of each object header.
@@ -21,10 +26,14 @@ const HEADER_BYTES: usize = 16;
 /// Stores variable-length values in global heap collections.
 ///
 /// One collection is open in memory. It goes to the sink when it is full,
-/// and at [`Self::flush`].
+/// and at [`Self::flush`]. The first collection has 4 KiB. Each new
+/// collection has two times the size of the one before, up to 64 KiB. A
+/// writer with few values adds few bytes to the file.
 #[derive(Debug, Default)]
 pub struct HeapWriter {
     open: Option<Collection>,
+    /// The number of collections up to now.
+    collections: u32,
 }
 
 /// A collection with reserved file space that is not in the sink yet.
@@ -97,8 +106,9 @@ impl HeapWriter {
                 let exact = need
                     .checked_add(HEADER_BYTES)
                     .ok_or_else(|| Error::unsupported("a variable-length value is too large"))?;
-                let size = exact.max(COLLECTION_BYTES);
+                let size = exact.max(collection_bytes(self.collections));
                 let address = alloc.alloc_data(to_u64(size)?)?;
+                self.collections = self.collections.saturating_add(1);
                 let mut bytes = Encoder::with_capacity(size);
                 bytes.bytes(GCOL_SIGNATURE);
                 bytes.u8(1); // version
@@ -151,6 +161,12 @@ impl HeapWriter {
     }
 }
 
+/// The default size of the collection after `count` collections.
+fn collection_bytes(count: u32) -> usize {
+    let shift = count.min(COLLECTION_BYTES.ilog2() - MIN_COLLECTION_BYTES.ilog2());
+    MIN_COLLECTION_BYTES << shift
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,32 +200,45 @@ mod tests {
         assert_eq!((a.length, a.collection_address, a.object_index), (5, 0, 1));
         assert_eq!((b.length, b.collection_address, b.object_index), (8, 0, 2));
         let file = sink.into_inner();
-        assert_eq!(file.len(), 65536);
+        assert_eq!(file.len(), 4096);
+        assert_eq!(file[8..16], 4096u64.to_le_bytes());
         // The free space object starts after two objects and holds the rest.
         assert_eq!(file[64..66], [0, 0]);
-        assert_eq!(file[72..80], (65536u64 - 64).to_le_bytes());
+        assert_eq!(file[72..80], (4096u64 - 64).to_le_bytes());
         let heap = read(file, 0);
         assert_eq!(heap.object(1).unwrap().data, b"hello");
         assert_eq!(heap.object(2).unwrap().data, b"12345678");
     }
 
     #[test]
-    fn a_full_collection_starts_a_new_collection() {
+    fn a_full_collection_starts_a_new_collection_of_two_times_its_size() {
         let mut heap = HeapWriter::default();
         let mut sink = MemorySink::new();
         let mut alloc = Allocator::new(0, 0);
-        let value = vec![7u8; 30000];
-        let addresses: Vec<u64> = (0..5)
-            .map(|_| {
-                parse(heap.put(&mut sink, &mut alloc, &value, 30000).unwrap()).collection_address
-            })
-            .collect();
-        assert_eq!(addresses, [0, 0, 65536, 65536, 131072]);
+        // An object of this value takes 1016 bytes, so four fit in the first collection.
+        let value = vec![7u8; 1000];
+        let mut addresses = Vec::new();
+        let mut last = None;
+        while addresses.len() < 7 {
+            let d = parse(heap.put(&mut sink, &mut alloc, &value, 1000).unwrap());
+            if addresses.last() != Some(&d.collection_address) {
+                addresses.push(d.collection_address);
+            }
+            last = Some(d);
+        }
+        assert_eq!(addresses, [0, 4096, 12288, 28672, 61440, 126976, 192512]);
         heap.flush(&mut sink).unwrap();
         sink.set_len(alloc.end_of_file()).unwrap();
         let file = sink.into_inner();
-        assert_eq!(read(file.clone(), 65536).object(2).unwrap().data, value);
-        assert_eq!(read(file, 131072).objects.len(), 1);
+        let sizes: Vec<u64> = addresses
+            .iter()
+            .map(|&at| u64::from_le_bytes(file[at as usize + 8..][..8].try_into().unwrap()))
+            .collect();
+        assert_eq!(sizes, [4096, 8192, 16384, 32768, 65536, 65536, 65536]);
+        assert_eq!(read(file.clone(), 0).objects.len(), 4);
+        let last = last.unwrap();
+        let heap = read(file, last.collection_address);
+        assert_eq!(heap.object(last.object_index as u16).unwrap().data, value);
     }
 
     #[test]

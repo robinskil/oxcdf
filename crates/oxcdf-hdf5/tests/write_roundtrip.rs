@@ -826,9 +826,48 @@ fn deflate_makes_the_file_smaller() {
     assert_eq!(read_all::<f64>(&reopen(small), "/v"), values);
 }
 
+/// A sink that cannot read, as an upload stream.
+#[derive(Debug)]
+struct WriteOnly(MemorySink);
+
+impl oxcdf_hdf5::write::ByteSink for WriteOnly {
+    fn write_all_at(&mut self, offset: u64, data: &[u8]) -> oxcdf_hdf5::Result<()> {
+        self.0.write_all_at(offset, data)
+    }
+
+    fn set_len(&mut self, len: u64) -> oxcdf_hdf5::Result<()> {
+        self.0.set_len(len)
+    }
+
+    fn sync(&mut self) -> oxcdf_hdf5::Result<()> {
+        self.0.sync()
+    }
+}
+
 #[test]
-fn a_flushed_chunk_takes_only_a_full_write() {
+fn a_part_of_a_stored_compressed_chunk_takes_a_write() {
     let mut w = new_writer();
+    let root = w.root();
+    let spec = DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[8])
+        .unwrap()
+        .chunked(&[4])
+        .with_filters(&[Filter::Shuffle, Filter::Deflate(4), Filter::Fletcher32]);
+    let d = w.add_dataset(root, "v", spec).unwrap();
+    // Each chunk gets a full write, so each is in the file with its filters.
+    w.write(d, &Hyperslab::all(&[8]), &[1i32, 2, 3, 4, 5, 6, 7, 8])
+        .unwrap();
+    let middle = Hyperslab::new(vec![2], vec![4], &[8]).unwrap();
+    w.write(d, &middle, &[30i32, 40, 50, 60]).unwrap();
+    let one = Hyperslab::new(vec![7], vec![1], &[8]).unwrap();
+    w.write(d, &one, &[80i32]).unwrap();
+    let file = reopen(w.close().unwrap().into_inner());
+    assert_eq!(read_all::<i32>(&file, "/v"), [1, 2, 30, 40, 50, 60, 7, 80]);
+}
+
+#[test]
+fn a_flushed_chunk_takes_only_a_full_write_with_no_read() {
+    let sink = WriteOnly(MemorySink::new());
+    let mut w = Hdf5Writer::create(sink, WriteOptions::default()).unwrap();
     let root = w.root();
     let spec = DatasetSpec::numeric(DType::Uint(1), ByteOrder::Little, &[4, 4])
         .unwrap()
@@ -852,7 +891,7 @@ fn a_flushed_chunk_takes_only_a_full_write() {
     let chunk = Hyperslab::new(vec![0, 0], vec![2, 4], &[4, 4]).unwrap();
     w.write(d, &chunk, &[5u8; 8]).unwrap();
     w.write(d, &row(3), &[3u8; 4]).unwrap();
-    let file = reopen(w.close().unwrap().into_inner());
+    let file = reopen(w.close().unwrap().0.into_inner());
     assert_eq!(
         read_all::<u8>(&file, "/v"),
         [5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 3, 3, 3, 3]

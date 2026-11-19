@@ -39,9 +39,13 @@
 //! [`Hdf5Writer::attach_scale`] writes the two attributes of a dimension
 //! scale. The `oxcdf` crate uses it for the netCDF conventions.
 //!
+//! [`Hdf5Writer::open`] opens a file that exists for edits. The values stay
+//! in place. The close writes each object header again at the end of the
+//! file, so each edit session adds the size of all headers to the file.
+//!
 //! The writer does not write datasets of variable-length sequences.
-//! It does not apply the netCDF conventions. It does not change an existing
-//! file.
+//! It does not apply the netCDF conventions. It does not remove or rename a
+//! group, and it does not remove a dataset or an attribute.
 
 pub(crate) mod alloc;
 pub(crate) mod btree;
