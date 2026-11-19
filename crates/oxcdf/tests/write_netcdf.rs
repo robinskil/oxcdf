@@ -669,20 +669,75 @@ fn names_follow_the_rules_of_netcdf_c() {
 }
 
 #[test]
-fn a_refused_write_to_a_compressed_chunk_changes_nothing() {
+fn a_part_of_a_compressed_chunk_takes_a_second_write() {
     let mut file = oxcdf::create_in_memory().unwrap();
     file.add_unlimited_dimension("t").unwrap();
     let mut v = file.add_variable::<i32>("v", &["t"]).unwrap();
     v.set_chunking(&[2]).unwrap();
     v.set_compression(1, false).unwrap();
     v.put_values(&[1, 2], [0..2]).unwrap();
-    // The chunk at 0 is in the file with its filter, so a part of it takes no write.
-    let refused = v.put_values(&[7, 8, 9], [1..4]);
-    assert!(matches!(refused, Err(Error::Unsupported(_))));
-    assert_eq!(file.dimension_len("t"), Some(2));
+    // The chunk at 0 is in the file with its filter. The writer reads it back.
+    v.put_values(&[7, 8, 9], [1..4]).unwrap();
+    assert_eq!(file.dimension_len("t"), Some(4));
 
     let file = reopen(file);
     let v = file.variable("v").unwrap();
-    assert_eq!(v.shape, [2]);
-    assert_eq!(v.get_values::<i32, _>(..).unwrap(), [1, 2]);
+    assert_eq!(v.get_values::<i32, _>(..).unwrap(), [1, 7, 8, 9]);
+}
+
+#[test]
+fn shuffle_works_alone_and_with_zstandard() {
+    let mut file = oxcdf::create_in_memory().unwrap();
+    file.add_dimension("x", 6).unwrap();
+    let values: Vec<i32> = (0..6).collect();
+    let mut alone = file.add_variable::<i32>("alone", &["x"]).unwrap();
+    alone.set_shuffle(true).unwrap();
+    alone.put_values(&values, ..).unwrap();
+    let mut both = file.add_variable::<i32>("both", &["x"]).unwrap();
+    both.set_shuffle(true).unwrap();
+    both.set_zstd(3).unwrap();
+    both.put_values(&values, ..).unwrap();
+    let mut scalar = file.add_variable::<i32>("scalar", &[]).unwrap();
+    assert!(bad(scalar.set_shuffle(true)));
+
+    let file = reopen(file);
+    let ids = |name: &str| -> Vec<u16> {
+        let dataset = file.variable(name).unwrap().dataset().unwrap();
+        dataset.pipeline.filters.iter().map(|f| f.id).collect()
+    };
+    assert_eq!(ids("alone"), [2]);
+    assert_eq!(ids("both"), [2, 32015]);
+    for name in ["alone", "both"] {
+        let v = file.variable(name).unwrap();
+        assert_eq!(v.get_values::<i32, _>(..).unwrap(), values);
+    }
+}
+
+#[test]
+fn the_fill_value_of_a_char_variable_is_scalar_text() {
+    let mut file = oxcdf::create_in_memory().unwrap();
+    file.add_dimension("x", 3).unwrap();
+    let mut code = file
+        .add_variable_with_type("code", &["x"], &DType::Char)
+        .unwrap();
+    code.set_fill_value(b'#').unwrap();
+    code.put_values(b"a".as_slice(), [1..2]).unwrap();
+    let mut number = file.add_variable::<i16>("number", &["x"]).unwrap();
+    number.set_fill_value(-1i16).unwrap();
+
+    let file = reopen(file);
+    let code = file.variable("code").unwrap();
+    assert_eq!(code.get_strings(..).unwrap().concat(), "#a#");
+    let dims = |name: &str| {
+        let dataset = file.variable(name).unwrap().dataset().unwrap();
+        dataset
+            .attribute("_FillValue")
+            .unwrap()
+            .dataspace
+            .dims
+            .clone()
+    };
+    // netcdf-c writes a scalar for `char` and one element for a number.
+    assert!(dims("code").is_empty());
+    assert_eq!(dims("number"), [1]);
 }

@@ -180,3 +180,133 @@ fn netcdf_c_reads_a_file_from_the_netcdf_writer() {
     drop(file);
     std::fs::remove_file(&path).unwrap();
 }
+
+#[test]
+fn netcdf_c_reads_a_file_from_netcdf_c_after_an_append() {
+    let path = std::env::temp_dir().join(format!("oxcdf-diff-append-{}.nc", std::process::id()));
+    {
+        let mut file = netcdf::create(&path).unwrap();
+        file.add_unlimited_dimension("time").unwrap();
+        file.add_dimension("lat", 3).unwrap();
+        file.add_attribute("title", "from netcdf-c").unwrap();
+        // More than eight attributes or links go to dense storage in netcdf-c.
+        for i in 0..12i32 {
+            file.add_attribute(&format!("attr_{i:02}"), i).unwrap();
+        }
+        let mut lat = file.add_variable::<f32>("lat", &["lat"]).unwrap();
+        lat.put_values(&[-10.0f32, 0.0, 10.0], ..).unwrap();
+        let mut temp = file.add_variable::<f32>("TEMP", &["time", "lat"]).unwrap();
+        temp.set_chunking(&[2, 3]).unwrap();
+        temp.set_compression(4, true).unwrap();
+        temp.set_fill_value(-999.0f32).unwrap();
+        temp.put_attribute("units", "degC").unwrap();
+        temp.put_values(&[1.0f32, 2.0, 3.0], [0..1, 0..3]).unwrap();
+        let mut name = file.add_string_variable("name", &["lat"]).unwrap();
+        name.put_string("south", [0]).unwrap();
+        for i in 0..20i32 {
+            let mut var = file
+                .add_variable::<i32>(&format!("var_{i:02}"), &["lat"])
+                .unwrap();
+            var.put_values(&[i, i + 1, i + 2], ..).unwrap();
+        }
+        let mut sub = file.add_group("sub").unwrap();
+        sub.add_dimension("z", 2).unwrap();
+        let mut deep = sub.add_variable::<i32>("deep", &["z", "lat"]).unwrap();
+        deep.put_values(&[1, 2, 3, 4, 5, 6], ..).unwrap();
+    }
+
+    let mut file = oxcdf::append(&path).unwrap();
+    assert_eq!(file.dimension_len("time"), Some(1));
+    let mut temp = file.variable_mut("TEMP").unwrap();
+    temp.put_values(&[4.0f32, 5.0, 6.0, 7.0, 8.0, 9.0], [1..3, 0..3])
+        .unwrap();
+    temp.put_attribute("long_name", "temperature").unwrap();
+    let mut name = file.variable_mut("name").unwrap();
+    name.put_string("north", [2]).unwrap();
+    file.add_attribute("history", "appended by oxcdf").unwrap();
+    file.add_attribute("attr_03", 33i32).unwrap();
+    file.add_dimension("depth", 2).unwrap();
+    let mut psal = file
+        .add_variable::<f64>("PSAL", &["time", "depth"])
+        .unwrap();
+    psal.put_values(&[0.5f64, 1.5, 2.5, 3.5, 4.5, 5.5], ..)
+        .unwrap();
+    let mut sub = file.group_mut("sub").unwrap();
+    let mut more = sub.add_variable::<i16>("more", &["z"]).unwrap();
+    more.put_values(&[7i16, 8], ..).unwrap();
+    file.close().unwrap();
+
+    let file = netcdf::open(&path).unwrap();
+    let dims: Vec<(String, usize, bool)> = file
+        .dimensions()
+        .map(|d| (d.name(), d.len(), d.is_unlimited()))
+        .collect();
+    assert_eq!(
+        dims,
+        [
+            ("time".to_owned(), 3, true),
+            ("lat".to_owned(), 3, false),
+            ("depth".to_owned(), 2, false)
+        ]
+    );
+    assert_eq!(file.variables().count(), 24);
+    assert_eq!(file.attributes().count(), 14);
+    let attr_03 = file.attribute("attr_03").unwrap().value().unwrap();
+    assert!(matches!(attr_03, netcdf::AttributeValue::Int(33)));
+    let attr_11 = file.attribute("attr_11").unwrap().value().unwrap();
+    assert!(matches!(attr_11, netcdf::AttributeValue::Int(11)));
+    let history = file.attribute("history").unwrap().value().unwrap();
+    assert!(matches!(history, netcdf::AttributeValue::Str(ref s) if s == "appended by oxcdf"));
+
+    let temp = file.variable("TEMP").unwrap();
+    let temp_dims: Vec<String> = temp.dimensions().iter().map(|d| d.name()).collect();
+    assert_eq!(temp_dims, ["time", "lat"]);
+    assert_eq!(
+        temp.get_values::<f32, _>(..).unwrap(),
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    );
+    assert_eq!(temp.fill_value::<f32>().unwrap(), Some(-999.0));
+    assert_eq!(temp.attributes().count(), 3);
+    let lat = file.variable("lat").unwrap();
+    assert_eq!(lat.get_values::<f32, _>(..).unwrap(), [-10.0, 0.0, 10.0]);
+    let name = file.variable("name").unwrap();
+    assert_eq!(name.get_string([0]).unwrap(), "south");
+    assert_eq!(name.get_string([2]).unwrap(), "north");
+    for i in 0..20i32 {
+        let var = file.variable(&format!("var_{i:02}")).unwrap();
+        assert_eq!(var.get_values::<i32, _>(..).unwrap(), [i, i + 1, i + 2]);
+        let var_dims: Vec<String> = var.dimensions().iter().map(|d| d.name()).collect();
+        assert_eq!(var_dims, ["lat"]);
+    }
+    let psal = file.variable("PSAL").unwrap();
+    let psal_dims: Vec<String> = psal.dimensions().iter().map(|d| d.name()).collect();
+    assert_eq!(psal_dims, ["time", "depth"]);
+    assert_eq!(
+        psal.get_values::<f64, _>(..).unwrap(),
+        [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
+    );
+    let sub = file.group("sub").unwrap().unwrap();
+    let deep = sub.variable("deep").unwrap();
+    assert_eq!(deep.get_values::<i32, _>(..).unwrap(), [1, 2, 3, 4, 5, 6]);
+    let more = sub.variable("more").unwrap();
+    assert_eq!(more.get_values::<i16, _>(..).unwrap(), [7, 8]);
+    // Windows cannot remove a file that netcdf-c holds open.
+    drop(file);
+
+    // netcdf-c appends to the file again, and this reader reads the result.
+    {
+        let mut file = netcdf::append(&path).unwrap();
+        let mut temp = file.variable_mut("TEMP").unwrap();
+        temp.put_values(&[10.0f32, 11.0, 12.0], [3..4, 0..3])
+            .unwrap();
+    }
+    let file = oxcdf::open(&path).unwrap();
+    let temp = file.variable("TEMP").unwrap();
+    assert_eq!(temp.shape, [4, 3]);
+    assert_eq!(
+        temp.get_values::<f32, _>([3..4, 0..3]).unwrap(),
+        [10.0, 11.0, 12.0]
+    );
+    drop(file);
+    std::fs::remove_file(&path).unwrap();
+}

@@ -69,9 +69,9 @@
 //!
 //! # Write
 //!
-//! The `write` feature adds `create`. It makes a new netCDF-4 file with no
-//! netcdf-c. See the `write` module, behind that feature. The crate does not
-//! change a file that exists. Keep netcdf-c for that.
+//! The `write` feature adds `create` and `append`. `create` makes a new
+//! netCDF-4 file with no netcdf-c. `append` changes a file in place. See the
+//! `write` module, behind that feature.
 
 // docs.rs builds with `--cfg docsrs` on nightly, so every feature-gated item
 // carries a badge that names the feature. A stable build ignores this.
@@ -146,7 +146,8 @@ pub use oxcdf_hdf5::write::WriteOptions;
 #[cfg(feature = "write")]
 #[cfg_attr(docsrs, doc(cfg(feature = "write")))]
 pub use write::{
-    create, create_in_memory, create_in_memory_with, create_with, FileMut, GroupMut, VariableMut,
+    append, append_in_memory, append_with, create, create_in_memory, create_in_memory_with,
+    create_with, FileMut, GroupMut, VariableMut,
 };
 
 /// Open a netCDF file for reading.

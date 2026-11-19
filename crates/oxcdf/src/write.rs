@@ -36,7 +36,8 @@
 //!
 //! # Limits
 //!
-//! The writer makes new files only. It has no user-defined types. One
+//! [`append`] changes a file in place. The writer does not remove or rename
+//! an object. It has no user-defined types. One
 //! attribute holds 64 KiB at most. See [`oxcdf_hdf5::write`] for the limits
 //! of the container.
 
@@ -51,10 +52,16 @@ use oxcdf_hdf5::write::{
     GroupId, Hdf5Writer, MemorySink, ObjectId, WriteOptions,
 };
 
+use std::sync::Arc;
+
+use oxcdf_hdf5::source::ByteSource;
+use oxcdf_hdf5::Hdf5File;
+
 use crate::extent::Extents;
 use crate::netcdf::{
     AttributeValue, NON_COORDINATE_PREFIX, PHANTOM_DIMENSION_PREFIX, RESERVED_ATTRIBUTES,
 };
+use crate::netcdf::{NcGroup, NetcdfFile};
 use crate::{DType, Element, Error, Result};
 
 /// Index of the root group in the group list.
@@ -152,14 +159,167 @@ pub fn create_in_memory() -> Result<FileMut> {
 ///
 /// Returns [`Error::BadRequest`] for options above their limits.
 pub fn create_in_memory_with(options: WriteOptions) -> Result<FileMut> {
-    FileMut::new(Sink::Memory(MemorySink::new()), options, Target::Memory)
+    FileMut::new(
+        Sink::Memory(MemoryBuffer::default()),
+        options,
+        Target::Memory,
+    )
+}
+
+/// Open the netCDF-4 file `path` to change it in place.
+///
+/// The file can come from this writer or from netcdf-c. [`FileMut::close`]
+/// writes the changes. A [`FileMut`] that is dropped does the same and
+/// ignores errors.
+///
+/// The writer is the only writer of the file until the close. A second
+/// [`append`] of the file fails. On Windows, the handle of the writer
+/// shares the file for reads only. On Unix, the writer takes an exclusive
+/// advisory lock (`flock`) on the file. The OS frees the file when the
+/// process stops, so a crash leaves no lock.
+///
+/// A reader such as [`crate::open`] can open the file during the session.
+/// Until the close, it sees the earlier structure and the earlier values.
+///
+/// Each variable of the file keeps its definition. A write to values of
+/// the file changes them at once. New groups, dimensions, variables and
+/// attributes appear at the close. Each append session adds the size of
+/// all object headers to the file.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the file cannot be opened, or when another
+/// handle has it open for writes or holds a lock on it. Returns
+/// [`Error::Unsupported`] for a classic file and for a file that the writer
+/// cannot describe again, such as a file with user-defined types or with no
+/// dimension scales. An error changes nothing.
+///
+/// [`FileMut::add_variable`] in a session returns [`Error::Unsupported`]
+/// for a new coordinate variable of a dimension of the file.
+pub fn append(path: impl AsRef<Path>) -> Result<FileMut> {
+    append_with(path, WriteOptions::default())
+}
+
+/// Open the netCDF-4 file `path` to change it in place, with explicit options.
+///
+/// # Errors
+///
+/// The errors of [`append`]. Returns [`Error::BadRequest`] for options above
+/// their limits.
+pub fn append_with(path: impl AsRef<Path>, options: WriteOptions) -> Result<FileMut> {
+    let sink = FileSink::open(path)?;
+    let file = NetcdfFile::from_source(sink.source()?)?;
+    FileMut::open(Sink::File(sink), &file, options, Target::InPlace)
+}
+
+/// Open the netCDF-4 file `bytes` in memory to change it.
+///
+/// [`FileMut::into_bytes`] returns the changed file.
+///
+/// # Errors
+///
+/// The errors of [`append`], apart from [`Error::Io`].
+pub fn append_in_memory(bytes: Vec<u8>) -> Result<FileMut> {
+    append_shared(Arc::new(bytes))
+}
+
+/// Open the file `bytes` in memory. The reader and the sink share the one buffer.
+fn append_shared(bytes: Arc<Vec<u8>>) -> Result<FileMut> {
+    let source = Arc::new(SharedSource(Arc::clone(&bytes)));
+    let file = NetcdfFile::from_source(source)?;
+    let sink = Sink::Memory(MemoryBuffer::shared(bytes));
+    FileMut::open(sink, &file, WriteOptions::default(), Target::Memory)
+}
+
+/// A byte source over a buffer that a [`MemoryBuffer`] also holds.
+#[derive(Debug)]
+struct SharedSource(Arc<Vec<u8>>);
+
+impl ByteSource for SharedSource {
+    fn size(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let range = usize::try_from(offset)
+            .ok()
+            .and_then(|start| Some(start..start.checked_add(buf.len())?));
+        match range.and_then(|range| self.0.get(range)) {
+            Some(bytes) => buf.copy_from_slice(bytes),
+            None => {
+                return Err(Error::OutOfBounds {
+                    what: "buffer",
+                    offset,
+                    len: buf.len() as u64,
+                    available: self.size().saturating_sub(offset),
+                })
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A memory sink that can start from a buffer that a reader shares.
+#[derive(Debug, Default)]
+struct MemoryBuffer {
+    /// The bytes of the file until the first access to the sink.
+    shared: Option<Arc<Vec<u8>>>,
+    sink: MemorySink,
+}
+
+impl MemoryBuffer {
+    /// A sink with the bytes of `bytes`.
+    fn shared(bytes: Arc<Vec<u8>>) -> Self {
+        Self {
+            shared: Some(bytes),
+            sink: MemorySink::new(),
+        }
+    }
+
+    /// The sink, with the shared bytes moved in at the first call.
+    fn sink(&mut self) -> &mut MemorySink {
+        if let Some(bytes) = self.shared.take() {
+            // With no reader left, the move takes the buffer with no copy.
+            let bytes = Arc::try_unwrap(bytes).unwrap_or_else(|bytes| bytes.as_ref().clone());
+            self.sink = MemorySink::from_bytes(bytes);
+        }
+        &mut self.sink
+    }
+
+    /// Take the bytes.
+    fn into_inner(mut self) -> Vec<u8> {
+        self.sink();
+        self.sink.into_inner()
+    }
+}
+
+impl ByteSink for MemoryBuffer {
+    fn write_all_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        self.sink().write_all_at(offset, data)
+    }
+
+    fn set_len(&mut self, len: u64) -> Result<()> {
+        self.sink().set_len(len)
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.sink().sync()
+    }
+
+    fn can_read(&self) -> bool {
+        self.sink.can_read()
+    }
+
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.sink().read_exact_at(offset, buf)
+    }
 }
 
 /// The place that holds the bytes of the file.
 #[derive(Debug)]
 enum Sink {
     File(FileSink),
-    Memory(MemorySink),
+    Memory(MemoryBuffer),
 }
 
 impl ByteSink for Sink {
@@ -183,13 +343,32 @@ impl ByteSink for Sink {
             Self::Memory(sink) => sink.sync(),
         }
     }
+
+    fn can_read(&self) -> bool {
+        match self {
+            Self::File(sink) => sink.can_read(),
+            Self::Memory(sink) => sink.can_read(),
+        }
+    }
+
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        match self {
+            Self::File(sink) => sink.read_exact_at(offset, buf),
+            Self::Memory(sink) => sink.read_exact_at(offset, buf),
+        }
+    }
 }
 
 /// Where the file goes at the close.
 #[derive(Debug)]
 enum Target {
     Memory,
-    File { temporary: PathBuf, path: PathBuf },
+    File {
+        temporary: PathBuf,
+        path: PathBuf,
+    },
+    /// A file from [`append`]. The sink is the file at its path.
+    InPlace,
 }
 
 /// One group of the file.
@@ -214,6 +393,8 @@ struct Dimension {
     unlimited: bool,
     /// The variable of the same name that has this dimension as its first axis.
     coordinate: Option<usize>,
+    /// The dataset of a dimension of the file with no variable, and its length.
+    scale: Option<(DatasetId, u64)>,
 }
 
 /// The part of a variable that can change before its first write.
@@ -242,6 +423,8 @@ struct Variable {
     shape: Vec<u64>,
     /// True after the first write.
     written: bool,
+    /// True for a variable of the file, which has its scales.
+    attached: bool,
 }
 
 /// The model of the file and the HDF5 writer below it.
@@ -303,6 +486,19 @@ impl FileMut {
         })
     }
 
+    /// Open the file in `sink` for changes. `file` is the view of that file.
+    fn open(sink: Sink, file: &NetcdfFile, options: WriteOptions, target: Target) -> Result<Self> {
+        let hdf5 = file
+            .hdf5()
+            .ok_or_else(|| Error::unsupported("an append to a netCDF classic file"))?;
+        let writer = Hdf5Writer::open(sink, hdf5, options)?;
+        let state = State::from_file(writer, file, hdf5)?;
+        Ok(Self {
+            state: Some(state),
+            target,
+        })
+    }
+
     fn state(&mut self) -> Result<&mut State> {
         self.state.as_mut().ok_or_else(state_defect)
     }
@@ -357,7 +553,10 @@ impl FileMut {
     /// # Errors
     ///
     /// Returns [`Error::BadRequest`] for a wrong name, a name that the group
-    /// uses, or an unknown dimension.
+    /// uses, or an unknown dimension. Returns [`Error::Unsupported`] for a
+    /// new coordinate variable of a dimension of a file from [`append`]. That
+    /// dimension has no coordinate variable in the file. This error changes
+    /// nothing.
     pub fn add_variable<T: Element>(
         &mut self,
         name: &str,
@@ -440,16 +639,29 @@ impl FileMut {
 
     /// Write a file in memory and return its bytes.
     ///
+    /// A file from [`append`] gets the in-place close of [`Self::close`] and
+    /// then an error, so the session keeps its changes.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::BadRequest`] for a file from [`create`], and the
-    /// writer removes it. The other errors are those of [`Self::close`].
+    /// writer removes it. Returns [`Error::BadRequest`] for a file from
+    /// [`append`] after the writer writes it in place. When that write
+    /// fails, returns its error. The other errors are those of
+    /// [`Self::close`].
     pub fn into_bytes(mut self) -> Result<Vec<u8>> {
-        if matches!(self.target, Target::File { .. }) {
-            self.discard();
-            return Err(Error::bad_request(
-                "the file is on disk: use close, then read the file",
-            ));
+        match self.target {
+            Target::Memory => {}
+            Target::InPlace => {
+                self.finish_file()?;
+                return Err(in_place_close("read the file"));
+            }
+            Target::File { .. } => {
+                self.discard();
+                return Err(Error::bad_request(
+                    "the file is on disk: use close, then read the file",
+                ));
+            }
         }
         let state = self.state.take().ok_or_else(state_defect)?;
         match state.finish()? {
@@ -468,11 +680,16 @@ impl FileMut {
     /// The close before the upload blocks the thread, as [`Self::close`]
     /// does. The read of each part of a temporary file also blocks it.
     ///
+    /// A file from [`append`] gets the in-place close of [`Self::close`] and
+    /// then an error, with no upload. The session keeps its changes.
+    ///
     /// # Errors
     ///
     /// The errors of [`Self::close`]. Returns [`Error::Io`] if the upload or
     /// the removal of the temporary file fails. A failed upload leaves the
-    /// earlier object at `location`.
+    /// earlier object at `location`. Returns [`Error::BadRequest`] for a
+    /// file from [`append`] after the writer writes it in place. When that
+    /// write fails, returns its error.
     #[cfg(feature = "object-store")]
     #[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
     pub async fn close_to_store(
@@ -481,6 +698,10 @@ impl FileMut {
         location: &object_store::path::Path,
     ) -> Result<()> {
         use object_store::ObjectStoreExt;
+        if matches!(self.target, Target::InPlace) {
+            self.finish_file()?;
+            return Err(in_place_close("upload the file"));
+        }
         let state = self.state.take().ok_or_else(state_defect)?;
         let finished = state.finish();
         let Target::File { temporary, .. } = &self.target else {
@@ -766,6 +987,19 @@ impl VariableMut<'_> {
         })
     }
 
+    /// Add or remove the shuffle filter of each chunk.
+    ///
+    /// The filter helps a compression filter that comes after it. Use this
+    /// for shuffle with Zstandard, or for shuffle with no compression.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadRequest`] after the first write or for a scalar
+    /// variable.
+    pub fn set_shuffle(&mut self, on: bool) -> Result<()> {
+        self.redefine(|d| d.shuffle = on)
+    }
+
     /// Set the Zstandard level, from 1 to 22. A reader needs the Zstandard plugin.
     ///
     /// A variable takes deflate or Zstandard, not the two.
@@ -837,10 +1071,14 @@ impl VariableMut<'_> {
             let attribute = Attribute {
                 name: "_FillValue".to_owned(),
                 datatype: datatype_of(&definition.dtype, definition.order)?,
-                dataspace: Dataspace {
-                    kind: DataspaceKind::Simple,
-                    dims: vec![1],
-                    max_dims: None,
+                // netcdf-c writes the fill value of a `char` variable as one scalar text.
+                dataspace: match definition.dtype {
+                    DType::Char => scalar(),
+                    _ => Dataspace {
+                        kind: DataspaceKind::Simple,
+                        dims: vec![1],
+                        max_dims: None,
+                    },
                 },
                 data: in_order(fill.clone(), definition.order),
             };
@@ -1016,6 +1254,149 @@ impl VariableMut<'_> {
 }
 
 impl State {
+    /// The model of `file`, which `writer` has open.
+    fn from_file(writer: Hdf5Writer<Sink>, file: &NetcdfFile, hdf5: &Hdf5File) -> Result<Self> {
+        let mut state = Self {
+            writer,
+            groups: Vec::new(),
+            dimensions: Vec::new(),
+            variables: Vec::new(),
+        };
+        let root = state.writer.root();
+        // Each dimension is in the model before a variable looks for it.
+        let mut dimensions = Vec::new();
+        state.import_groups(file.root(), root, None, hdf5, &mut dimensions)?;
+        dimensions.sort_by_key(|(id, _)| *id);
+        for (position, (id, dimension)) in dimensions.into_iter().enumerate() {
+            // The position of a dimension in the model is its id in the file.
+            if i64::try_from(position).ok() != Some(id) {
+                return Err(Error::unsupported(
+                    "an append to a file with dimension ids that are not 0, 1, 2 and so on",
+                ));
+            }
+            state.groups[dimension.group].dimensions.push(position);
+            state.dimensions.push(dimension);
+        }
+        state.import_variables(file.root(), ROOT, hdf5)?;
+        Ok(state)
+    }
+
+    /// Add `group` and its child groups to the model. The dimensions go to `dimensions` with their ids.
+    fn import_groups(
+        &mut self,
+        group: &NcGroup,
+        id: GroupId,
+        parent: Option<usize>,
+        hdf5: &Hdf5File,
+        dimensions: &mut Vec<(i64, Dimension)>,
+    ) -> Result<()> {
+        let index = self.groups.len();
+        self.groups.push(Group {
+            id,
+            parent,
+            dimensions: Vec::new(),
+            variables: Vec::new(),
+            groups: Vec::new(),
+        });
+        for dimension in &group.dimensions {
+            let (Some(dimension_id), false) = (dimension.id, dimension.is_phony) else {
+                return Err(Error::unsupported(format!(
+                    "an append to a file with no dimension scale for {}",
+                    dimension.name
+                )));
+            };
+            let scale = match dimension.has_coordinate_variable {
+                true => None,
+                false => {
+                    let path = format!("{}/{}", group.path.trim_end_matches('/'), dimension.name);
+                    let dataset = self.writer.find_dataset(id, &dimension.name);
+                    let len = hdf5.dataset(&path).and_then(|d| d.shape.first().copied());
+                    Some(dataset.zip(len).ok_or_else(|| {
+                        Error::unsupported(format!("an append to a file with no dataset {path}"))
+                    })?)
+                }
+            };
+            let model = Dimension {
+                name: dimension.name.clone(),
+                group: index,
+                len: dimension.len,
+                unlimited: dimension.is_unlimited,
+                coordinate: None,
+                scale,
+            };
+            dimensions.push((dimension_id, model));
+        }
+        for child in &group.groups {
+            let child_id = self.writer.find_group(id, &child.name).ok_or_else(|| {
+                Error::unsupported(format!("an append to a file with no group {}", child.path))
+            })?;
+            let child_index = self.groups.len();
+            self.groups[index]
+                .groups
+                .push((child.name.clone(), child_index));
+            self.import_groups(child, child_id, Some(index), hdf5, dimensions)?;
+        }
+        Ok(())
+    }
+
+    /// Add the variables of `group` and of its child groups to the model.
+    fn import_variables(&mut self, group: &NcGroup, index: usize, hdf5: &Hdf5File) -> Result<()> {
+        for info in &group.variables {
+            let missing = || {
+                Error::unsupported(format!(
+                    "an append to a file with no dataset for {}",
+                    info.path
+                ))
+            };
+            let dataset = crate::netcdf::hdf5_dataset(hdf5, info).ok_or_else(missing)?;
+            let id = self
+                .writer
+                .find_dataset(self.groups[index].id, &dataset.name);
+            let mut dimensions = Vec::with_capacity(info.dimensions.len());
+            for name in &info.dimensions {
+                dimensions.push(self.find_dimension(index, name).ok_or_else(missing)?);
+            }
+            let variable = self.variables.len();
+            if let (true, Some(&first)) = (info.is_coordinate, dimensions.first()) {
+                if self.dimensions[first].group == index && self.dimensions[first].name == info.name
+                {
+                    self.dimensions[first].coordinate = Some(variable);
+                }
+            }
+            let chunks = match &dataset.layout {
+                oxcdf_hdf5::message::Layout::Chunked { chunk_dims, .. } => {
+                    Some(chunk_dims.iter().map(|&dim| u64::from(dim)).collect())
+                }
+                _ => None,
+            };
+            let definition = Definition {
+                dtype: DType::of(&dataset.datatype),
+                order: dataset.datatype.byte_order().unwrap_or(ByteOrder::Little),
+                chunks,
+                shuffle: false,
+                deflate: None,
+                zstd: None,
+                fletcher32: false,
+                fill: None,
+            };
+            self.groups[index].variables.push(variable);
+            self.variables.push(Variable {
+                name: info.name.clone(),
+                dataset: id.ok_or_else(missing)?,
+                definition,
+                dimensions,
+                shape: dataset.shape.clone(),
+                written: true,
+                attached: true,
+            });
+        }
+        for (position, child) in group.groups.iter().enumerate() {
+            let child_index = self.groups[index].groups[position].1;
+            self.import_variables(child, child_index, hdf5)?;
+        }
+        Ok(())
+    }
+
     /// The dimension `name` that a variable of `group` sees.
     fn find_dimension(&self, group: usize, name: &str) -> Option<usize> {
         let mut at = Some(group);
@@ -1071,6 +1452,7 @@ impl State {
             len,
             unlimited,
             coordinate: None,
+            scale: None,
         });
         Ok(())
     }
@@ -1116,6 +1498,15 @@ impl State {
             })?;
             dimensions.push(found);
         }
+        // A variable with the name of a dimension is its coordinate only on axis 0.
+        let namesake = self.own_dimension(group, name);
+        let coordinate = namesake.filter(|d| dimensions.first() == Some(d));
+        // The dataset of such a dimension holds the link that the coordinate needs.
+        if coordinate.is_some_and(|d| self.dimensions[d].scale.is_some()) {
+            return Err(Error::unsupported(format!(
+                "a new coordinate variable for the dimension {name:?} of the file"
+            )));
+        }
         let definition = Definition {
             dtype: dtype.clone(),
             order: ByteOrder::Little,
@@ -1128,9 +1519,6 @@ impl State {
         };
         let spec = self.spec(&definition, &dimensions)?;
         let shape = spec.shape.clone();
-        // A variable with the name of a dimension is its coordinate only on axis 0.
-        let namesake = self.own_dimension(group, name);
-        let coordinate = namesake.filter(|d| dimensions.first() == Some(d));
         let link = match (namesake, coordinate) {
             (Some(_), None) => format!("{NON_COORDINATE_PREFIX}{name}"),
             _ => name.to_owned(),
@@ -1156,6 +1544,7 @@ impl State {
             dimensions,
             shape,
             written: false,
+            attached: false,
         });
         Ok(variable)
     }
@@ -1226,8 +1615,8 @@ impl State {
     fn finish(mut self) -> Result<Sink> {
         let mut scales = Vec::with_capacity(self.dimensions.len());
         for (id, dimension) in self.dimensions.iter().enumerate() {
-            let (scale, name) = match dimension.coordinate {
-                Some(variable) => {
+            let (scale, name) = match (dimension.coordinate, dimension.scale) {
+                (Some(variable), _) => {
                     let variable = &self.variables[variable];
                     let mut shape = variable.shape.clone();
                     // The scale gives the length of the dimension to a reader.
@@ -1237,7 +1626,15 @@ impl State {
                     }
                     (variable.dataset, dimension.name.clone())
                 }
-                None => {
+                (None, Some((scale, len))) => {
+                    // The scale gives the length of the dimension to a reader.
+                    if dimension.unlimited && len < dimension.len {
+                        self.writer.resize(scale, &[dimension.len])?;
+                    }
+                    let name = format!("{PHANTOM_DIMENSION_PREFIX}.{:>10}", dimension.len);
+                    (scale, name)
+                }
+                (None, None) => {
                     let datatype = numeric_datatype(DType::Float(4), ByteOrder::Big)?;
                     let mut spec = DatasetSpec::new(datatype, &[dimension.len]);
                     if dimension.unlimited {
@@ -1269,7 +1666,7 @@ impl State {
                 .dimensions
                 .first()
                 .is_some_and(|&d| self.dimensions[d].coordinate == Some(index));
-            if is_scale {
+            if is_scale || variable.attached {
                 continue;
             }
             for (axis, &dimension) in variable.dimensions.iter().enumerate() {
@@ -1284,6 +1681,15 @@ impl State {
 /// The error for a file with no state. Only a defect in the writer causes it.
 fn state_defect() -> Error {
     Error::Malformed("a defect in the writer: the file has no state".to_owned())
+}
+
+/// The error for a wrong close of a file from [`append`], after its in-place close.
+///
+/// `next` tells the caller what to do with the file after [`FileMut::close`].
+fn in_place_close(next: &str) -> Error {
+    Error::bad_request(format!(
+        "a file from append closes in place, and the writer wrote it: use close, then {next}"
+    ))
 }
 
 /// The error for a file in memory that has a file sink. Only a defect in the writer causes it.
@@ -1526,6 +1932,7 @@ mod tests {
             len,
             unlimited,
             coordinate: None,
+            scale: None,
         }
     }
 
@@ -1544,6 +1951,56 @@ mod tests {
         assert!(chunks.iter().product::<u64>() * 8 <= DEFAULT_CHUNK_BYTES);
         let squares = default_chunks(&[&time, &time], 4);
         assert_eq!(squares, [1024, 1024]);
+    }
+
+    #[test]
+    fn an_append_in_memory_keeps_one_reference_to_the_buffer() {
+        let mut file = create_in_memory().unwrap();
+        file.add_dimension("x", 3).unwrap();
+        let mut v = file.add_variable::<i32>("v", &["x"]).unwrap();
+        v.put_values(&[1, 2, 3], ..).unwrap();
+        let bytes = Arc::new(file.into_bytes().unwrap());
+        let weak = Arc::downgrade(&bytes);
+
+        let mut file = append_shared(bytes).unwrap();
+        // The reader is gone and the sink holds the only reference.
+        assert_eq!(weak.strong_count(), 1);
+        let mut v = file.variable_mut("v").unwrap();
+        v.put_value(9, [1]).unwrap();
+        assert_eq!(weak.strong_count(), 0);
+        let source = Arc::new(oxcdf_hdf5::MemorySource::new(file.into_bytes().unwrap()));
+        let file = NetcdfFile::from_source(source).unwrap();
+        let v = file.variable("v").unwrap();
+        assert_eq!(v.get_values::<i32, _>(..).unwrap(), [1, 9, 3]);
+    }
+
+    #[test]
+    fn a_memory_buffer_moves_a_unique_buffer_and_copies_a_shared_one() {
+        let bytes = Arc::new(b"abcd".to_vec());
+        let address = bytes.as_ptr();
+        let mut buffer = MemoryBuffer::shared(bytes);
+        buffer.write_all_at(1, b"x").unwrap();
+        let moved = buffer.into_inner();
+        assert_eq!(moved, b"axcd");
+        assert_eq!(moved.as_ptr(), address);
+
+        let bytes = Arc::new(b"abcd".to_vec());
+        let mut buffer = MemoryBuffer::shared(Arc::clone(&bytes));
+        let mut read = [0u8; 2];
+        buffer.read_exact_at(2, &mut read).unwrap();
+        assert_eq!(&read, b"cd");
+        buffer.write_all_at(0, b"z").unwrap();
+        assert_eq!(buffer.into_inner(), b"zbcd");
+        assert_eq!(*bytes, b"abcd");
+    }
+
+    #[test]
+    fn a_shared_source_rejects_a_read_past_the_end() {
+        let source = SharedSource(Arc::new(b"abc".to_vec()));
+        assert_eq!(source.read_vec(1, 2).unwrap(), b"bc");
+        let error = source.read_vec(2, 2).unwrap_err();
+        assert!(matches!(error, Error::OutOfBounds { .. }), "{error:?}");
+        assert!(source.read_vec(u64::MAX, 1).is_err());
     }
 
     #[test]

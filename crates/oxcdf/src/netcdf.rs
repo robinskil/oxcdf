@@ -69,7 +69,7 @@ fn netcdf_name(name: &str, path: &str) -> (String, String) {
 ///
 /// The prefixed name goes first. The bare name can be the dataset of the
 /// dimension that has the same name.
-fn hdf5_dataset<'a>(hdf5: &'a Hdf5File, info: &NcVariable) -> Option<&'a DatasetIndex> {
+pub(crate) fn hdf5_dataset<'a>(hdf5: &'a Hdf5File, info: &NcVariable) -> Option<&'a DatasetIndex> {
     let parent = &info.path[..info.path.len() - info.name.len()];
     hdf5.dataset(&format!("{parent}{NON_COORDINATE_PREFIX}{}", info.name))
         .or_else(|| hdf5.dataset(&info.path))
