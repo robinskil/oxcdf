@@ -178,11 +178,15 @@ impl ObjectHeader {
                 continue;
             }
             match Attribute::parse(&m.data, sizes) {
-                Ok(a) => out.push(a),
+                Ok(a) => out.push((m.creation_order, a)),
                 Err(e) => errors.push(e),
             }
         }
-        (out, errors)
+        // The HDF5 library can store a message before an earlier one. netCDF lists by creation order.
+        if out.iter().all(|(order, _)| order.is_some()) {
+            out.sort_by_key(|(order, _)| *order);
+        }
+        (out.into_iter().map(|(_, a)| a).collect(), errors)
     }
 
     /// Whether this object looks like a group rather than a dataset.

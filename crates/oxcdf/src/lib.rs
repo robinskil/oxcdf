@@ -67,7 +67,11 @@
 //! [`Error::is_fallback_worthy`] to send one variable to netcdf-c. Every other
 //! error marks a damaged file or a defect here.
 //!
-//! The crate does not write files. Keep netcdf-c for writes.
+//! # Write
+//!
+//! The `write` feature adds `create` and `append`. `create` makes a new
+//! netCDF-4 file with no netcdf-c. `append` changes a file in place. See the
+//! `write` module, behind that feature.
 
 // docs.rs builds with `--cfg docsrs` on nightly, so every feature-gated item
 // carries a badge that names the feature. A stable build ignores this.
@@ -98,6 +102,10 @@ pub mod netcdf;
 #[cfg(feature = "async")]
 #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub mod async_netcdf;
+
+#[cfg(feature = "write")]
+#[cfg_attr(docsrs, doc(cfg(feature = "write")))]
+pub mod write;
 
 // ─── the layer below ───────────────────────────────────────────────────────
 //
@@ -131,6 +139,16 @@ pub use async_netcdf::{AsyncNetcdfFile, AsyncVariable};
 #[cfg(feature = "async")]
 #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub use oxcdf_hdf5::{AsyncByteSource, SyncAsAsync};
+
+#[cfg(feature = "write")]
+#[cfg_attr(docsrs, doc(cfg(feature = "write")))]
+pub use oxcdf_hdf5::write::WriteOptions;
+#[cfg(feature = "write")]
+#[cfg_attr(docsrs, doc(cfg(feature = "write")))]
+pub use write::{
+    append, append_in_memory, append_with, create, create_in_memory, create_in_memory_with,
+    create_with, FileMut, GroupMut, VariableMut,
+};
 
 /// Open a netCDF file for reading.
 ///

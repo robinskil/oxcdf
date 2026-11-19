@@ -121,6 +121,36 @@ impl MessageType {
             other => Self::Unknown(other),
         }
     }
+
+    /// Map the type to its on-disk code, the inverse of [`MessageType::from_code`].
+    pub fn code(&self) -> u16 {
+        match self {
+            Self::Nil => 0x00,
+            Self::Dataspace => 0x01,
+            Self::LinkInfo => 0x02,
+            Self::Datatype => 0x03,
+            Self::FillValueOld => 0x04,
+            Self::FillValue => 0x05,
+            Self::Link => 0x06,
+            Self::ExternalDataFiles => 0x07,
+            Self::DataLayout => 0x08,
+            Self::Bogus => 0x09,
+            Self::GroupInfo => 0x0A,
+            Self::FilterPipeline => 0x0B,
+            Self::Attribute => 0x0C,
+            Self::ObjectComment => 0x0D,
+            Self::ObjectModificationTimeOld => 0x0E,
+            Self::SharedMessageTable => 0x0F,
+            Self::ObjectHeaderContinuation => 0x10,
+            Self::SymbolTable => 0x11,
+            Self::ObjectModificationTime => 0x12,
+            Self::BtreeKValues => 0x13,
+            Self::DriverInfo => 0x14,
+            Self::AttributeInfo => 0x15,
+            Self::ObjectReferenceCount => 0x16,
+            Self::Unknown(other) => *other,
+        }
+    }
 }
 
 /// Message flag: the message body is a reference to a shared message.
@@ -470,6 +500,13 @@ mod tests {
         assert_eq!(MessageType::from_code(0x08), MessageType::DataLayout);
         assert_eq!(MessageType::from_code(0x11), MessageType::SymbolTable);
         assert_eq!(MessageType::from_code(0xFF), MessageType::Unknown(0xFF));
+    }
+
+    #[test]
+    fn every_message_type_code_round_trips() {
+        for code in 0u16..=0x20 {
+            assert_eq!(MessageType::from_code(code).code(), code);
+        }
     }
 
     #[test]

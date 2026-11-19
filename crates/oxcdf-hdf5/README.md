@@ -20,6 +20,7 @@ oxcdf-hdf5 = { version = "0.5", features = ["async", "object-store"] }
 |---|---|
 | `async` | The asynchronous engine |
 | `object-store` | Read from S3, GCS, Azure or HTTP |
+| `write` | Create HDF5 files. Limited: see the module docs. |
 
 ## Read
 
@@ -72,7 +73,12 @@ The reader targets the subset of HDF5 that netcdf-c writes. It does not target
 the whole specification. A feature outside that subset returns
 `Error::Unsupported`. Every other error marks a damaged file or a defect here.
 
-The crate does not write files.
+The `write` feature creates files. It supports groups, attributes and
+datasets of numbers, fixed strings and variable-length strings. A dataset is
+contiguous or chunked. A chunked dataset can have unlimited dimensions and
+shuffle, deflate, Zstandard and Fletcher-32 filters. A dataset can have
+dimension scales. `Hdf5Writer::open` opens a file that exists for edits. The
+`oxcdf` crate adds the netCDF conventions.
 
 See the [repository] for the full state and the test matrix.
 

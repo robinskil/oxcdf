@@ -827,7 +827,7 @@ pub fn pad_to_selection(
 }
 
 /// Byte-swap every element in place, turning big-endian values into native.
-fn swap_bytes_in_place(buf: &mut [u8], element_size: usize) {
+pub(crate) fn swap_bytes_in_place(buf: &mut [u8], element_size: usize) {
     if element_size <= 1 {
         return;
     }

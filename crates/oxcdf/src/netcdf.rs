@@ -47,11 +47,12 @@ use oxcdf_hdf5::read::{pad_to_selection, read_hyperslab, Hyperslab, RawData, Sto
 
 /// Prefix of the `NAME` attribute on a dimension that has no coordinate
 /// variable. netcdf-c writes the dimension length after it.
-const PHANTOM_DIMENSION_PREFIX: &str = "This is a netCDF dimension but not a netCDF variable";
+pub(crate) const PHANTOM_DIMENSION_PREFIX: &str =
+    "This is a netCDF dimension but not a netCDF variable";
 
 /// Prefix netcdf-c puts on the HDF5 name of a variable that has the name of a
 /// dimension but is not its coordinate variable. The netCDF name is without it.
-const NON_COORDINATE_PREFIX: &str = "_nc4_non_coord_";
+pub(crate) const NON_COORDINATE_PREFIX: &str = "_nc4_non_coord_";
 
 /// The netCDF name and path of a variable, from its HDF5 name and path.
 fn netcdf_name(name: &str, path: &str) -> (String, String) {
@@ -68,7 +69,7 @@ fn netcdf_name(name: &str, path: &str) -> (String, String) {
 ///
 /// The prefixed name goes first. The bare name can be the dataset of the
 /// dimension that has the same name.
-fn hdf5_dataset<'a>(hdf5: &'a Hdf5File, info: &NcVariable) -> Option<&'a DatasetIndex> {
+pub(crate) fn hdf5_dataset<'a>(hdf5: &'a Hdf5File, info: &NcVariable) -> Option<&'a DatasetIndex> {
     let parent = &info.path[..info.path.len() - info.name.len()];
     hdf5.dataset(&format!("{parent}{NON_COORDINATE_PREFIX}{}", info.name))
         .or_else(|| hdf5.dataset(&info.path))
@@ -78,7 +79,7 @@ fn hdf5_dataset<'a>(hdf5: &'a Hdf5File, info: &NcVariable) -> Option<&'a Dataset
 ///
 /// netCDF hides these, so this reader hides them too. Surfacing them would make
 /// every variable look like it has bookkeeping attributes it does not have.
-const RESERVED_ATTRIBUTES: &[&str] = &[
+pub(crate) const RESERVED_ATTRIBUTES: &[&str] = &[
     "CLASS",
     "NAME",
     "DIMENSION_LIST",
@@ -139,6 +140,63 @@ pub enum AttributeValue {
     /// file. This reader parses HDF5 directly, so it can meet a type netCDF
     /// never defines. The attribute stays visible rather than vanishing.
     Raw(Vec<u8>),
+}
+
+macro_rules! attribute_from {
+    ($($rust:ty => $one:ident, $many:ident;)*) => {$(
+        impl From<$rust> for AttributeValue {
+            fn from(value: $rust) -> Self {
+                Self::$one(value)
+            }
+        }
+        impl From<Vec<$rust>> for AttributeValue {
+            fn from(values: Vec<$rust>) -> Self {
+                Self::$many(values)
+            }
+        }
+        impl From<&[$rust]> for AttributeValue {
+            fn from(values: &[$rust]) -> Self {
+                Self::$many(values.to_vec())
+            }
+        }
+    )*};
+}
+
+attribute_from! {
+    u8 => Uchar, Uchars;
+    i8 => Schar, Schars;
+    u16 => Ushort, Ushorts;
+    i16 => Short, Shorts;
+    u32 => Uint, Uints;
+    i32 => Int, Ints;
+    u64 => Ulonglong, Ulonglongs;
+    i64 => Longlong, Longlongs;
+    f32 => Float, Floats;
+    f64 => Double, Doubles;
+}
+
+impl From<&str> for AttributeValue {
+    fn from(text: &str) -> Self {
+        Self::Str(text.to_owned())
+    }
+}
+
+impl From<String> for AttributeValue {
+    fn from(text: String) -> Self {
+        Self::Str(text)
+    }
+}
+
+impl From<Vec<String>> for AttributeValue {
+    fn from(texts: Vec<String>) -> Self {
+        Self::Strs(texts)
+    }
+}
+
+impl From<&[&str]> for AttributeValue {
+    fn from(texts: &[&str]) -> Self {
+        Self::Strs(texts.iter().map(|&t| t.to_owned()).collect())
+    }
 }
 
 impl AttributeValue {
