@@ -170,6 +170,36 @@ match &temp.attribute("_FillValue").unwrap().value {
 let scale = temp.attribute("scale_factor").and_then(|a| a.value.as_f64());
 ```
 
+## Write
+
+The `write` feature creates netCDF-4 files with no netcdf-c. The interface
+follows the write half of the `netcdf` crate.
+
+```rust
+let mut file = oxcdf::create("out.nc")?;
+file.add_unlimited_dimension("time")?;
+file.add_dimension("lat", 180)?;
+file.add_attribute("title", "Sea surface temperature")?;
+
+let mut temp = file.add_variable::<f32>("TEMP", &["time", "lat"])?;
+temp.set_chunking(&[1, 180])?;
+temp.set_compression(4, true)?;
+temp.set_fill_value(-999.0f32)?;
+temp.put_attribute("units", "degC")?;
+temp.put_values(&first_day, [0..1, 0..180])?;
+file.close()?;
+```
+
+- A write past the length of an unlimited dimension grows the variable.
+- Set the chunk shape, the filters and the fill value before the first write.
+- `create` writes to `out.nc.tmp`. `close` moves that file to `out.nc`.
+- `create_in_memory` and `into_bytes` give the file as bytes.
+- With the `object-store` feature, `close_to_store` uploads the file.
+
+netcdf-c, netCDF4 for Python and xarray read these files. netcdf-c can append to
+them. The writer does not change a file that exists, and it has no
+user-defined types.
+
 ## Parallel reads
 
 The reader holds no lock, so many threads read one file at the same time. Split
@@ -254,7 +284,8 @@ Not supported:
 - Strided selections
 - Batched reads across variables
 
-The crate does not write files. Keep netcdf-c for writes.
+The `write` feature creates new files. See [Write](#write). The crate does not
+change a file that exists. Keep netcdf-c for that.
 
 `Error::Unsupported` marks a valid HDF5 feature this reader does not implement.
 Every other error marks a damaged file or a defect here. Match on
@@ -298,12 +329,25 @@ The reader parses untrusted binary input, so `malformed.rs` mutates the corpus.
 It truncates each file, flips bytes, and feeds random bytes. A damaged file must
 return an error. A panic marks a defect.
 
-`fuzz/` holds three `cargo fuzz` targets: `open`, `read` and `filters`. The
+`fuzz/` holds four `cargo fuzz` targets: `open`, `read`, `filters` and `write`. The
 `filters` target covers the C zstd decoder, which is the one part of the build
 that is not safe Rust. A nightly job runs them, seeded from the corpus.
 
 ```bash
 cargo +nightly fuzz run open -- -max_total_time=60
+```
+
+The `write` target turns its input into writer calls. It compares the file
+from the writer with a model, through the reader.
+
+`scripts/check_writer.py` compares the writer with other readers. It writes 80
+random files. Then h5py, `h5dump`, `ncdump`, netCDF4 and xarray read each file,
+and the HDF5 library changes each file. It also checks one file from the netCDF
+writer: netcdf-c appends to it, and this reader reads the result. CI does not
+run this script.
+
+```bash
+python scripts/check_writer.py
 ```
 
 `rustfmt.toml` holds the format. Every value is a rustfmt default, written down
