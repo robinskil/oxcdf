@@ -329,7 +329,8 @@ The reader parses untrusted binary input, so `malformed.rs` mutates the corpus.
 It truncates each file, flips bytes, and feeds random bytes. A damaged file must
 return an error. A panic marks a defect.
 
-`fuzz/` holds four `cargo fuzz` targets: `open`, `read`, `filters` and `write`. The
+`fuzz/` holds five `cargo fuzz` targets: `open`, `read`, `filters`, `write` and
+`netcdf_write`. The
 `filters` target covers the C zstd decoder, which is the one part of the build
 that is not safe Rust. A nightly job runs them, seeded from the corpus.
 
@@ -337,8 +338,10 @@ that is not safe Rust. A nightly job runs them, seeded from the corpus.
 cargo +nightly fuzz run open -- -max_total_time=60
 ```
 
-The `write` target turns its input into writer calls. It compares the file
-from the writer with a model, through the reader.
+The `write` target turns its input into calls of the HDF5 writer. The
+`netcdf_write` target does the same for the netCDF writer. Each compares the
+file from the writer with a model, through the reader. The test `write_calls`
+runs the `netcdf_write` code on 20000 random inputs with no `cargo fuzz`.
 
 `scripts/check_writer.py` compares the writer with other readers. It writes 80
 random files. Then h5py, `h5dump`, `ncdump`, netCDF4 and xarray read each file,

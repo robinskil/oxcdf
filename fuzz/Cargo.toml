@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.7"
-oxcdf = { path = "../crates/oxcdf" }
+oxcdf = { path = "../crates/oxcdf", features = ["write"] }
 oxcdf-hdf5 = { path = "../crates/oxcdf-hdf5", features = ["write"] }
 
 [[bin]]
@@ -36,6 +36,13 @@ bench = false
 [[bin]]
 name = "write"
 path = "fuzz_targets/write.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netcdf_write"
+path = "fuzz_targets/netcdf_write.rs"
 test = false
 doc = false
 bench = false
