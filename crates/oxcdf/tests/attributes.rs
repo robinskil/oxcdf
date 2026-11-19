@@ -286,3 +286,14 @@ fn netcdf_attribute_parity() {
     assert!(compared > 50, "only {compared} attributes were compared");
     println!("compared {compared} attributes against netcdf-c");
 }
+
+#[test]
+fn attributes_come_in_creation_order() {
+    // netcdf-c stores `a.b` after `c-d` in this header, but it made `a.b` first.
+    let Some(path) = corpus("attribute_order.nc") else {
+        return;
+    };
+    let file = oxcdf::open(&path).unwrap();
+    let names: Vec<&str> = file.attributes().iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["global attr", "a.b", "c-d", "é"]);
+}
