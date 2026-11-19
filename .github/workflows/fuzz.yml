@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [open, read, filters]
+        target: [open, read, filters, write]
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +37,9 @@ jobs:
 
       # A fuzzer that starts from nothing spends its first hours rediscovering
       # the file format. The real files teach it the format in seconds.
+      # The write target reads its input as writer calls, so files teach it nothing.
       - name: seed the corpus
+        if: matrix.target != 'write'
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
           cp test_files/*.nc test_files/*.h5 fuzz/corpus/${{ matrix.target }}/ || true
