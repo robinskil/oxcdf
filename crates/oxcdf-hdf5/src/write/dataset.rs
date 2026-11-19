@@ -333,6 +333,31 @@ struct ChunkSpace {
 }
 
 impl Chunks {
+    /// The part of `slab` in each chunk that it touches, in row-major order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when `slab` covers a part of a chunk
+    /// that is in the file with its filters.
+    fn parts(&self, slab: &Hyperslab) -> Result<Vec<Part>> {
+        let parts: Vec<Part> = chunk_origins(&self.dims, slab)
+            .map(|origin| Part::new(origin, &self.dims, slab))
+            .collect();
+        for part in &parts {
+            // The stored bytes of a filtered chunk cannot take a part of a chunk.
+            let stored = !self.filters.is_empty()
+                && self.spaces.contains_key(&part.origin)
+                && !self.buffers.contains_key(&part.origin);
+            if stored && !part.full {
+                return Err(Error::unsupported(format!(
+                    "a write to a part of the chunk at {:?}, which is in the file with its filters",
+                    part.origin
+                )));
+            }
+        }
+        Ok(parts)
+    }
+
     /// Check a chunk shape against the dataset shape and its largest shape.
     fn new(
         dims: Vec<u64>,
@@ -711,6 +736,19 @@ impl Dataset {
         messages
     }
 
+    /// Check that no chunk refuses a write to `slab`. The slab can pass the shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when `slab` covers a part of a chunk
+    /// that is in the file with its filters.
+    pub(super) fn check_chunks(&self, slab: &Hyperslab) -> Result<()> {
+        match &self.chunks {
+            Some(chunks) if slab.start.len() == chunks.dims.len() => chunks.parts(slab).map(drop),
+            _ => Ok(()),
+        }
+    }
+
     /// The first element of each chunk inside the shape that holds no values.
     ///
     /// A chunk with no complete fill pass holds no values. Empty for a contiguous dataset.
@@ -926,21 +964,7 @@ impl Dataset {
                 .ok_or_else(overflow)?;
             chunk_strides[axis] = chunk_strides[axis + 1] * chunks.dims[axis + 1];
         }
-        let parts: Vec<Part> = chunk_origins(&chunks.dims, slab)
-            .map(|origin| Part::new(origin, &chunks.dims, slab))
-            .collect();
-        for part in &parts {
-            // The stored bytes of a filtered chunk cannot take a part of a chunk.
-            let stored = !chunks.filters.is_empty()
-                && chunks.spaces.contains_key(&part.origin)
-                && !chunks.buffers.contains_key(&part.origin);
-            if stored && !part.full {
-                return Err(Error::unsupported(format!(
-                    "a write to a part of the chunk at {:?}, which is in the file with its filters",
-                    part.origin
-                )));
-            }
-        }
+        let parts = chunks.parts(slab)?;
 
         // Each row of a full chunk writes over its bytes, so the buffer needs no reset.
         let mut full_buffer = Vec::new();

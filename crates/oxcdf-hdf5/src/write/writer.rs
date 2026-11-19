@@ -286,6 +286,39 @@ impl<S: ByteSink> Hdf5Writer<S> {
         Ok(DatasetId(self.push_child(parent, name, kind)))
     }
 
+    /// Give the dataset `dataset` of the group `parent` the link name `name`.
+    ///
+    /// The dataset keeps its place in the group, its values and its
+    /// attributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadRequest`] for a dataset that is not in `parent`,
+    /// a wrong name or a name that exists in `parent`. Returns
+    /// [`Error::Unsupported`] for a name too long for a link message. An
+    /// error changes nothing.
+    pub fn rename_dataset(
+        &mut self,
+        parent: GroupId,
+        dataset: DatasetId,
+        name: &str,
+    ) -> Result<()> {
+        if !self.links(parent)?.children.contains(&dataset.0) {
+            return Err(Error::bad_request(format!(
+                "the group holds no dataset with id {}",
+                dataset.0
+            )));
+        }
+        self.node_index(dataset.into())?;
+        self.check_link(parent, name)?;
+        let old = std::mem::replace(&mut self.nodes[dataset.0].name, name.to_owned());
+        if let NodeKind::Group(links) = &mut self.nodes[parent.0].kind {
+            links.names.remove(&old);
+            links.names.insert(name.to_owned());
+        }
+        Ok(())
+    }
+
     /// Replace the definition of a dataset that holds no values.
     ///
     /// The dataset keeps its name, its place in the group and its
@@ -423,6 +456,23 @@ impl<S: ByteSink> Hdf5Writer<S> {
                 "a variable-length dataset takes no raw bytes",
             )),
             Some(NodeKind::Dataset(d)) => d.write_raw(sink, alloc, slab, bytes, None),
+            _ => Err(no_dataset(dataset)),
+        }
+    }
+
+    /// Check that the chunks of `dataset` accept a write to `slab`.
+    ///
+    /// The slab can pass the current shape. Use this before a
+    /// [`Self::resize`] for a write, because no axis can shrink again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadRequest`] for an unknown dataset. Returns
+    /// [`Error::Unsupported`] when `slab` covers a part of a chunk that is
+    /// in the file with its filters.
+    pub fn check_write(&self, dataset: DatasetId, slab: &Hyperslab) -> Result<()> {
+        match self.nodes.get(dataset.0).map(|n| &n.kind) {
+            Some(NodeKind::Dataset(d)) => d.check_chunks(slab),
             _ => Err(no_dataset(dataset)),
         }
     }
@@ -1546,5 +1596,37 @@ mod tests {
         assert_eq!(d.attributes.len(), 1);
         let raw = crate::read::read_hyperslab(file.ctx(), d, &Hyperslab::all(&[4])).unwrap();
         assert_eq!(i32::from_ne_slice(&raw.bytes), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_dataset_takes_a_new_link_name() {
+        let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+        let root = w.root();
+        let group = w.add_group(root, "g").unwrap();
+        let spec = DatasetSpec::numeric(DType::Int(4), ByteOrder::Little, &[2]).unwrap();
+        let d = w.add_dataset(root, "old", spec.clone()).unwrap();
+        w.add_dataset(root, "other", spec.clone()).unwrap();
+        w.write(d, &Hyperslab::all(&[2]), &[1i32, 2]).unwrap();
+        fn bad<T>(r: Result<T>) -> bool {
+            matches!(r, Err(Error::BadRequest(_)))
+        }
+        assert!(bad(w.rename_dataset(root, d, "other")));
+        assert!(bad(w.rename_dataset(root, d, "a/b")));
+        assert!(bad(w.rename_dataset(group, d, "new")));
+        assert!(bad(w.rename_dataset(root, DatasetId(99), "new")));
+        w.rename_dataset(root, d, "new").unwrap();
+        // The earlier name is free again.
+        w.add_dataset(root, "old", spec).unwrap();
+        let file = reopen(w.close().unwrap().into_inner());
+        let names: Vec<&str> = file
+            .root()
+            .datasets
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(names, ["new", "other", "old"]);
+        let d = file.dataset("/new").unwrap();
+        let raw = crate::read::read_hyperslab(file.ctx(), d, &Hyperslab::all(&[2])).unwrap();
+        assert_eq!(i32::from_ne_slice(&raw.bytes), [1, 2]);
     }
 }
