@@ -1,6 +1,7 @@
 //! Object header and superblock encoding for the writer.
 
 use super::encode::{Encoder, UNDEFINED_ADDRESS};
+use super::message::MAX_MESSAGE_BYTES;
 use crate::error::{Error, Result};
 use crate::objheader::{HeaderMessage, MessageType, OHDR_SIGNATURE};
 use crate::HDF5_SIGNATURE;
@@ -17,9 +18,6 @@ const FRAME_BYTES: usize = 6;
 /// Length of a checksum.
 const CHECKSUM_BYTES: usize = 4;
 
-/// Largest message body that the 2-byte size field holds.
-const MAX_BODY_BYTES: usize = u16::MAX as usize;
-
 /// Object header flags: 4-byte chunk size and creation order tracked.
 const OHDR_FLAGS: u8 = 0x06;
 
@@ -35,7 +33,7 @@ pub fn message(kind: MessageType, data: Vec<u8>) -> HeaderMessage {
 
 /// Encode a version 2 superblock with 8-byte offsets and lengths.
 pub fn encode_superblock(root_address: u64, end_of_file: u64) -> Vec<u8> {
-    let mut e = Encoder::new();
+    let mut e = Encoder::with_capacity(SUPERBLOCK_BYTES as usize);
     e.bytes(&HDF5_SIGNATURE);
     e.u8(2); // version
     e.u8(8); // offset size
@@ -51,9 +49,14 @@ pub fn encode_superblock(root_address: u64, end_of_file: u64) -> Vec<u8> {
 
 /// Exact length of the bytes that [`encode_header`] returns for these arguments.
 pub fn header_len(messages: &[HeaderMessage], slack: usize) -> usize {
+    header_len_of(messages.iter().map(|m| m.data.len()), slack)
+}
+
+/// Exact length of a header with one message for each body length in `bodies`.
+pub fn header_len_of(bodies: impl IntoIterator<Item = usize>, slack: usize) -> usize {
     let mut len = PREFIX_BYTES.saturating_add(CHECKSUM_BYTES);
-    for m in messages {
-        len = len.saturating_add(FRAME_BYTES.saturating_add(m.data.len()));
+    for body in bodies {
+        len = len.saturating_add(FRAME_BYTES.saturating_add(body));
     }
     if slack > 0 {
         len = len.saturating_add(FRAME_BYTES.saturating_add(slack));
@@ -65,15 +68,16 @@ pub fn header_len(messages: &[HeaderMessage], slack: usize) -> usize {
 ///
 /// A `slack` above zero appends one `Nil` message with `slack` zero bytes.
 pub fn encode_header(messages: &[HeaderMessage], slack: usize) -> Result<Vec<u8>> {
+    let len = header_len(messages, slack);
     // header_len is never below the prefix plus the checksum.
-    let area = header_len(messages, slack) - PREFIX_BYTES - CHECKSUM_BYTES;
+    let area = len - PREFIX_BYTES - CHECKSUM_BYTES;
     let area = u32::try_from(area).map_err(|_| {
         Error::unsupported(format!(
             "object header message area of {area} bytes is above the 4-byte size limit"
         ))
     })?;
 
-    let mut e = Encoder::new();
+    let mut e = Encoder::with_capacity(len);
     e.bytes(OHDR_SIGNATURE);
     e.u8(2); // version
     e.u8(OHDR_FLAGS);
@@ -106,7 +110,7 @@ fn frame(
     })?;
     let size = u16::try_from(len).map_err(|_| {
         Error::unsupported(format!(
-            "{kind:?} message body of {len} bytes is above the {MAX_BODY_BYTES}-byte limit"
+            "{kind:?} message body of {len} bytes is above the {MAX_MESSAGE_BYTES}-byte limit"
         ))
     })?;
     e.u8(code);

@@ -174,14 +174,16 @@ pub trait Element: Copy + Sized + sealed::Sealed {
     /// `bytes` must be native-order values of this exact type. A trailing
     /// partial element is dropped.
     fn from_ne_slice(bytes: &[u8]) -> Vec<Self>;
-    /// Encode a block of elements as native-order bytes.
-    fn to_ne_vec(values: &[Self]) -> Vec<u8>;
+    /// Append a block of elements to `out` as native-order bytes.
+    fn extend_ne_bytes(values: &[Self], out: &mut Vec<u8>);
     /// Convert from a stored signed integer.
     fn from_i64(value: i64) -> Self;
     /// Convert from a stored unsigned integer.
     fn from_u64(value: u64) -> Self;
     /// Convert from a stored float.
     fn from_f64(value: f64) -> Self;
+    /// Convert to another element type, as an `as` cast does.
+    fn convert<U: Element>(self) -> U;
 }
 
 mod sealed {
@@ -210,12 +212,11 @@ macro_rules! element {
                     .map(|b| <$rust>::from_ne_bytes(b.try_into().expect("width checked")))
                     .collect()
             }
-            fn to_ne_vec(values: &[Self]) -> Vec<u8> {
-                let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+            fn extend_ne_bytes(values: &[Self], out: &mut Vec<u8>) {
+                out.reserve(std::mem::size_of_val(values));
                 for v in values {
-                    bytes.extend_from_slice(&v.to_ne_bytes());
+                    out.extend_from_slice(&v.to_ne_bytes());
                 }
-                bytes
             }
             #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
             #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
@@ -231,6 +232,15 @@ macro_rules! element {
             #[allow(clippy::cast_precision_loss)]
             fn from_f64(value: f64) -> Self {
                 value as $rust
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+            #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            fn convert<U: Element>(self) -> U {
+                match Self::DTYPE {
+                    DType::Int(_) => U::from_i64(self as i64),
+                    DType::Uint(_) => U::from_u64(self as u64),
+                    _ => U::from_f64(self as f64),
+                }
             }
         }
     };

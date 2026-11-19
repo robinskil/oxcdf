@@ -15,6 +15,13 @@ impl Encoder {
         Self::default()
     }
 
+    /// Start an empty encoder with space for `capacity` bytes.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
     /// Append one byte.
     pub fn u8(&mut self, v: u8) {
         self.buf.push(v);
@@ -62,6 +69,16 @@ impl Encoder {
     pub fn checksum(&mut self) {
         let sum = crate::checksum::metadata(&self.buf);
         self.u32(sum);
+    }
+
+    /// The number of bytes written so far.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The bytes written so far.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf
     }
 
     /// Take the encoded bytes.

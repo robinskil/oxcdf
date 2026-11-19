@@ -74,7 +74,10 @@ the whole specification. A feature outside that subset returns
 `Error::Unsupported`. Every other error marks a damaged file or a defect here.
 
 The `write` feature creates files. It supports groups, attributes and
-contiguous numeric datasets.
+datasets of numbers, fixed strings and variable-length strings. A dataset is
+contiguous or chunked. A chunked dataset can have unlimited dimensions and
+shuffle, deflate, Zstandard and Fletcher-32 filters. A dataset can have
+dimension scales. The `oxcdf` crate adds the netCDF conventions.
 
 See the [repository] for the full state and the test matrix.
 

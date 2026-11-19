@@ -12,13 +12,27 @@ use crate::error::{Error, Result};
 pub trait ByteSink: Send + std::fmt::Debug {
     /// Write all of `data` at `offset`. A write past the end grows the sink.
     ///
-    /// An empty write changes nothing.
+    /// Bytes below the end that get no write hold zeros. An empty write
+    /// changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadRequest`] when `offset` plus the length of `data`
+    /// passes `u64::MAX`. Returns [`Error::Io`] when the storage fails.
     fn write_all_at(&mut self, offset: u64, data: &[u8]) -> Result<()>;
 
     /// Set the size of the sink to `len` bytes. New bytes hold zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the storage cannot hold `len` bytes.
     fn set_len(&mut self, len: u64) -> Result<()>;
 
     /// Flush all written bytes to durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the storage fails.
     fn sync(&mut self) -> Result<()>;
 }
 
@@ -30,6 +44,17 @@ fn range_end(offset: u64, len: usize) -> Result<u64> {
 }
 
 /// A byte sink backed by an in-memory buffer.
+///
+/// # Examples
+///
+/// ```
+/// use oxcdf_hdf5::write::{ByteSink, MemorySink};
+///
+/// let mut sink = MemorySink::new();
+/// sink.write_all_at(2, b"ab")?;
+/// assert_eq!(sink.into_inner(), b"\0\0ab");
+/// # Ok::<(), oxcdf_hdf5::Error>(())
+/// ```
 #[derive(Debug, Default)]
 pub struct MemorySink {
     data: Vec<u8>,
@@ -95,6 +120,10 @@ pub struct FileSink {
 
 impl FileSink {
     /// Create `path` for writing. An existing file is truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the file cannot be created.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             file: File::create(path)?,
