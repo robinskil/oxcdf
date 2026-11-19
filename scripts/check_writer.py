@@ -8,6 +8,9 @@ then the oxcdf reader reads the changed files.
 It does the same for one file from the netCDF writer: netCDF4 and xarray read
 it, netcdf-c appends to it, and the oxcdf reader reads the result.
 
+It also makes one file with netcdf-c. The oxcdf writer appends to it, and
+netCDF4, xarray and the tools read the result.
+
 Usage:
     python scripts/check_writer.py [--dir DIRECTORY]
 
@@ -272,7 +275,11 @@ def change_with_library(path, model, case, zstd):
             for d in model["datasets"]:
                 dataset = f[d["path"]]
                 dataset.attrs.create(ADDED, np.array([7], dtype="<i4"))
-                if dataset.size > 0:
+                # With no fill value, the library leaves new file space as it finds it.
+                plist = dataset.id.get_create_plist()
+                filled = plist.fill_value_defined() == h5py.h5d.FILL_VALUE_USER_DEFINED
+                stored = dataset.chunks is None and dataset.id.get_offset() is not None
+                if dataset.size > 0 and (filled or stored):
                     first = tuple(0 for _ in dataset.shape)
                     dataset[first] = dataset[first]
         check_h5py(changed, model, case + " (changed)", added=True)
@@ -566,6 +573,81 @@ def check_netcdf(path):
     return len(problems) == before
 
 
+def check_append(directory):
+    """Let the oxcdf writer append to a file from netcdf-c, then check the result."""
+    case = "append"
+    path = os.path.join(directory, "python.nc")
+    if netCDF4 is None:
+        counts.setdefault("netCDF4 not found: the append to a file from netcdf-c", 0)
+        return
+    with netCDF4.Dataset(path, "w") as ds:
+        ds.createDimension("time", None)
+        ds.createDimension("lat", 3)
+        ds.title = "from netcdf-c"
+        for i in range(12):
+            ds.setncattr(f"attr_{i:02}", np.int32(i))
+        ds.createVariable("lat", "f4", ("lat",))[:] = [-10.0, 0.0, 10.0]
+        temp = ds.createVariable("TEMP", "f4", ("time", "lat"), zlib=True, complevel=4, shuffle=True,
+                                 chunksizes=(2, 3), fill_value=-999.0)
+        temp.units = "degC"
+        temp[0] = [1.0, 2.0, 3.0]
+        name = ds.createVariable("name", str, ("lat",))
+        name[0] = "south"
+        for i in range(20):
+            ds.createVariable(f"var_{i:02}", "i4", ("lat",))[:] = [i, i + 1, i + 2]
+        sub = ds.createGroup("sub")
+        sub.createDimension("z", 2)
+        sub.createVariable("deep", "i4", ("z", "lat"))[:] = np.arange(6).reshape(2, 3)
+
+    cargo("a_python_file_takes_an_append", directory, "oxcdf", "write_append")
+
+    def same(what, got, expected):
+        got, expected = np.asarray(got), np.asarray(expected)
+        if not np.array_equal(got, expected):
+            note(case, f"{what}: got {got.tolist()}, expected {expected.tolist()}")
+        else:
+            count("append value checks")
+
+    check_tool(["ncdump", path], case)
+    check_tool(["h5dump", "-H", path], case)
+    with netCDF4.Dataset(path) as ds:
+        ds.set_auto_maskandscale(False)
+        dims = {name: (len(d), d.isunlimited()) for name, d in ds.dimensions.items()}
+        if dims != {"time": (3, True), "lat": (3, False), "depth": (2, False)}:
+            note(case, f"dimensions {dims}")
+        if len(ds.variables) != 24 or ds.history != "appended by oxcdf" or ds.attr_03 != 33:
+            note(case, "variable count or global attributes")
+        same("TEMP", ds["TEMP"][:], np.arange(1, 10, dtype="f4").reshape(3, 3))
+        if ds["TEMP"].dimensions != ("time", "lat") or ds["TEMP"].long_name != "temperature":
+            note(case, "TEMP dimensions or attributes")
+        if not ds["TEMP"].filters()["zlib"] or ds["TEMP"].chunking() != [2, 3]:
+            note(case, "TEMP filters or chunks")
+        same("lat", ds["lat"][:], [-10.0, 0.0, 10.0])
+        same("name", ds["name"][:], np.array(["south", "", "north"], dtype=object))
+        for i in range(20):
+            same(f"var_{i:02}", ds[f"var_{i:02}"][:], [i, i + 1, i + 2])
+        same("PSAL", ds["PSAL"][:], np.arange(6).reshape(3, 2) + 0.5)
+        if ds["PSAL"].dimensions != ("time", "depth"):
+            note(case, "PSAL dimensions")
+        same("deep", ds["sub"]["deep"][:], np.arange(6).reshape(2, 3))
+        same("more", ds["sub"]["more"][:], [7, 8])
+    if xarray is not None:
+        with xarray.open_dataset(path) as ds:
+            if dict(ds.sizes) != {"time": 3, "lat": 3, "depth": 2}:
+                note(case, f"xarray sizes {dict(ds.sizes)}")
+            same("xarray TEMP", ds["TEMP"].values, np.arange(1, 10, dtype="f4").reshape(3, 3))
+    # netcdf-c appends to the file again after the oxcdf append.
+    try:
+        with netCDF4.Dataset(path, "a") as ds:
+            ds["TEMP"][3] = [10.0, 11.0, 12.0]
+            ds.createVariable("last", "i2", ("lat",))[:] = [1, 2, 3]
+        with netCDF4.Dataset(path) as ds:
+            same("TEMP after netcdf-c", ds["TEMP"][3], [10.0, 11.0, 12.0])
+            same("last", ds["last"][:], [1, 2, 3])
+    except Exception as error:  # noqa: BLE001
+        note(case, f"netcdf-c append after the oxcdf append: {type(error).__name__}: {error}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--dir", help="directory for the files; the default is a temporary directory")
@@ -603,6 +685,7 @@ def main():
         # The oxcdf reader reads the file that netcdf-c changed.
         cargo("a_file_changed_by_netcdf_c_reads_back", directory, "oxcdf", "write_netcdf")
         count("file changed by netcdf-c read by oxcdf")
+    check_append(directory)
     if not problems:
         # The oxcdf reader reads the files that the HDF5 library changed.
         cargo("files_changed_by_the_library_read_back", directory)

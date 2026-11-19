@@ -3,6 +3,8 @@
 //! Each call can return an error. An error must change nothing. A call that
 //! returns `Ok` changes the model. At the end the reader must give the model.
 //!
+//! One call closes the file and opens it again for an append.
+//!
 //! The model has the root group and its child groups. It does not add a
 //! dimension that hides a dimension of the root group from a variable that
 //! uses it, because the reader finds a dimension by its name.
@@ -285,7 +287,14 @@ pub fn run(data: &[u8]) {
         let g = input.index(model.0.len());
         let group_name = model.0[g].name.clone();
         let group = group_name.as_deref();
-        match op % 8 {
+        match op % 9 {
+            8 => {
+                // Close the file and open it again for an append.
+                let empty = oxcdf::create_in_memory().expect("a file in memory opens");
+                let bytes = std::mem::replace(&mut file, empty).into_bytes();
+                let bytes = bytes.expect("the close passes");
+                file = oxcdf::append_in_memory(bytes).expect("the file opens for an append");
+            }
             0 => {
                 let name = NAMES[input.index(NAMES.len())];
                 let len = input.index(5);
@@ -370,7 +379,7 @@ pub fn run(data: &[u8]) {
                     _ => count,
                 };
                 let numbers: Vec<i32> = (0..given).map(|_| input.index(100) as i32).collect();
-                let wrote = match (is_text, op % 8) {
+                let wrote = match (is_text, op % 9) {
                     (true, _) => {
                         let texts: Vec<String> = numbers.iter().map(|n| format!("s{n}")).collect();
                         on!(

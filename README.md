@@ -197,8 +197,36 @@ file.close()?;
 - With the `object-store` feature, `close_to_store` uploads the file.
 
 netcdf-c, netCDF4 for Python and xarray read these files. netcdf-c can append to
-them. The writer does not change a file that exists, and it has no
-user-defined types.
+them.
+
+`append` opens a file that exists and changes it in place. The file can come
+from this writer or from netcdf-c.
+
+```rust
+let mut file = oxcdf::append("out.nc")?;
+let mut temp = file.variable_mut("TEMP").unwrap();
+temp.put_values(&next_day, [1..2, 0..180])?;
+file.add_attribute("history", "one more day")?;
+file.close()?;
+```
+
+- The writer is the only writer of the file until the close. A second
+  `append` fails with `Error::Io`. A reader can open the file at the same time.
+  On Windows, the handle of the writer shares the file for reads only. On
+  Unix, the writer takes an advisory `flock`. A crash leaves no lock.
+- Values change in place. New objects and attributes appear at the close.
+- The close writes each object header again at the end of the file. The last
+  write is the superblock. Until then, a reader sees the earlier structure.
+- Each append session adds the size of all object headers to the file.
+- A variable of the file keeps its chunk shape, filters and fill value.
+- `append` returns `Error::Unsupported` for a file that it cannot describe
+  again: a classic file, user-defined types, the szip filter, or an attribute
+  above 64 KiB. Such an error changes nothing.
+- `add_variable` returns `Error::Unsupported` for a new coordinate variable of
+  a dimension of the file.
+
+The writer does not remove or rename an object, and it has no user-defined
+types.
 
 ## Parallel reads
 
@@ -284,8 +312,7 @@ Not supported:
 - Strided selections
 - Batched reads across variables
 
-The `write` feature creates new files. See [Write](#write). The crate does not
-change a file that exists. Keep netcdf-c for that.
+The `write` feature creates files and appends to files. See [Write](#write).
 
 `Error::Unsupported` marks a valid HDF5 feature this reader does not implement.
 Every other error marks a damaged file or a defect here. Match on
@@ -319,7 +346,7 @@ GitHub Actions runs every check on each push and pull request.
 |---|---|
 | `format` | `cargo fmt` over the workspace and over `fuzz`. |
 | `clippy` | Five feature sets, both crates. A warning fails the build. |
-| `test` | Linux, macOS and Windows. Default features, then every feature. |
+| `test` | Linux. Default features, then every feature. |
 | `docs` | Three builds. A broken link fails the build. |
 | `msrv` | The crate builds on Rust 1.91. |
 | `differential` | Installs netcdf-c and compares every value against it. |
@@ -332,7 +359,7 @@ return an error. A panic marks a defect.
 `fuzz/` holds five `cargo fuzz` targets: `open`, `read`, `filters`, `write` and
 `netcdf_write`. The
 `filters` target covers the C zstd decoder, which is the one part of the build
-that is not safe Rust. A nightly job runs them, seeded from the corpus.
+that is not safe Rust. A job runs them on each pull request to `main`.
 
 ```bash
 cargo +nightly fuzz run open -- -max_total_time=60
@@ -351,6 +378,15 @@ run this script.
 
 ```bash
 python scripts/check_writer.py
+```
+
+`scripts/check_copy.py` writes 35 different files with netCDF4 for Python. The
+test `write_copy` reads each file with this reader and writes a copy with this
+writer. The script then compares each copy with its original: each dimension,
+attribute, filter and value. CI does not run this script.
+
+```bash
+python scripts/check_copy.py
 ```
 
 `rustfmt.toml` holds the format. Every value is a rustfmt default, written down
