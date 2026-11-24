@@ -713,6 +713,35 @@ fn many_chunks_and_chunked_strings_round_trip() {
     assert_eq!(read_strings(&file, "/names"), ["", "", "", "d", "", "f"]);
 }
 
+/// A scan through one small cache evicts chunks that a read found cached.
+/// Each read must still return its values.
+#[test]
+fn a_scan_past_the_cache_capacity_reads_every_chunk() {
+    const LEN: u64 = 4000;
+    const CHUNK: u64 = 10;
+    let mut w = new_writer();
+    let root = w.root();
+    let spec = DatasetSpec::numeric(DType::Float(8), ByteOrder::Little, &[LEN])
+        .unwrap()
+        .chunked(&[CHUNK]);
+    let d = w.add_dataset(root, "v", spec).unwrap();
+    let values: Vec<f64> = (0..LEN).map(|i| i as f64).collect();
+    w.write(d, &Hyperslab::all(&[LEN]), &values).unwrap();
+    let file = reopen(w.close().unwrap().into_inner())
+        .with_cache(Some(oxcdf_hdf5::cache::ChunkCache::new(8)));
+
+    let d = file.dataset("/v").unwrap();
+    for start in (0..LEN).step_by(CHUNK as usize) {
+        let slab = Hyperslab::new(vec![start], vec![CHUNK], &[LEN]).unwrap();
+        let got = read_hyperslab(file.ctx(), d, &slab)
+            .unwrap_or_else(|e| panic!("chunk at {start}: {e}"))
+            .get::<f64>(d)
+            .unwrap();
+        let want: Vec<f64> = (start..start + CHUNK).map(|i| i as f64).collect();
+        assert_eq!(got, want, "chunk at {start}");
+    }
+}
+
 #[test]
 fn wrong_chunk_and_resize_calls_are_bad_requests() {
     let mut w = new_writer();

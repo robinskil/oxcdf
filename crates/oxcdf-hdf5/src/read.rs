@@ -1229,14 +1229,29 @@ pub async fn read_hyperslab_async_with(
                 .map(|(i, _)| i)
                 .collect();
 
+            // Hold the needed chunks here, as the inserts below can evict them.
+            let mut held: std::collections::HashMap<u64, bytes::Bytes> =
+                std::collections::HashMap::new();
+
             // Fetch everything not already decoded, plus the read-ahead window,
             // in one batched call.
             let mut wanted = Vec::new();
             if let Some(&last) = needed.last() {
+                for &i in &needed {
+                    let r = &chunks[i];
+                    if r.size == 0 {
+                        continue;
+                    }
+                    match cache.and_then(|c| c.get(r.address)) {
+                        Some(hit) => {
+                            held.insert(r.address, hit);
+                        }
+                        None => wanted.push((r.address, r.size as usize, r.filter_mask)),
+                    }
+                }
                 let lookahead = cache.map(|c| c.readahead()).unwrap_or(0);
                 let end = (last + 1 + lookahead).min(chunks.len());
-                for i in needed.iter().copied().chain((last + 1)..end) {
-                    let r = &chunks[i];
+                for r in &chunks[(last + 1)..end] {
                     if r.size == 0 || cache.is_some_and(|c| c.contains(r.address)) {
                         continue;
                     }
@@ -1244,8 +1259,6 @@ pub async fn read_hyperslab_async_with(
                 }
             }
 
-            let mut fetched: std::collections::HashMap<u64, bytes::Bytes> =
-                std::collections::HashMap::new();
             if !wanted.is_empty() {
                 let ranges: Vec<(u64, usize)> = wanted
                     .iter()
@@ -1261,7 +1274,7 @@ pub async fn read_hyperslab_async_with(
                             if let Some(c) = cache {
                                 c.insert(address, decoded.clone());
                             }
-                            fetched.insert(address, decoded);
+                            held.insert(address, decoded);
                         }
                         Err(e) => {
                             // Only a chunk this read actually needs is fatal;
@@ -1281,15 +1294,12 @@ pub async fn read_hyperslab_async_with(
 
             for &i in &needed {
                 let record = &chunks[i];
-                let decoded = match cache.and_then(|c| c.get(record.address)) {
-                    Some(hit) => hit,
-                    None => fetched.get(&record.address).cloned().ok_or_else(|| {
-                        Error::malformed(format!(
-                            "chunk at {:?} of {} was neither cached nor fetched",
-                            record.offset, dataset.path
-                        ))
-                    })?,
-                };
+                let decoded = held.get(&record.address).cloned().ok_or_else(|| {
+                    Error::malformed(format!(
+                        "chunk at {:?} of {} was neither cached nor fetched",
+                        record.offset, dataset.path
+                    ))
+                })?;
                 if decoded.len() < decoded_len {
                     return Err(Error::malformed(format!(
                         "chunk at {:?} of dataset {} decoded to {} bytes, expected {decoded_len}",
