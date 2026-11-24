@@ -231,3 +231,47 @@ async fn a_contiguous_variable_needs_no_preparation() {
     .unwrap();
     assert_eq!(got.get::<f64>(d).unwrap().len(), 240);
 }
+
+/// A file with one Float64 dataset of `len` values in chunks of `chunk`.
+#[cfg(feature = "write")]
+fn many_chunk_file(len: u64, chunk: u64) -> Vec<u8> {
+    use oxcdf_hdf5::message::ByteOrder;
+    use oxcdf_hdf5::write::{DatasetSpec, Hdf5Writer, MemorySink, WriteOptions};
+    use oxcdf_hdf5::DType;
+
+    let mut w = Hdf5Writer::create(MemorySink::new(), WriteOptions::default()).unwrap();
+    let root = w.root();
+    let spec = DatasetSpec::numeric(DType::Float(8), ByteOrder::Little, &[len])
+        .unwrap()
+        .chunked(&[chunk]);
+    let d = w.add_dataset(root, "v", spec).unwrap();
+    let values: Vec<f64> = (0..len).map(|i| i as f64).collect();
+    w.write(d, &Hyperslab::all(&[len]), &values).unwrap();
+    w.close().unwrap().into_inner()
+}
+
+/// A scan through one small cache evicts chunks that a read found cached.
+/// Each read must still return its values.
+#[cfg(feature = "write")]
+#[tokio::test]
+async fn a_scan_past_the_cache_capacity_reads_every_chunk() {
+    use oxcdf_hdf5::cache::ChunkCache;
+
+    const LEN: u64 = 4000;
+    const CHUNK: u64 = 10;
+    let bytes = many_chunk_file(LEN, CHUNK);
+    let file = Hdf5File::from_source(Arc::new(MemorySource::new(bytes.clone()))).unwrap();
+    let d = file.dataset("/v").unwrap();
+    d.prepare(file.ctx()).unwrap();
+
+    let source: Arc<dyn AsyncByteSource> = Arc::new(SyncAsAsync(MemorySource::new(bytes)));
+    let cache = ChunkCache::new(8);
+    for start in (0..LEN).step_by(CHUNK as usize) {
+        let slab = Hyperslab::new(vec![start], vec![CHUNK], &[LEN]).unwrap();
+        let got = read_hyperslab_async(source.as_ref(), file.superblock(), Some(&cache), d, &slab)
+            .await
+            .unwrap_or_else(|e| panic!("chunk at {start}: {e}"));
+        let want: Vec<f64> = (start..start + CHUNK).map(|i| i as f64).collect();
+        assert_eq!(got.get::<f64>(d).unwrap(), want, "chunk at {start}");
+    }
+}
